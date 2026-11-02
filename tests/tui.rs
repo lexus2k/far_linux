@@ -1,0 +1,547 @@
+//! End-to-end tests: they run the real binary inside tmux, press real keys
+//! and read the real screen. They are skipped when tmux is not installed.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::{Duration, Instant};
+
+static NEXT: AtomicU32 = AtomicU32::new(0);
+
+struct Session {
+    socket: String,
+    root: PathBuf,
+}
+
+fn tmux_available() -> bool {
+    Command::new("tmux")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+impl Session {
+    /// Starts far in a private tmux server with panels on `left` and `right`.
+    fn start(setup: impl FnOnce(&Path)) -> Option<Session> {
+        if !tmux_available() {
+            eprintln!("tmux not found: skipping");
+            return None;
+        }
+        let id = NEXT.fetch_add(1, Ordering::Relaxed);
+        let socket = format!("far_e2e_{}_{id}", std::process::id());
+        let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(&socket);
+        let _ = fs::remove_dir_all(&root);
+        for dir in ["left", "right", "home"] {
+            fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        setup(&root);
+        let session = Session { socket, root };
+        let launch = format!(
+            "env HOME={home} PS1= {bin} {left} {right}; sleep 30",
+            home = session.root.join("home").display(),
+            bin = env!("CARGO_BIN_EXE_far"),
+            left = session.root.join("left").display(),
+            right = session.root.join("right").display(),
+        );
+        session.tmux(&[
+            "-f",
+            "/dev/null",
+            "new-session",
+            "-d",
+            "-x",
+            "100",
+            "-y",
+            "30",
+            "-s",
+            "t",
+            &launch,
+        ]);
+        session.tmux(&["set", "-s", "escape-time", "0"]);
+        session.wait("left");
+        Some(session)
+    }
+
+    fn tmux(&self, args: &[&str]) -> String {
+        let output = Command::new("tmux")
+            .args(["-L", &self.socket])
+            .args(args)
+            .output()
+            .expect("tmux runs");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    fn keys(&self, keys: &[&str]) {
+        for key in keys {
+            self.tmux(&["send-keys", "-t", "t", key]);
+        }
+    }
+
+    fn text(&self, text: &str) {
+        self.tmux(&["send-keys", "-t", "t", "-l", text]);
+    }
+
+    fn screen(&self) -> String {
+        self.tmux(&["capture-pane", "-p", "-t", "t"])
+    }
+
+    fn wait(&self, wanted: &str) {
+        self.wait_for(wanted, |s| s.contains(wanted));
+    }
+
+    fn wait_gone(&self, unwanted: &str) {
+        self.wait_for(unwanted, |s| !s.contains(unwanted));
+    }
+
+    fn wait_for(&self, label: &str, check: impl Fn(&str) -> bool) {
+        let start = Instant::now();
+        loop {
+            let screen = self.screen();
+            if check(&screen) {
+                return;
+            }
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!("timed out on {label:?}. Screen:\n{screen}");
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    fn wait_file(&self, path: &Path, exists: bool) {
+        let start = Instant::now();
+        while path.exists() != exists {
+            if start.elapsed() > Duration::from_secs(8) {
+                panic!(
+                    "{} exists={exists} not reached.\n{}",
+                    path.display(),
+                    self.screen()
+                );
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+
+    fn p(&self, rel: &str) -> PathBuf {
+        self.root.join(rel)
+    }
+}
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.tmux(&["kill-server"]);
+        let _ = fs::remove_dir_all(&self.root);
+    }
+}
+
+fn with_file(root: &Path) {
+    fs::write(root.join("left/alpha.txt"), "alpha contents\nsecond line\n").unwrap();
+}
+
+#[test]
+fn panels_show_files_and_f10_quits() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.wait("right");
+    assert!(s.screen().contains("Copy"), "key bar:\n{}", s.screen());
+    s.keys(&["F10"]);
+    s.wait("Do you want to quit?");
+    s.keys(&["Enter"]);
+    s.wait_gone("alpha.txt");
+}
+
+#[test]
+fn f5_copies_to_the_other_panel() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F5"]);
+    s.wait("Copy alpha.txt to:");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/alpha.txt"), true);
+    assert_eq!(
+        fs::read_to_string(s.p("right/alpha.txt")).unwrap(),
+        "alpha contents\nsecond line\n"
+    );
+    assert!(s.p("left/alpha.txt").exists());
+}
+
+#[test]
+fn copying_over_a_file_asks_first_and_skip_keeps_it() {
+    let Some(s) = Session::start(|root| {
+        with_file(root);
+        fs::write(root.join("right/alpha.txt"), "existing").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F5"]);
+    s.wait("Copy alpha.txt to:");
+    s.keys(&["Enter"]);
+    s.wait("already exists");
+    s.keys(&["s"]);
+    s.wait_gone("already exists");
+    assert_eq!(
+        fs::read_to_string(s.p("right/alpha.txt")).unwrap(),
+        "existing"
+    );
+}
+
+#[test]
+fn f6_moves_and_shift_f6_renames() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "S-F6"]);
+    s.wait("Rename or move alpha.txt to:");
+    s.text("beta.txt");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/beta.txt"), true);
+    // The name also appears in the dialogs, and keys pressed while an
+    // operation runs are ignored: wait until the panels are back.
+    s.wait_for("panels after rename", |t| {
+        t.contains("beta.txt") && !t.contains("Rename or move") && !t.contains("Esc cancels")
+    });
+    assert!(!s.p("left/alpha.txt").exists());
+    s.keys(&["F6"]);
+    s.wait("Rename or move beta.txt to:");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/beta.txt"), true);
+    assert!(!s.p("left/beta.txt").exists());
+}
+
+#[test]
+fn f7_makes_a_folder() {
+    let Some(s) = Session::start(|_| {}) else {
+        return;
+    };
+    s.keys(&["F7"]);
+    s.wait("Create the folder:");
+    s.text("new_folder");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/new_folder"), true);
+    s.wait("new_folder");
+    assert!(s.p("left/new_folder").is_dir());
+}
+
+#[test]
+fn f8_uses_the_trash_and_shift_delete_is_permanent() {
+    let Some(s) = Session::start(|root| {
+        with_file(root);
+        fs::write(root.join("left/gone.txt"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F8"]);
+    s.wait("Move to the trash:");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/alpha.txt"), false);
+    let trashed = s.p("home/.local/share/Trash/files/alpha.txt");
+    assert_eq!(
+        fs::read_to_string(trashed).unwrap(),
+        "alpha contents\nsecond line\n"
+    );
+    s.wait_gone("alpha.txt");
+    s.keys(&["S-DC"]);
+    s.wait("Permanently delete");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/gone.txt"), false);
+    assert!(!s.p("home/.local/share/Trash/files/gone.txt").exists());
+}
+
+#[test]
+fn delete_can_be_cancelled() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F8"]);
+    s.wait("Move to the trash:");
+    s.keys(&["Escape"]);
+    s.wait_gone("Move to the trash:");
+    assert!(s.p("left/alpha.txt").exists());
+}
+
+#[test]
+fn insert_selects_several_files_for_one_copy() {
+    let Some(s) = Session::start(|root| {
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            fs::write(root.join("left").join(name), name).unwrap();
+        }
+    }) else {
+        return;
+    };
+    s.wait("c.txt");
+    s.keys(&["Down", "IC", "IC", "F5"]);
+    s.wait("Copy 2 items to:");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/a.txt"), true);
+    s.wait_file(&s.p("right/b.txt"), true);
+    assert!(!s.p("right/c.txt").exists());
+}
+
+#[test]
+fn ctrl_a_changes_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "C-a"]);
+    s.wait("Permissions");
+    s.text("600");
+    s.keys(&["Enter"]);
+    let start = Instant::now();
+    let mode = || {
+        fs::metadata(s.p("left/alpha.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777
+    };
+    while mode() != 0o600 {
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "mode {:o}\n{}",
+            mode(),
+            s.screen()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn alt_f6_creates_a_symbolic_link() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "M-F6"]);
+    s.wait("Link name:");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/alpha.txt"), true);
+    assert!(fs::symlink_metadata(s.p("right/alpha.txt"))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[test]
+fn f3_views_and_escape_returns() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F3"]);
+    s.wait("alpha contents");
+    s.wait("second line");
+    s.keys(&["F4"]);
+    s.wait("61 6C 70 68 61");
+    s.keys(&["Escape"]);
+    s.wait_gone("61 6C 70 68 61");
+    s.wait("RenMov");
+}
+
+#[test]
+fn f4_edits_saves_and_warns_about_unsaved_changes() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F4"]);
+    s.wait("alpha contents");
+    s.text("NEW ");
+    s.wait("NEW alpha contents");
+    s.keys(&["Escape"]);
+    s.wait("has been modified");
+    s.keys(&["c"]);
+    s.wait_gone("has been modified");
+    s.keys(&["F2"]);
+    let start = Instant::now();
+    while !fs::read_to_string(s.p("left/alpha.txt"))
+        .unwrap()
+        .starts_with("NEW ")
+    {
+        assert!(start.elapsed() < Duration::from_secs(8), "{}", s.screen());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert_eq!(
+        fs::read_to_string(s.p("left/alpha.txt")).unwrap(),
+        "NEW alpha contents\nsecond line\n"
+    );
+    s.keys(&["Escape"]);
+    s.wait("RenMov");
+}
+
+#[test]
+fn editor_undo_returns_to_the_saved_state_without_a_prompt() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F4"]);
+    s.wait("alpha contents");
+    s.text("x");
+    s.wait("xalpha contents");
+    s.keys(&["C-z"]);
+    s.wait_gone("xalpha contents");
+    s.keys(&["Escape"]);
+    s.wait("RenMov");
+}
+
+#[test]
+fn ctrl_o_shows_command_output_and_returns_to_panels() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text("echo hello_from_shell");
+    s.wait("echo hello_from_shell");
+    s.keys(&["Enter"]);
+    s.wait("alpha.txt");
+    s.wait("╔");
+    s.keys(&["C-o"]);
+    s.wait_for("console", |t| {
+        t.contains("\nhello_from_shell") && !t.contains("╔")
+    });
+    s.keys(&["C-o"]);
+    s.wait("╔");
+    s.wait("alpha.txt");
+}
+
+#[test]
+fn commands_can_be_typed_on_the_console_screen() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["C-o"]);
+    s.wait_gone("╔");
+    s.text("echo typed_on_console");
+    s.keys(&["Enter"]);
+    s.wait("\ntyped_on_console");
+    assert!(!s.screen().contains("╔"));
+    s.keys(&["C-o"]);
+    s.wait("╔");
+}
+
+#[test]
+fn cd_and_export_persist_across_commands() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/sub")).unwrap();
+        fs::write(root.join("left/sub/inner.txt"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("sub");
+    s.text("cd sub && export FAR_E2E=persisted");
+    s.keys(&["Enter"]);
+    s.wait("inner.txt");
+    s.text("echo $FAR_E2E > out.txt");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/sub/out.txt"), true);
+    let start = Instant::now();
+    while fs::read_to_string(s.p("left/sub/out.txt")).unwrap().trim() != "persisted" {
+        assert!(start.elapsed() < Duration::from_secs(8), "{}", s.screen());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn ctrl_p_hides_the_inactive_panel() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("right/on_the_right.txt"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("on_the_right.txt");
+    s.keys(&["C-p"]);
+    s.wait_gone("on_the_right.txt");
+    s.keys(&["C-p"]);
+    s.wait("on_the_right.txt");
+}
+
+#[test]
+fn tab_switches_panel_and_enter_opens_folders() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("right/folder")).unwrap();
+        fs::write(root.join("right/folder/deep.txt"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("folder");
+    s.keys(&["Tab", "Down", "Enter"]);
+    s.wait("deep.txt");
+    s.keys(&["C-PageUp"]);
+    s.wait_gone("deep.txt");
+}
+
+#[test]
+fn alt_f7_finds_files_by_name() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/nested")).unwrap();
+        fs::write(root.join("left/nested/target_file.log"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("nested");
+    s.keys(&["M-F7"]);
+    s.wait("File mask");
+    s.text("*.log");
+    s.keys(&["Enter"]);
+    s.wait("target_file.log");
+    s.keys(&["Enter"]);
+    s.wait_gone("File mask");
+    s.wait("target_file.log");
+}
+
+#[test]
+fn f9_menu_runs_commands_and_escape_closes_it() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["F9"]);
+    s.wait("Quick view");
+    s.keys(&["Escape"]);
+    s.wait_gone("Quick view");
+    s.keys(&["F9", "Right"]);
+    s.wait("Make folder");
+    s.keys(&["Escape"]);
+    s.wait_gone("Make folder");
+}
+
+#[test]
+fn hostile_file_name_does_not_reach_the_terminal() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/evil\x1b[2Jname"), "x").unwrap();
+        fs::write(root.join("left/plain.txt"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("plain.txt");
+    s.wait("evil?[2Jname");
+}
+
+#[test]
+fn terminal_is_restored_on_exit() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["F10"]);
+    s.wait("Do you want to quit?");
+    s.keys(&["Enter"]);
+    s.wait_gone("╔");
+    let on_alternate = s.tmux(&["display-message", "-p", "-t", "t", "#{alternate_on}"]);
+    assert_eq!(on_alternate.trim(), "0");
+    assert_eq!(
+        s.tmux(&["display-message", "-p", "-t", "t", "#{cursor_flag}"])
+            .trim(),
+        "1"
+    );
+}
