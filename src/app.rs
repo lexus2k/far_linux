@@ -1,11 +1,13 @@
 //! The application: panels, command line, hot keys and file operation dialogs.
 
+use crate::archive::{self, ExtractRequest, Format, ScratchDir, FORMATS};
 use crate::dialog::{self, Field, Form};
-use crate::editor::{self, Clipboard, EditorExit};
+use crate::editor::{self, Clipboard, EditorContext, EditorExit};
 use crate::fsops::{
     self, AttrChange, CopyOptions, ErrorChoice, OpSummary, OpUi, OverwriteChoice, Progress, Totals,
     TrashChoice,
 };
+use crate::history::{History, Kind};
 use crate::lineedit::LineEdit;
 use crate::panel::{Panel, Sort, View};
 use crate::screen::{
@@ -14,12 +16,22 @@ use crate::screen::{
 use crate::shell::Shell;
 use crate::util;
 use crate::viewer::{self, ViewerExit};
-use crossterm::{cursor, event::KeyCode, execute, style::Print, terminal};
+use crossterm::{
+    cursor,
+    event::{
+        self, Event, KeyCode, KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+        PushKeyboardEnhancementFlags,
+    },
+    execute,
+    style::Print,
+    terminal,
+};
 use std::ffi::OsString;
 use std::fs;
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -77,6 +89,10 @@ pub enum Action {
     Info,
     QuickView,
     Help,
+    DeleteCurrent,
+    ArchiveAdd,
+    ArchiveExtract,
+    ArchiveCommands,
     Quit,
 }
 
@@ -108,13 +124,21 @@ fn files_menu() -> Vec<MenuItem> {
         ("Create link", "Alt+F6", Action::Link),
         ("Make folder", "F7", Action::MkDir),
         ("Delete to trash", "F8", Action::Trash),
+        (
+            "Delete item under cursor",
+            "Shift+F8",
+            Action::DeleteCurrent,
+        ),
         ("Delete permanently", "Shift+Del", Action::DeletePermanently),
         ("File attributes", "Ctrl+A", Action::Attributes),
         ("Select group", "+", Action::SelectGroup),
         ("Unselect group", "-", Action::UnselectGroup),
         ("Invert selection", "*", Action::InvertSelection),
         ("Select all", "Ctrl+Shift+A", Action::SelectAll),
-        ("Clear selection", "Ctrl+M", Action::ClearSelection),
+        ("Clear selection", "Menu", Action::ClearSelection),
+        ("Add to archive", "Shift+F1", Action::ArchiveAdd),
+        ("Extract from archive", "Shift+F2", Action::ArchiveExtract),
+        ("Archive commands", "Shift+F3", Action::ArchiveCommands),
     ]
 }
 
@@ -136,6 +160,17 @@ fn commands_menu() -> Vec<MenuItem> {
 }
 
 const HELP: &[(&str, &str)] = &[
+    ("Archives", ""),
+    ("Enter, Ctrl+PgDn", "Open the archive under the cursor"),
+    ("Ctrl+PgUp", "Go up, leaving the archive at its top"),
+    ("Shift+F1", "Add the selection to an archive"),
+    ("Shift+F2", "Extract the chosen archives"),
+    ("Shift+F3", "Archive commands: test"),
+    ("F5", "Extract from, or add to, the open archive"),
+    ("F6", "Extract and remove, or add and remove"),
+    ("F3, F4", "View or edit a temporary copy of a file"),
+    ("F7, F8", "Make a folder, delete, inside the archive"),
+    ("", ""),
     ("Panels", ""),
     ("Tab", "Other panel"),
     ("Enter", "Open folder, run program, or run the command line"),
@@ -173,7 +208,8 @@ const HELP: &[(&str, &str)] = &[
     ("Alt+F6", "Create a symbolic or hard link"),
     ("F7", "Make folder"),
     ("F8, Del", "Delete to trash"),
-    ("Shift+F8, Shift+Del", "Delete permanently"),
+    ("Shift+F8", "Delete the item under the cursor to the trash"),
+    ("Shift+Del", "Delete permanently"),
     ("Ctrl+A", "Permissions and owner"),
     ("Alt+F7", "Find files"),
     ("", ""),
@@ -186,33 +222,6 @@ const HELP: &[(&str, &str)] = &[
     ("Alt+F11, Alt+F12", "View history, folder history"),
     ("Ctrl+Y, Esc", "Clear"),
     ("Ctrl+Ins, Alt+Ins", "Copy names, copy full paths"),
-    ("", ""),
-    ("Viewer", ""),
-    ("F2, F4, F8", "Wrap, hex, encoding"),
-    ("F6", "Edit"),
-    ("F7, Shift+F7, Alt+F7", "Search, next, previous"),
-    ("Alt+F8", "Go to offset or percent"),
-    ("", ""),
-    ("Editor", ""),
-    ("F2, Shift+F2", "Save, save as"),
-    ("Shift+F10", "Save and close"),
-    ("Shift+arrows", "Select stream block"),
-    ("Alt+Shift+arrows", "Select vertical block"),
-    (
-        "Ctrl+C, Ctrl+X, Ctrl+V",
-        "Copy, cut, paste (also Ctrl+Ins, Shift+Del, Shift+Ins)",
-    ),
-    (
-        "Ctrl+D, Ctrl+A, Ctrl+U",
-        "Delete block, select all, unselect",
-    ),
-    ("Ctrl+Y, Ctrl+K", "Delete line, delete to end of line"),
-    ("Ctrl+Z, Ctrl+Shift+Z", "Undo, redo"),
-    ("F7, Shift+F7, Alt+F7", "Search, next, previous"),
-    ("Ctrl+F7", "Replace"),
-    ("F8", "Encoding"),
-    ("Alt+F8", "Go to line"),
-    ("Ins", "Insert or overwrite"),
 ];
 
 enum ToUi {
@@ -243,7 +252,7 @@ impl OpUi for ChannelUi {
     }
 
     fn progress(&mut self, progress: &Progress) {
-        let due = self.last.map_or(true, |t| t.elapsed() >= OP_TICK);
+        let due = self.last.is_none_or(|t| t.elapsed() >= OP_TICK);
         if due {
             self.last = Some(Instant::now());
             let _ = self.tx.send(ToUi::Progress(progress.clone()));
@@ -342,26 +351,51 @@ struct App {
     masks: String,
     find_mask: String,
     find_text: String,
+    db: Rc<History>,
 }
 
 /// Runs the file manager until the user quits.
-pub fn run(left: Option<String>, right: Option<String>) -> io::Result<()> {
+pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     // Prefer the logical path, which keeps symbolic link names in the title.
     let start = std::env::var_os("PWD")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute() && same_dir(p, &cwd))
         .unwrap_or(cwd);
-    let resolve = |arg: Option<String>| -> PathBuf {
+    let resolve = |arg: Option<OsString>| -> PathBuf {
         arg.map_or_else(
             || start.clone(),
-            |text| util::normalize(&util::resolve_path(&start, &text)),
+            |raw| match raw.to_str() {
+                Some(text) => util::normalize(&util::resolve_path(&start, text)),
+                None => util::normalize(&start.join(&raw)),
+            },
         )
     };
     let (left, right) = (resolve(left), resolve(right));
     screen::install_panic_hook();
     let shell = Shell::new()?;
     let tui = Tui::new()?;
+    let db = Rc::new(History::open_default());
+    let oldest_first = |kind| -> Vec<String> {
+        let mut items = db.list(kind);
+        items.truncate(HISTORY_LIMIT);
+        items.reverse();
+        items
+    };
+    let history = oldest_first(Kind::Command);
+    let mut folders: Vec<PathBuf> = oldest_first(Kind::Folder)
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    folders.retain(|p| p != &left);
+    folders.push(left.clone());
+    let viewed: Vec<(PathBuf, bool)> = oldest_first(Kind::View)
+        .iter()
+        .filter_map(|item| {
+            let (tag, path) = item.split_once(':')?;
+            Some((PathBuf::from(path), tag == "e"))
+        })
+        .collect();
     let mut app = App {
         tui,
         panels: [Panel::new(left.clone()), Panel::new(right.clone())],
@@ -370,18 +404,60 @@ pub fn run(left: Option<String>, right: Option<String>) -> io::Result<()> {
         quick: None,
         overlay: Overlay::None,
         keybar: true,
-        history: Vec::new(),
+        history,
         history_pos: None,
-        folders: vec![left],
-        viewed: Vec::new(),
+        folders,
+        viewed,
         clipboard: Clipboard::default(),
         shell,
         quit: false,
-        masks: "*".into(),
-        find_mask: "*".into(),
-        find_text: String::new(),
+        masks: db.last(Kind::Mask).unwrap_or_else(|| "*".into()),
+        find_mask: db.last(Kind::FindMask).unwrap_or_else(|| "*".into()),
+        find_text: db.last(Kind::FindText).unwrap_or_default(),
+        db,
     };
     app.main_loop()
+}
+
+/// `far --keys`: prints each key as the program receives it, to find out which
+/// combinations a terminal delivers.
+pub fn show_keys() -> io::Result<()> {
+    let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    terminal::enable_raw_mode()?;
+    let mut out = io::stdout();
+    if enhanced {
+        execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )?;
+    }
+    let protocol = if enhanced { "yes" } else { "no" };
+    execute!(
+        out,
+        Print(format!(
+            "Keyboard protocol: {protocol}. Press keys; Ctrl+C quits.\r\n"
+        ))
+    )?;
+    let result = (|| -> io::Result<()> {
+        loop {
+            let Event::Key(raw) = event::read()? else {
+                continue;
+            };
+            if raw.kind == KeyEventKind::Release {
+                continue;
+            }
+            let key = screen::normalize_key(raw.code, raw.modifiers, enhanced);
+            execute!(out, Print(format!("{:?} {}\r\n", key.code, key.mods)))?;
+            if key.mods == CTRL && key.code == KeyCode::Char('c') {
+                return Ok(());
+            }
+        }
+    })();
+    if enhanced {
+        execute!(out, PopKeyboardEnhancementFlags)?;
+    }
+    terminal::disable_raw_mode()?;
+    result
 }
 
 fn same_dir(a: &Path, b: &Path) -> bool {
@@ -698,10 +774,43 @@ impl App {
         };
         if entry.is_up {
             self.go_up();
+        } else if self.panels[self.active].archive.is_some() {
+            if entry.is_dir {
+                self.panel().enter_archive_folder(&entry.name);
+            }
         } else if entry.is_dir {
             let path = self.panels[self.active].entry_path(&entry);
             let _ = self.navigate(&path, None);
+        } else {
+            let path = self.panels[self.active].entry_path(&entry);
+            if let Some(format) = archive::detect(&path) {
+                let _ = self.enter_archive(&path, format);
+            }
         }
+    }
+
+    /// Opens an archive in the active panel.
+    fn enter_archive(&mut self, path: &Path, format: Format) -> io::Result<()> {
+        if !format.is_available() {
+            let text = format!(
+                "{} is needed to open this archive",
+                format.tool().unwrap_or_default()
+            );
+            return dialog::alert(&mut self.tui, "Archive", &text);
+        }
+        self.show_wait("Archive", "Reading the archive...")?;
+        if let Err(text) = self.panel().open_archive(path, format) {
+            dialog::alert(&mut self.tui, "Archive", &text)?;
+        }
+        Ok(())
+    }
+
+    /// Shows a message while the program does something short.
+    fn show_wait(&mut self, title: &str, text: &str) -> io::Result<()> {
+        self.draw_main();
+        let lines = vec![text.to_string()];
+        dialog::draw_message(&mut self.tui.screen, title, &lines, &[], 0, false);
+        self.tui.draw()
     }
 
     fn navigate(&mut self, path: &Path, focus: Option<&OsString>) -> io::Result<()> {
@@ -722,6 +831,9 @@ impl App {
     }
 
     fn remember_folder(&mut self, path: PathBuf) {
+        if let Some(text) = path.to_str() {
+            self.db.add(Kind::Folder, text);
+        }
         self.folders.retain(|p| p != &path);
         self.folders.push(path);
         if self.folders.len() > HISTORY_LIMIT {
@@ -730,6 +842,10 @@ impl App {
     }
 
     fn remember_viewed(&mut self, path: &Path, edited: bool) {
+        if let Some(text) = path.to_str() {
+            let tag = if edited { "e" } else { "v" };
+            self.db.add(Kind::View, &format!("{tag}:{text}"));
+        }
         self.viewed.retain(|(p, e)| !(p == path && *e == edited));
         self.viewed.push((path.to_path_buf(), edited));
         if self.viewed.len() > HISTORY_LIMIT {
@@ -743,9 +859,18 @@ impl App {
         };
         if entry.is_up {
             self.go_up();
+        } else if self.panels[self.active].archive.is_some() {
+            if entry.is_dir {
+                self.panel().enter_archive_folder(&entry.name);
+            } else {
+                self.view_in_archive()?;
+            }
         } else if entry.is_dir {
             let path = self.panels[self.active].entry_path(&entry);
             self.navigate(&path, None)?;
+        } else if let Some(format) = archive::detect(Path::new(&entry.raw)) {
+            let path = self.panels[self.active].entry_path(&entry);
+            self.enter_archive(&path, format)?;
         } else if entry.exec {
             self.execute(&format!("./{}", shell_quote(&entry.name)))?;
         } else {
@@ -778,6 +903,7 @@ impl App {
 
     fn remember_command(&mut self, command: &str) {
         self.history_pos = None;
+        self.db.add(Kind::Command, command);
         self.history.retain(|c| c != command);
         self.history.push(command.to_string());
         if self.history.len() > HISTORY_LIMIT {
@@ -801,7 +927,11 @@ impl App {
         terminal::disable_raw_mode()?;
         execute!(
             out,
-            Print(format!("{}$ {command}\r\n", util::tilde(&cwd))),
+            Print(format!(
+                "{}$ {}\r\n",
+                util::printable(&util::tilde(&cwd)),
+                util::printable(command)
+            )),
             cursor::Show
         )?;
         let finished = self.shell.run(command, &cwd);
@@ -835,7 +965,10 @@ impl App {
         let mut out = io::stdout();
         loop {
             let (w, _) = terminal::size()?;
-            let prompt = format!("{}$ ", util::tilde(&self.panels[self.active].path));
+            let prompt = format!(
+                "{}$ ",
+                util::printable(&util::tilde(&self.panels[self.active].path))
+            );
             let prompt = fit_left(&prompt, (w / 2) as usize);
             let room = (w as usize).saturating_sub(str_width(&prompt)).max(1);
             let (shown, column) = dialog::visible_text(&self.cmd, room);
@@ -916,7 +1049,21 @@ impl App {
     }
 
     fn perform(&mut self, action: Action) -> io::Result<()> {
+        let inside = self.panels[self.active].archive.is_some();
+        if inside
+            && matches!(
+                action,
+                Action::Link | Action::Attributes | Action::CopyHere | Action::RenameHere
+            )
+        {
+            let text = "This command does not work inside an archive";
+            return dialog::alert(&mut self.tui, "Archive", text);
+        }
         match action {
+            Action::DeleteCurrent => self.delete_current()?,
+            Action::ArchiveAdd => self.archive_add()?,
+            Action::ArchiveExtract => self.archive_extract()?,
+            Action::ArchiveCommands => self.archive_commands()?,
             Action::View => self.view_current()?,
             Action::Edit => self.edit_current()?,
             Action::NewFile => self.new_file()?,
@@ -998,6 +1145,13 @@ impl App {
         if entry.is_up {
             return Ok(());
         }
+        if self.panels[self.active].archive.is_some() {
+            return if entry.is_dir {
+                Ok(())
+            } else {
+                self.view_in_archive()
+            };
+        }
         let path = self.panels[self.active].entry_path(&entry);
         if entry.is_dir {
             return self.folder_size(&path);
@@ -1006,20 +1160,52 @@ impl App {
     }
 
     fn view_file(&mut self, path: &Path) -> io::Result<()> {
-        self.remember_viewed(path, false);
-        match viewer::run(&mut self.tui, path) {
-            Ok(ViewerExit::Close) => {}
-            Ok(ViewerExit::Edit) => {
-                self.draw_main();
-                return self.edit_file(path);
+        let mut current = path.to_path_buf();
+        loop {
+            self.remember_viewed(&current, false);
+            let db = self.db.clone();
+            let exit = viewer::run(
+                &mut self.tui,
+                &current,
+                &mut self.keybar,
+                &mut self.clipboard,
+                &db,
+            );
+            self.draw_main();
+            match exit {
+                Ok(ViewerExit::Close) => {}
+                Ok(ViewerExit::Edit) => return self.edit_file(&current),
+                Ok(ViewerExit::GoToFile) => return self.jump_to(&current),
+                Ok(ViewerExit::History) => return self.view_history(),
+                Ok(ViewerExit::NextFile) | Ok(ViewerExit::PreviousFile) => {
+                    let forward = matches!(exit, Ok(ViewerExit::NextFile));
+                    if let Some(next) = self.adjacent_file(&current, forward) {
+                        current = next;
+                        continue;
+                    }
+                }
+                Err(e) => {
+                    let text = format!("{}\n{e}", current.display());
+                    dialog::alert(&mut self.tui, "Viewer", &text)?;
+                }
             }
-            Err(e) => {
-                self.draw_main();
-                dialog::alert(&mut self.tui, "Viewer", &format!("{}\n{e}", path.display()))?;
-            }
+            self.reload_all();
+            return Ok(());
         }
-        self.reload_all();
-        Ok(())
+    }
+
+    /// The next or previous file in the active panel, moving its cursor too.
+    fn adjacent_file(&mut self, current: &Path, forward: bool) -> Option<PathBuf> {
+        let panel = &mut self.panels[self.active];
+        let name = current.file_name()?;
+        let at = panel.entries.iter().position(|e| e.raw == name)?;
+        let found = if forward {
+            (at + 1..panel.entries.len()).find(|i| !panel.entries[*i].is_dir)
+        } else {
+            (0..at).rev().find(|i| !panel.entries[*i].is_dir)
+        }?;
+        panel.cursor = found;
+        Some(panel.entry_path(&panel.entries[found]))
     }
 
     fn edit_current(&mut self) -> io::Result<()> {
@@ -1029,13 +1215,25 @@ impl App {
         if entry.is_up || entry.is_dir {
             return Ok(());
         }
+        if self.panels[self.active].archive.is_some() {
+            return self.edit_in_archive();
+        }
         let path = self.panels[self.active].entry_path(&entry);
         self.edit_file(&path)
     }
 
     fn edit_file(&mut self, path: &Path) -> io::Result<()> {
         self.remember_viewed(path, true);
-        let exit = editor::run(&mut self.tui, path, &mut self.clipboard)?;
+        let name_on = |panel: &Panel| panel.current().filter(|e| !e.is_up).map(|e| e.name.clone());
+        let db = self.db.clone();
+        let mut ctx = EditorContext {
+            clipboard: &mut self.clipboard,
+            keybar: &mut self.keybar,
+            db: &db,
+            active_name: name_on(&self.panels[self.active]),
+            passive_name: name_on(&self.panels[1 - self.active]),
+        };
+        let exit = editor::run(&mut self.tui, path, &mut ctx)?;
         self.reload_all();
         if let Some(name) = path.file_name() {
             if path.parent() == Some(self.panels[self.active].path.as_path()) {
@@ -1043,11 +1241,14 @@ impl App {
                 self.panel().goto_name(&name);
             }
         }
-        if exit == EditorExit::View {
-            self.draw_main();
-            return self.view_file(path);
+        self.draw_main();
+        match exit {
+            EditorExit::Close => Ok(()),
+            EditorExit::View => self.view_file(path),
+            EditorExit::NewFile => self.new_file(),
+            EditorExit::GoToFile => self.jump_to(path),
+            EditorExit::History => self.view_history(),
         }
-        Ok(())
     }
 
     fn new_file(&mut self) -> io::Result<()> {
@@ -1115,7 +1316,11 @@ impl App {
         }
     }
 
+    /// Default target of F5 and F6: the passive panel's archive or folder.
     fn other_path(&self) -> String {
+        if let Some(view) = &self.panels[1 - self.active].archive {
+            return format!("{}:/{}", view.file.display(), view.folder);
+        }
         let mut text = self.panels[1 - self.active].path.display().to_string();
         if !text.ends_with('/') {
             text.push('/');
@@ -1124,6 +1329,12 @@ impl App {
     }
 
     fn copy_dialog(&mut self, here: bool) -> io::Result<()> {
+        if self.panels[self.active].archive.is_some() {
+            return self.extract_from_panel(false);
+        }
+        if !here && self.panels[1 - self.active].archive.is_some() {
+            return self.add_to_passive(false);
+        }
         let sources: Vec<PathBuf> = if here {
             self.panels[self.active]
                 .current_path()
@@ -1142,13 +1353,19 @@ impl App {
         };
         let label = format!("Copy {} to:", Self::describe(&sources));
         let mut form = Form::new(vec![
-            Field::text(&label, &default),
+            Field::with_history(&label, &default, Kind::Target),
             Field::check("Copy contents of symbolic links", false),
-        ]);
+        ])
+        .with_db(&self.db);
         if !form.run(&mut self.tui, "Copy")? || form.text(0).is_empty() {
             return Ok(());
         }
         let target = form.text(0);
+        if here && target == default && !sources[0].to_str().is_some() {
+            // The box shows a lossy name. Unedited, it would name another file.
+            return Ok(());
+        }
+        self.db.add(Kind::Target, &target);
         let options = CopyOptions {
             follow_symlinks: form.checked(1),
         };
@@ -1162,6 +1379,12 @@ impl App {
     }
 
     fn move_dialog(&mut self, here: bool) -> io::Result<()> {
+        if self.panels[self.active].archive.is_some() {
+            return self.extract_from_panel(true);
+        }
+        if !here && self.panels[1 - self.active].archive.is_some() {
+            return self.add_to_passive(true);
+        }
         let sources: Vec<PathBuf> = if here {
             self.panels[self.active]
                 .current_path()
@@ -1179,10 +1402,23 @@ impl App {
             self.other_path()
         };
         let label = format!("Rename or move {} to:", Self::describe(&sources));
-        let Some(target) = dialog::prompt(&mut self.tui, "Rename/Move", &label, &default)? else {
+        let db = self.db.clone();
+        let Some(target) = dialog::prompt_history(
+            &mut self.tui,
+            &db,
+            Kind::Target,
+            "Rename/Move",
+            &label,
+            &default,
+        )?
+        else {
             return Ok(());
         };
         if target.is_empty() {
+            return Ok(());
+        }
+        if here && target == default && !sources[0].to_str().is_some() {
+            // The box shows a lossy name. Unedited, it would rename the file.
             return Ok(());
         }
         let base = self.panels[self.active].path.clone();
@@ -1236,6 +1472,17 @@ impl App {
         if name.is_empty() {
             return Ok(());
         }
+        if let Some(view) = &self.panels[self.active].archive {
+            let Some(inner) = archive::safe_name(&archive::join_inner(&view.folder, &name)) else {
+                return dialog::alert(&mut self.tui, "Make folder", "That name is not allowed");
+            };
+            let (file, format) = (view.file.clone(), view.format);
+            let summary = self.run_op("Make folder", move |ui| {
+                archive::make_folder(&file, format, &inner, ui)
+            })?;
+            self.after_op(&summary);
+            return Ok(());
+        }
         let path = util::resolve_path(&self.panels[self.active].path, &name);
         match fs::create_dir_all(&path) {
             Ok(()) => {
@@ -1255,7 +1502,26 @@ impl App {
         Ok(())
     }
 
+    /// Shift+F8: the item under the cursor, whatever is selected.
+    fn delete_current(&mut self) -> io::Result<()> {
+        let selected: Vec<OsString> = self.panels[self.active]
+            .entries
+            .iter()
+            .filter(|e| e.selected)
+            .map(|e| e.raw.clone())
+            .collect();
+        self.panel().clear_selection();
+        let result = self.delete_dialog(false);
+        for entry in &mut self.panel().entries {
+            entry.selected = selected.contains(&entry.raw);
+        }
+        result
+    }
+
     fn delete_dialog(&mut self, permanent: bool) -> io::Result<()> {
+        if self.panels[self.active].archive.is_some() {
+            return self.delete_in_archive();
+        }
         let sources = self.panels[self.active].targets();
         if sources.is_empty() {
             return Ok(());
@@ -1296,14 +1562,15 @@ impl App {
         let single = (sources.len() == 1)
             .then(|| panel.current().cloned())
             .flatten();
-        let (mode, owner, group) = match (&single, fs::symlink_metadata(&sources[0])) {
-            (Some(_), Ok(meta)) => (
-                format!("{:04o}", meta.mode() & 0o7777),
-                fsops::user_name(meta.uid()),
-                fsops::group_name(meta.gid()),
-            ),
-            _ => Default::default(),
-        };
+        let (mode, owner, group): (String, String, String) =
+            match (&single, fs::symlink_metadata(&sources[0])) {
+                (Some(_), Ok(meta)) => (
+                    format!("{:04o}", meta.mode() & 0o7777),
+                    fsops::user_name(meta.uid()),
+                    fsops::group_name(meta.gid()),
+                ),
+                _ => Default::default(),
+            };
         let mut form = Form::new(vec![
             Field::Label(Self::describe(&sources)),
             Field::text("Permissions (octal, empty keeps them):", &mode),
@@ -1319,7 +1586,9 @@ impl App {
             ..Default::default()
         };
         let (mode_text, owner_text, group_text) = (form.text(1), form.text(2), form.text(3));
-        if !mode_text.trim().is_empty() && mode_text.trim() != mode {
+        // Only what the user changed is applied, recursively or not. Prefilled
+        // values describe the first item and must not spread to the others.
+        if field_changed(&mode_text, &mode) {
             let Some(value) = fsops::parse_mode(&mode_text) else {
                 return dialog::alert(
                     &mut self.tui,
@@ -1328,10 +1597,8 @@ impl App {
                 );
             };
             change.mode = Some(value);
-        } else if !mode_text.trim().is_empty() && change.recursive {
-            change.mode = fsops::parse_mode(&mode_text);
         }
-        if !owner_text.trim().is_empty() && (owner_text != owner || change.recursive) {
+        if field_changed(&owner_text, &owner) {
             let Some(value) = fsops::lookup_user(owner_text.trim()) else {
                 return dialog::alert(
                     &mut self.tui,
@@ -1341,7 +1608,7 @@ impl App {
             };
             change.uid = Some(value);
         }
-        if !group_text.trim().is_empty() && (group_text != group || change.recursive) {
+        if field_changed(&group_text, &group) {
             let Some(value) = fsops::lookup_group(group_text.trim()) else {
                 return dialog::alert(
                     &mut self.tui,
@@ -1359,6 +1626,420 @@ impl App {
         Ok(())
     }
 
+    /// Extracts the item under the cursor to a private folder.
+    fn extract_current_to_scratch(&mut self) -> io::Result<Option<(ScratchDir, PathBuf)>> {
+        let panel = &self.panels[self.active];
+        let (Some(view), Some(entry)) = (&panel.archive, panel.current()) else {
+            return Ok(None);
+        };
+        let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
+        let name = entry.name.clone();
+        let scratch = match ScratchDir::new() {
+            Ok(scratch) => scratch,
+            Err(e) => {
+                let text = e.to_string();
+                dialog::alert(&mut self.tui, "Archive", &text)?;
+                return Ok(None);
+            }
+        };
+        let request = ExtractRequest {
+            items: vec![archive::join_inner(&folder, &name)],
+            base: folder,
+            dest: scratch.path().to_path_buf(),
+        };
+        let summary = self.run_op("Extract", move |ui| {
+            archive::extract(&file, format, &request, ui)
+        })?;
+        let path = scratch.path().join(&name);
+        if summary.cancelled || fs::symlink_metadata(&path).is_err() {
+            return Ok(None);
+        }
+        Ok(Some((scratch, path)))
+    }
+
+    /// F3 inside an archive: views a temporary copy.
+    fn view_in_archive(&mut self) -> io::Result<()> {
+        let Some((scratch, path)) = self.extract_current_to_scratch()? else {
+            return Ok(());
+        };
+        let db = self.db.clone();
+        let exit = viewer::run(
+            &mut self.tui,
+            &path,
+            &mut self.keybar,
+            &mut self.clipboard,
+            &db,
+        );
+        self.draw_main();
+        drop(scratch);
+        match exit {
+            Ok(ViewerExit::Edit) => self.edit_in_archive(),
+            Ok(_) => Ok(()),
+            Err(e) => dialog::alert(&mut self.tui, "Viewer", &e.to_string()),
+        }
+    }
+
+    /// F4 inside an archive: edits a temporary copy and offers to put it back.
+    fn edit_in_archive(&mut self) -> io::Result<()> {
+        let Some((_scratch, path)) = self.extract_current_to_scratch()? else {
+            return Ok(());
+        };
+        let before = fs::read(&path).ok();
+        let db = self.db.clone();
+        let mut ctx = EditorContext {
+            clipboard: &mut self.clipboard,
+            keybar: &mut self.keybar,
+            db: &db,
+            active_name: None,
+            passive_name: None,
+        };
+        editor::run(&mut self.tui, &path, &mut ctx)?;
+        self.draw_main();
+        if fs::read(&path).ok() == before {
+            return Ok(());
+        }
+        let lines = vec!["The file changed. Update it in the archive?".to_string()];
+        let answer = dialog::message(
+            &mut self.tui,
+            "Archive",
+            &lines,
+            &["Update", "Discard"],
+            false,
+        )?;
+        if answer != Some(0) {
+            return Ok(());
+        }
+        let Some(view) = &self.panels[self.active].archive else {
+            return Ok(());
+        };
+        let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
+        let summary = self.run_op("Update archive", move |ui| {
+            archive::update_file(&file, format, &folder, &path, ui)
+        })?;
+        self.after_op(&summary);
+        Ok(())
+    }
+
+    /// F5 and F6 inside an archive.
+    fn extract_from_panel(&mut self, moving: bool) -> io::Result<()> {
+        let panel = &self.panels[self.active];
+        let Some(view) = &panel.archive else {
+            return Ok(());
+        };
+        let items = panel.archive_targets();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
+        let base_dir = panel.path.clone();
+        let default = self.other_path();
+        let what = match items.as_slice() {
+            [one] => one.rsplit('/').next().unwrap_or(one).to_string(),
+            many => format!("{} items", many.len()),
+        };
+        let verb = if moving { "Move" } else { "Extract" };
+        let db = self.db.clone();
+        let Some(target) = dialog::prompt_history(
+            &mut self.tui,
+            &db,
+            Kind::Target,
+            verb,
+            &format!("{verb} {what} to:"),
+            &default,
+        )?
+        else {
+            return Ok(());
+        };
+        if target.is_empty() {
+            return Ok(());
+        }
+        let passive = self.panels[1 - self.active]
+            .archive
+            .as_ref()
+            .filter(|_| target == default)
+            .map(|v| (v.file.clone(), v.format, v.folder.clone()));
+        if passive.as_ref().is_some_and(|(other, _, _)| *other == file) {
+            let text = "The source and target are the same archive";
+            return dialog::alert(&mut self.tui, "Archive", text);
+        }
+        let dest = util::resolve_path(&base_dir, &target);
+        let summary = self.run_op(verb, move |ui| {
+            let mut request = ExtractRequest {
+                items: items.clone(),
+                base: folder,
+                dest,
+            };
+            let mut scratch = None;
+            if passive.is_some() {
+                match ScratchDir::new() {
+                    Ok(dir) => {
+                        request.dest = dir.path().to_path_buf();
+                        scratch = Some(dir);
+                    }
+                    Err(e) => {
+                        ui.error(&file, &e.to_string());
+                        return OpSummary {
+                            skipped: 1,
+                            ..Default::default()
+                        };
+                    }
+                }
+            }
+            let mut summary = archive::extract(&file, format, &request, ui);
+            if let (Some((other, other_format, other_folder)), Some(dir), false, 0) =
+                (passive, &scratch, summary.cancelled, summary.skipped)
+            {
+                let sources: Vec<PathBuf> = fs::read_dir(dir.path())
+                    .map(|names| names.flatten().map(|e| e.path()).collect())
+                    .unwrap_or_default();
+                summary = archive::add(&other, other_format, &other_folder, &sources, ui);
+            }
+            // Only remove what is known to have arrived.
+            if moving && !summary.cancelled && summary.skipped == 0 {
+                return archive::delete(&file, format, &items, ui);
+            }
+            summary
+        })?;
+        self.after_op(&summary);
+        Ok(())
+    }
+
+    /// F5 and F6 with an archive on the passive panel.
+    fn add_to_passive(&mut self, moving: bool) -> io::Result<()> {
+        let sources = self.panels[self.active].targets();
+        let Some(view) = &self.panels[1 - self.active].archive else {
+            return Ok(());
+        };
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
+        let verb = if moving {
+            "Move to archive"
+        } else {
+            "Add to archive"
+        };
+        let lines = vec![
+            format!("{verb}: {}", Self::describe(&sources)),
+            self.other_path(),
+        ];
+        let answer = dialog::message(&mut self.tui, verb, &lines, &["OK", "Cancel"], false)?;
+        if answer != Some(0) {
+            return Ok(());
+        }
+        let summary = self.run_op(verb, move |ui| {
+            add_then_remove(&file, format, &folder, &sources, moving, ui)
+        })?;
+        self.after_op(&summary);
+        Ok(())
+    }
+
+    fn delete_in_archive(&mut self) -> io::Result<()> {
+        let panel = &self.panels[self.active];
+        let Some(view) = &panel.archive else {
+            return Ok(());
+        };
+        let items = panel.archive_targets();
+        if items.is_empty() {
+            return Ok(());
+        }
+        let (file, format) = (view.file.clone(), view.format);
+        let lines = vec![
+            "Delete from the archive, with no way to restore:".to_string(),
+            match items.as_slice() {
+                [one] => one.clone(),
+                many => format!("{} items", many.len()),
+            },
+        ];
+        let answer = dialog::message(
+            &mut self.tui,
+            "Delete from archive",
+            &lines,
+            &["Delete", "Cancel"],
+            true,
+        )?;
+        if answer != Some(0) {
+            return Ok(());
+        }
+        let summary = self.run_op("Delete from archive", move |ui| {
+            archive::delete(&file, format, &items, ui)
+        })?;
+        self.after_op(&summary);
+        Ok(())
+    }
+
+    /// Shift+F1: packs the selection into a new or existing archive.
+    fn archive_add(&mut self) -> io::Result<()> {
+        if self.panels[self.active].archive.is_some() {
+            let text = "Leave the archive first, or use F5 from the other panel";
+            return dialog::alert(&mut self.tui, "Add to archive", text);
+        }
+        let sources = self.panels[self.active].targets();
+        if sources.is_empty() {
+            return Ok(());
+        }
+        let base = self.panels[self.active].path.clone();
+        let stem = match sources.as_slice() {
+            [one] => one
+                .file_name()
+                .map_or(String::new(), |n| n.to_string_lossy().into_owned()),
+            _ => base
+                .file_name()
+                .map_or("archive".to_string(), |n| n.to_string_lossy().into_owned()),
+        };
+        let mut format = self
+            .db
+            .setting("archive.format")
+            .and_then(|ext| FORMATS.into_iter().find(|f| f.extension() == ext))
+            .unwrap_or(Format::Zip);
+        let name = format!("{stem}.{}", format.extension());
+        let mut form = Form::new(vec![
+            Field::with_history("&Archive name", &name, Kind::Target),
+            Field::check("&Move files to the archive", false),
+        ])
+        .with_buttons(&["Add", "&Format", "Cancel"])
+        .with_db(&self.db);
+        let title = format!("Add {} to archive", Self::describe(&sources));
+        loop {
+            match form.run_buttons(&mut self.tui, &title)? {
+                Some(0) => break,
+                Some(1) => {
+                    let items: Vec<String> = FORMATS
+                        .iter()
+                        .map(|f| match f.tool() {
+                            Some(tool) if !f.is_available() => {
+                                format!("{} (needs {tool})", f.extension())
+                            }
+                            _ => f.extension().to_string(),
+                        })
+                        .collect();
+                    let at = FORMATS.iter().position(|f| *f == format).unwrap_or(0);
+                    if let Some(i) = dialog::menu(&mut self.tui, "Format", &items, at)? {
+                        format = FORMATS[i];
+                        let text = form.text(0);
+                        let renamed = format!("{}.{}", archive::stem(&text), format.extension());
+                        form.set_text(0, &renamed);
+                    }
+                }
+                _ => return Ok(()),
+            }
+        }
+        let mut text = form.text(0);
+        if text.is_empty() {
+            return Ok(());
+        }
+        match archive::detect(Path::new(&text)) {
+            Some(named) => format = named,
+            None => text = format!("{text}.{}", format.extension()),
+        }
+        if !format.is_available() {
+            let message = format!("{} is not installed", format.tool().unwrap_or_default());
+            return dialog::alert(&mut self.tui, "Add to archive", &message);
+        }
+        self.db.add(Kind::Target, &text);
+        self.db.set_setting("archive.format", format.extension());
+        let file = util::resolve_path(&base, &text);
+        let moving = form.checked(1);
+        let target = file.clone();
+        let summary = self.run_op("Add to archive", move |ui| {
+            add_then_remove(&target, format, "", &sources, moving, ui)
+        })?;
+        self.after_op(&summary);
+        if file.parent() == Some(base.as_path()) {
+            if let Some(leaf) = file.file_name() {
+                let leaf = leaf.to_os_string();
+                self.panel().goto_name(&leaf);
+            }
+        }
+        Ok(())
+    }
+
+    /// Archives chosen on a normal panel.
+    fn chosen_archives(&self) -> Vec<(PathBuf, Format)> {
+        self.panels[self.active]
+            .targets()
+            .into_iter()
+            .filter_map(|path| archive::detect(&path).map(|format| (path, format)))
+            .collect()
+    }
+
+    /// Shift+F2: unpacks the chosen archives, or the items in the open one.
+    fn archive_extract(&mut self) -> io::Result<()> {
+        if self.panels[self.active].archive.is_some() {
+            return self.extract_from_panel(false);
+        }
+        let archives = self.chosen_archives();
+        if archives.is_empty() {
+            return dialog::alert(&mut self.tui, "Extract", "Choose an archive first");
+        }
+        let passive = &self.panels[1 - self.active];
+        let mut default = passive.path.display().to_string();
+        if !default.ends_with('/') {
+            default.push('/');
+        }
+        let mut form = Form::new(vec![
+            Field::with_history("Extract &to", &default, Kind::Target),
+            Field::check("&Into a folder named after the archive", false),
+        ])
+        .with_db(&self.db);
+        if !form.run(&mut self.tui, "Extract")? || form.text(0).is_empty() {
+            return Ok(());
+        }
+        self.db.add(Kind::Target, &form.text(0));
+        let dest = util::resolve_path(&self.panels[self.active].path, &form.text(0));
+        let own_folder = form.checked(1);
+        let summary = self.run_op("Extract", move |ui| {
+            let mut total = OpSummary::default();
+            for (file, format) in &archives {
+                let mut target = dest.clone();
+                if own_folder {
+                    let name = file.file_name().unwrap_or_default().to_string_lossy();
+                    target.push(archive::stem(&name));
+                }
+                let request = ExtractRequest {
+                    dest: target,
+                    ..Default::default()
+                };
+                let one = archive::extract(file, *format, &request, ui);
+                total.done += one.done;
+                total.skipped += one.skipped;
+                total.cancelled = one.cancelled;
+                if one.cancelled {
+                    break;
+                }
+            }
+            total
+        })?;
+        self.after_op(&summary);
+        Ok(())
+    }
+
+    /// Shift+F3: commands for the current archive.
+    fn archive_commands(&mut self) -> io::Result<()> {
+        let panel = &self.panels[self.active];
+        let target = match &panel.archive {
+            Some(view) => Some((view.file.clone(), view.format)),
+            None => self.chosen_archives().into_iter().next(),
+        };
+        let Some((file, format)) = target else {
+            return dialog::alert(&mut self.tui, "Archive commands", "Choose an archive first");
+        };
+        let items = vec!["Test archive".to_string()];
+        if dialog::menu(&mut self.tui, "Archive commands", &items, 0)? != Some(0) {
+            return Ok(());
+        }
+        if !format.is_available() {
+            let text = format!("{} is not installed", format.tool().unwrap_or_default());
+            return dialog::alert(&mut self.tui, "Test archive", &text);
+        }
+        self.show_wait("Test archive", "Reading the whole archive...")?;
+        let text = match archive::test(&file, format) {
+            Ok(count) => format!("No errors found in {count} items"),
+            Err(e) => format!("The archive is damaged:\n{e}"),
+        };
+        dialog::alert(&mut self.tui, "Test archive", &text)
+    }
+
     /// Refreshes panels. The selection clears only after complete success, so
     /// a partial failure leaves it in place for another attempt.
     fn after_op(&mut self, summary: &OpSummary) {
@@ -1371,8 +2052,11 @@ impl App {
     fn group_dialog(&mut self, select: bool) -> io::Result<()> {
         let title = if select { "Select" } else { "Unselect" };
         let masks = self.masks.clone();
-        let Some(text) = dialog::prompt(
+        let db = self.db.clone();
+        let Some(text) = dialog::prompt_history(
             &mut self.tui,
+            &db,
+            Kind::Mask,
             title,
             "Mask (several: comma separated):",
             &masks,
@@ -1529,15 +2213,26 @@ impl App {
 
     fn find_dialog(&mut self) -> io::Result<()> {
         let mut form = Form::new(vec![
-            Field::text("File mask (several: comma separated):", &self.find_mask),
-            Field::text("Containing text (optional):", &self.find_text),
+            Field::with_history(
+                "File mask (several: comma separated):",
+                &self.find_mask,
+                Kind::FindMask,
+            ),
+            Field::with_history(
+                "Containing text (optional):",
+                &self.find_text,
+                Kind::FindText,
+            ),
             Field::check("Ignore case of text", true),
-        ]);
+        ])
+        .with_db(&self.db);
         if !form.run(&mut self.tui, "Find files")? {
             return Ok(());
         }
         self.find_mask = form.text(0);
         self.find_text = form.text(1);
+        self.db.add(Kind::FindMask, &self.find_mask);
+        self.db.add(Kind::FindText, &self.find_text);
         let masks = if self.find_mask.is_empty() {
             "*".to_string()
         } else {
@@ -1706,21 +2401,7 @@ impl App {
     }
 
     fn help(&mut self) -> io::Result<()> {
-        let width = HELP.iter().map(|(k, _)| str_width(k)).max().unwrap_or(0);
-        let items: Vec<String> = HELP
-            .iter()
-            .map(|(k, v)| {
-                if v.is_empty() && !k.is_empty() {
-                    format!("--- {k} ---")
-                } else if k.is_empty() {
-                    String::new()
-                } else {
-                    format!("{}  {v}", fit(k, width))
-                }
-            })
-            .collect();
-        dialog::menu(&mut self.tui, "Help", &items, 0)?;
-        Ok(())
+        dialog::help_list(&mut self.tui, "Help", HELP)
     }
 
     /// F9: a menu bar with drop-down lists.
@@ -1779,11 +2460,43 @@ impl App {
     }
 }
 
+/// True when a prefilled attribute field holds a new value.
+fn field_changed(text: &str, prefilled: &str) -> bool {
+    !text.trim().is_empty() && text.trim() != prefilled.trim()
+}
+
+/// Adds files to an archive. With `moving`, the sources are removed only after
+/// nothing was skipped and the archive reads back without errors.
+fn add_then_remove(
+    file: &Path,
+    format: Format,
+    folder: &str,
+    sources: &[PathBuf],
+    moving: bool,
+    ui: &mut ChannelUi,
+) -> OpSummary {
+    let summary = archive::add(file, format, folder, sources, ui);
+    if !moving || summary.cancelled || summary.skipped > 0 {
+        return summary;
+    }
+    if let Err(e) = archive::test(file, format) {
+        ui.error(file, &e.to_string());
+        return OpSummary {
+            skipped: 1,
+            ..summary
+        };
+    }
+    fsops::delete_items(sources, true, ui)
+}
+
 /// Maps the remaining hot keys to actions.
 fn key_action(key: Key, enhanced: bool) -> Option<Action> {
     let shift_ctrl = CTRL | SHIFT;
     Some(match (key.mods, key.code) {
         (NONE, KeyCode::F(1)) => Action::Help,
+        (SHIFT, KeyCode::F(1)) => Action::ArchiveAdd,
+        (SHIFT, KeyCode::F(2)) => Action::ArchiveExtract,
+        (SHIFT, KeyCode::F(3)) => Action::ArchiveCommands,
         (NONE, KeyCode::F(3)) => Action::View,
         (NONE, KeyCode::F(4)) => Action::Edit,
         (SHIFT, KeyCode::F(4)) => Action::NewFile,
@@ -1795,7 +2508,7 @@ fn key_action(key: Key, enhanced: bool) -> Option<Action> {
         (NONE, KeyCode::F(7)) => Action::MkDir,
         (ALT, KeyCode::F(7)) => Action::FindFiles,
         (NONE, KeyCode::F(8)) => Action::Trash,
-        (SHIFT, KeyCode::F(8)) => Action::DeletePermanently,
+        (SHIFT, KeyCode::F(8)) => Action::DeleteCurrent,
         (ALT, KeyCode::F(8)) => Action::CommandHistory,
         (NONE, KeyCode::F(10)) => Action::Quit,
         (ALT, KeyCode::F(11)) => Action::ViewHistory,
@@ -1989,6 +2702,15 @@ fn draw_quick_view(s: &mut screen::Screen, source: &Panel, x: u16, w: u16, h: u1
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefilled_attribute_values_are_not_changes() {
+        assert!(!field_changed("0755", "0755"));
+        assert!(!field_changed(" 0755 ", "0755"));
+        assert!(!field_changed("", "0755"));
+        assert!(field_changed("0700", "0755"));
+        assert!(field_changed("0700", ""));
+    }
 
     #[test]
     fn quoting_is_safe_for_bash() {

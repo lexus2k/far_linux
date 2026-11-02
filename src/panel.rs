@@ -1,5 +1,6 @@
 //! A file panel: directory contents, sorting, selection and drawing.
 
+use crate::archive::{self, ArcEntry, Format};
 use crate::screen::{fit, fit_left, fit_name, str_width, theme, Screen, Style};
 use crate::util;
 use std::ffi::OsString;
@@ -49,9 +50,43 @@ pub enum View {
     Wide,
 }
 
+/// An open archive shown in a panel. `Panel::path` stays the folder that holds
+/// the archive file, which is where shell commands run.
+pub struct ArchiveView {
+    pub file: PathBuf,
+    pub format: Format,
+    pub folder: String,
+    items: Vec<ArcEntry>,
+    stamp: (i64, u64),
+}
+
+fn file_stamp(path: &Path) -> (i64, u64) {
+    fs::metadata(path).map_or((0, 0), |m| (m.mtime(), m.len()))
+}
+
+fn up_entry() -> Entry {
+    Entry {
+        name: "..".into(),
+        raw: "..".into(),
+        is_dir: true,
+        is_link: false,
+        is_up: true,
+        size: 0,
+        mtime: 0,
+        ctime: 0,
+        atime: 0,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        exec: false,
+        selected: false,
+    }
+}
+
 /// A directory panel.
 pub struct Panel {
     pub path: PathBuf,
+    pub archive: Option<ArchiveView>,
     pub entries: Vec<Entry>,
     pub cursor: usize,
     pub top: usize,
@@ -121,6 +156,7 @@ impl Panel {
     pub fn new(path: PathBuf) -> Self {
         let mut panel = Panel {
             path,
+            archive: None,
             entries: Vec::new(),
             cursor: 0,
             top: 0,
@@ -142,13 +178,14 @@ impl Panel {
     /// Rereads the directory, keeping the cursor and selection by name.
     pub fn reload(&mut self) {
         let keep = self.current().map(|e| e.raw.clone());
-        let selected: Vec<OsString> = self
+        let selected: std::collections::HashSet<OsString> = self
             .entries
             .iter()
             .filter(|e| e.selected)
             .map(|e| e.raw.clone())
             .collect();
         let index = self.cursor;
+        self.relist_archive();
         self.read_dir();
         for entry in &mut self.entries {
             entry.selected = selected.contains(&entry.raw);
@@ -159,26 +196,123 @@ impl Panel {
         }
     }
 
-    fn read_dir(&mut self) {
-        self.entries.clear();
-        self.error = None;
-        if self.path.parent().is_some() {
+    /// Reads the archive again, closing the view if the file is gone.
+    fn relist_archive(&mut self) {
+        let Some(view) = &mut self.archive else {
+            return;
+        };
+        view.stamp = file_stamp(&view.file);
+        match archive::list(&view.file, view.format) {
+            Ok(items) => view.items = items,
+            Err(_) if !view.file.exists() => self.archive = None,
+            Err(e) => {
+                view.items.clear();
+                self.error = Some(e.to_string());
+            }
+        }
+    }
+
+    fn read_archive(&mut self) {
+        let Some(view) = &self.archive else {
+            return;
+        };
+        self.entries.push(up_entry());
+        for item in archive::children(&view.items, &view.folder) {
+            let name = item
+                .path
+                .rsplit('/')
+                .next()
+                .unwrap_or(&item.path)
+                .to_string();
+            if !self.show_hidden && name.starts_with('.') {
+                continue;
+            }
             self.entries.push(Entry {
-                name: "..".into(),
-                raw: "..".into(),
-                is_dir: true,
-                is_link: false,
-                is_up: true,
-                size: 0,
-                mtime: 0,
-                ctime: 0,
-                atime: 0,
-                mode: 0,
+                raw: name.clone().into(),
+                name,
+                is_dir: item.is_dir,
+                is_link: item.is_link,
+                is_up: false,
+                size: item.size,
+                mtime: item.mtime,
+                ctime: item.mtime,
+                atime: item.mtime,
+                mode: item.mode,
                 uid: 0,
                 gid: 0,
                 exec: false,
                 selected: false,
             });
+        }
+        self.apply_sort();
+    }
+
+    /// Opens an archive at its top folder.
+    pub fn open_archive(&mut self, file: &Path, format: Format) -> Result<(), String> {
+        let items = archive::list(file, format).map_err(|e| format!("{}: {e}", file.display()))?;
+        self.archive = Some(ArchiveView {
+            file: file.to_path_buf(),
+            format,
+            folder: String::new(),
+            items,
+            stamp: file_stamp(file),
+        });
+        self.read_dir();
+        self.top = 0;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    /// Enters a folder of the open archive.
+    pub fn enter_archive_folder(&mut self, name: &str) {
+        if let Some(view) = &mut self.archive {
+            view.folder = archive::join_inner(&view.folder, name);
+        }
+        self.read_dir();
+        self.top = 0;
+        self.cursor = 0;
+    }
+
+    /// Where the panel is, as shown in its title.
+    pub fn location(&self) -> String {
+        match &self.archive {
+            Some(view) => format!("{}:/{}", util::tilde(&view.file), view.folder),
+            None => util::tilde(&self.path),
+        }
+    }
+
+    /// Archive paths of the selection, or of the item under the cursor.
+    pub fn archive_targets(&self) -> Vec<String> {
+        let Some(view) = &self.archive else {
+            return Vec::new();
+        };
+        let path = |e: &Entry| archive::join_inner(&view.folder, &e.name);
+        let selected: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| e.selected)
+            .map(path)
+            .collect();
+        if selected.is_empty() {
+            self.current()
+                .filter(|e| !e.is_up)
+                .map(path)
+                .into_iter()
+                .collect()
+        } else {
+            selected
+        }
+    }
+
+    fn read_dir(&mut self) {
+        self.entries.clear();
+        self.error = None;
+        if self.archive.is_some() {
+            self.read_archive();
+            return;
+        }
+        if self.path.parent().is_some() {
+            self.entries.push(up_entry());
         }
         self.dir_mtime = fs::metadata(&self.path).map(|m| m.mtime()).unwrap_or(0);
         self.free_bytes = free_space(&self.path);
@@ -201,6 +335,9 @@ impl Panel {
 
     /// True when the directory changed on disk since it was read.
     pub fn changed_on_disk(&self) -> bool {
+        if let Some(view) = &self.archive {
+            return file_stamp(&view.file) != view.stamp;
+        }
         fs::metadata(&self.path)
             .map(|m| m.mtime() != self.dir_mtime)
             .unwrap_or(false)
@@ -300,6 +437,7 @@ impl Panel {
             return Err(format!("{}: {e}", path.display()));
         }
         self.path = path.to_path_buf();
+        self.archive = None;
         self.read_dir();
         self.top = 0;
         self.cursor = focus
@@ -310,6 +448,29 @@ impl Panel {
 
     /// Goes to the parent directory with the cursor on the folder just left.
     pub fn go_up(&mut self) -> Result<(), String> {
+        if let Some(view) = &mut self.archive {
+            let focus: OsString = match view.folder.rsplit_once('/') {
+                Some((parent, leaf)) => {
+                    let leaf = leaf.into();
+                    view.folder = parent.to_string();
+                    leaf
+                }
+                None if view.folder.is_empty() => {
+                    let name = view.file.file_name().unwrap_or_default().to_os_string();
+                    self.archive = None;
+                    name
+                }
+                None => std::mem::take(&mut view.folder).into(),
+            };
+            self.read_dir();
+            self.top = 0;
+            self.cursor = self
+                .entries
+                .iter()
+                .position(|e| e.raw == focus)
+                .unwrap_or(0);
+            return Ok(());
+        }
         let Some(parent) = self.path.parent().map(Path::to_path_buf) else {
             return Ok(());
         };
@@ -663,7 +824,7 @@ impl Panel {
         } else {
             theme::PANEL
         };
-        s.title(x, y, w, &util::tilde(&self.path), title_style);
+        s.title(x, y, w, &self.location(), title_style);
         let mode = match (self.sort, self.reverse) {
             (Sort::Name, false) => 'n',
             (Sort::Name, true) => 'N',
@@ -752,6 +913,42 @@ mod tests {
         assert_eq!(p.targets(), vec![root.join("a")]);
         assert_eq!(p.current().unwrap().name, "c");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archives_browse_like_folders() {
+        let dir = std::env::temp_dir().join(format!("far_panel_arc_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("x.tar");
+        {
+            let mut b = tar::Builder::new(fs::File::create(&file).unwrap());
+            for name in ["top.txt", "sub/deep/inner.txt"] {
+                let mut h = tar::Header::new_gnu();
+                h.set_size(1);
+                h.set_mode(0o644);
+                b.append_data(&mut h, name, &b"x"[..]).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let mut p = Panel::new(dir.clone());
+        p.open_archive(&file, Format::Tar).unwrap();
+        assert_eq!(names(&p), ["..", "sub", "top.txt"]);
+        assert!(p.location().ends_with("x.tar:/"));
+        p.enter_archive_folder("sub");
+        p.enter_archive_folder("deep");
+        assert_eq!(names(&p), ["..", "inner.txt"]);
+        p.cursor = 1;
+        assert_eq!(p.archive_targets(), ["sub/deep/inner.txt"]);
+        assert!(!p.changed_on_disk());
+        p.go_up().unwrap();
+        assert_eq!(p.current().unwrap().name, "deep");
+        p.go_up().unwrap();
+        assert_eq!(p.current().unwrap().name, "sub");
+        p.go_up().unwrap();
+        assert!(p.archive.is_none());
+        assert_eq!(p.current().unwrap().name, "x.tar");
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

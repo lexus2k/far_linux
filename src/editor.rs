@@ -4,17 +4,20 @@
 
 use crate::dialog::{self, Field, Form};
 use crate::encoding;
+use crate::history::{History, Kind};
 use crate::screen::{
-    fit, fit_left, str_width, theme, Input, Screen, Tui, ALT, ALT_SHIFT, CTRL, CTRL_SHIFT, NONE,
-    SHIFT,
+    fit, fit_left, str_width, theme, Input, Key, Screen, Tui, ALT, ALT_SHIFT, CTRL, CTRL_SHIFT,
+    NONE, SHIFT,
 };
+use crate::search::{is_word_char, Hit, Matcher, SearchOptions};
 use crate::util;
 use crate::viewer::{cell_width, visible_char};
 use crossterm::event::KeyCode;
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -215,56 +218,27 @@ impl Buffer {
         cursor
     }
 
-    /// Finds a single-line pattern from `from`.
-    pub fn find(
-        &self,
-        needle: &str,
-        from: Pos,
-        ignore_case: bool,
-        backward: bool,
-    ) -> Option<(Pos, Pos)> {
-        let fold = |text: &str| -> Vec<char> {
-            if ignore_case {
-                text.chars()
-                    .map(|c| c.to_lowercase().next().unwrap_or(c))
-                    .collect()
-            } else {
-                text.chars().collect()
-            }
-        };
-        let pattern = fold(needle);
-        if pattern.is_empty() || needle.contains('\n') {
-            return None;
-        }
-        let matches = |line: &[char], at: usize| line[at..].starts_with(&pattern);
+    /// Finds the next or previous match, searching each line on its own.
+    pub fn find_with(&self, m: &Matcher, from: Pos, backward: bool) -> Option<(Pos, Pos, Hit)> {
+        let found = |l: usize, hit: Hit| Some((pos(l, hit.start), pos(l, hit.end), hit));
         if backward {
-            for l in (0..=from.line).rev() {
-                let line = fold(&self.lines[l]);
-                if line.len() < pattern.len() {
-                    continue;
-                }
-                let limit = if l == from.line { from.col } else { line.len() };
-                let highest = limit.min(line.len()).checked_sub(pattern.len());
-                if let Some(highest) = highest {
-                    for at in (0..=highest).rev() {
-                        if matches(&line, at) {
-                            return Some((pos(l, at), pos(l, at + pattern.len())));
-                        }
-                    }
+            for l in (0..=from.line.min(self.lines.len() - 1)).rev() {
+                let line = &self.lines[l];
+                let limit = if l == from.line {
+                    from.col.min(line_len(line))
+                } else {
+                    line_len(line)
+                };
+                if let Some(hit) = m.find(line, limit, true) {
+                    return found(l, hit);
                 }
             }
             return None;
         }
         for l in from.line..self.lines.len() {
-            let line = fold(&self.lines[l]);
-            let begin = if l == from.line { from.col } else { 0 };
-            if line.len() < pattern.len() || begin > line.len() - pattern.len() {
-                continue;
-            }
-            for at in begin..=line.len() - pattern.len() {
-                if matches(&line, at) {
-                    return Some((pos(l, at), pos(l, at + pattern.len())));
-                }
+            let start = if l == from.line { from.col } else { 0 };
+            if let Some(hit) = m.find(&self.lines[l], start, false) {
+                return found(l, hit);
             }
         }
         None
@@ -357,7 +331,7 @@ pub fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
-    let mode = existing.as_ref().map_or(0o666, |m| m.mode() & 0o7777);
+    let mode = existing.as_ref().map_or(0o666, |m| m.mode() & 0o777);
     let opened = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -365,10 +339,23 @@ pub fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
         .open(&temp);
     let mut file = match opened {
         Ok(file) => file,
-        // A read-only folder can still hold a writable file.
-        Err(_) if existing.is_some() => return write_in_place(&real, data),
+        // A read-only folder can still hold a writable file. Other errors,
+        // such as a full disk, would only destroy the file in place as well.
+        Err(e) if existing.is_some() && e.kind() == io::ErrorKind::PermissionDenied => {
+            return write_in_place(&real, data);
+        }
         Err(e) => return Err(e),
     };
+    // Renaming must not hand the file to another group. If the group cannot be
+    // kept, the only way to preserve ownership is to write in place.
+    if let Some(meta) = &existing {
+        let group_differs = file.metadata().is_ok_and(|m| m.gid() != meta.gid());
+        if group_differs && std::os::unix::fs::fchown(&file, None, Some(meta.gid())).is_err() {
+            drop(file);
+            let _ = fs::remove_file(&temp);
+            return write_in_place(&real, data);
+        }
+    }
     let result = (|| {
         file.write_all(data)?;
         file.sync_all()?;
@@ -384,12 +371,43 @@ pub fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     result
 }
 
+/// What in-place saving needs from a file, so that failures can be tested.
+trait Rewritable: Write + Seek {
+    fn set_length(&mut self, length: u64) -> io::Result<()>;
+}
+
+impl Rewritable for fs::File {
+    fn set_length(&mut self, length: u64) -> io::Result<()> {
+        self.set_len(length)
+    }
+}
+
+/// Overwrites `file` with `data`. If that fails, the old contents go back, so
+/// that a full disk does not cost the user the file. An error says whether the
+/// restore worked too.
+fn rewrite_keeping_old<F: Rewritable>(file: &mut F, old: &[u8], data: &[u8]) -> io::Result<()> {
+    let write = |file: &mut F, bytes: &[u8]| -> io::Result<()> {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(bytes)?;
+        file.flush()?;
+        file.set_length(bytes.len() as u64)
+    };
+    let Err(error) = write(file, data) else {
+        return Ok(());
+    };
+    match write(file, old) {
+        Ok(()) => Err(error),
+        Err(_) => Err(io::Error::new(
+            error.kind(),
+            format!("{error}. The file on disk may be damaged"),
+        )),
+    }
+}
+
 fn write_in_place(path: &Path, data: &[u8]) -> io::Result<()> {
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(path)?;
-    file.write_all(data)?;
+    let old = fs::read(path)?;
+    let mut file = fs::OpenOptions::new().write(true).open(path)?;
+    rewrite_keeping_old(&mut file, &old, data)?;
     file.sync_all()
 }
 
@@ -405,6 +423,9 @@ pub struct Clipboard {
 pub enum EditorExit {
     Close,
     View,
+    NewFile,
+    GoToFile,
+    History,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -432,9 +453,12 @@ pub struct Editor {
     selection: Option<Selection>,
     overwrite: bool,
     mtime: Option<(i64, i64)>,
-    search: String,
-    replace: String,
-    ignore_case: bool,
+    search: SearchOptions,
+    last_replace: bool,
+    last_hit: Option<(Pos, Pos)>,
+    bookmarks: [Option<Pos>; 10],
+    locked: bool,
+    status_bar: bool,
 }
 
 fn stamp(meta: &fs::Metadata) -> (i64, i64) {
@@ -500,9 +524,12 @@ impl Editor {
             selection: None,
             overwrite: false,
             mtime,
-            search: String::new(),
-            replace: String::new(),
-            ignore_case: true,
+            search: SearchOptions::default(),
+            last_replace: false,
+            last_hit: None,
+            bookmarks: [None; 10],
+            locked: false,
+            status_bar: true,
         })
     }
 
@@ -515,7 +542,7 @@ impl Editor {
     }
 
     fn select_for(&mut self, mods: crossterm::event::KeyModifiers) {
-        let kind = if mods == ALT_SHIFT {
+        let kind = if mods.contains(ALT) {
             Some(SelKind::Vertical)
         } else if mods.contains(SHIFT) {
             Some(SelKind::Stream)
@@ -801,24 +828,39 @@ impl Editor {
         }
     }
 
-    fn draw(&mut self, s: &mut Screen) {
-        let (w, h) = (s.w as usize, s.h as usize);
-        let rows = h.saturating_sub(2).max(1);
+    /// Rows available for text.
+    fn text_rows(&self, screen_h: u16, keybar: bool) -> usize {
+        let bars = usize::from(self.status_bar) + usize::from(keybar);
+        (screen_h as usize).saturating_sub(bars).max(1)
+    }
+
+    fn draw(&mut self, s: &mut Screen, keybar: bool) {
+        let w = s.w as usize;
+        let rows = self.text_rows(s.h, keybar);
+        let first = u16::from(self.status_bar);
         self.scroll_into_view(rows, w.max(1));
         s.fill(0, 0, s.w, s.h, ' ', theme::EDITOR);
-        let info = format!(
-            " {}{} {} {} Ln {}/{} Col {} ",
-            if self.buf.is_modified() { "* " } else { "" },
-            encoding::NAMES[self.format.enc],
-            if self.format.crlf { "CRLF" } else { "LF" },
-            if self.overwrite { "OVR" } else { "INS" },
-            self.cursor.line + 1,
-            self.buf.lines.len(),
-            vis_of(self.line(), self.cursor.col) + 1,
-        );
-        let room = w.saturating_sub(str_width(&info));
-        let title = fit(&fit_left(&util::tilde(&self.path), room), room);
-        s.put(0, 0, &format!("{title}{info}"), theme::STATUS);
+        if self.status_bar {
+            let info = format!(
+                " {}{} {} {} Ln {}/{} Col {} ",
+                if self.buf.is_modified() { "* " } else { "" },
+                encoding::NAMES[self.format.enc],
+                if self.format.crlf { "CRLF" } else { "LF" },
+                if self.locked {
+                    "RO"
+                } else if self.overwrite {
+                    "OVR"
+                } else {
+                    "INS"
+                },
+                self.cursor.line + 1,
+                self.buf.lines.len(),
+                vis_of(self.line(), self.cursor.col) + 1,
+            );
+            let room = w.saturating_sub(str_width(&info));
+            let title = fit(&fit_left(&util::tilde(&self.path), room), room);
+            s.put(0, 0, &format!("{title}{info}"), theme::STATUS);
+        }
         let stream = self.stream_range();
         let block = self.block_range();
         let mut buf = [0u8; 4];
@@ -827,6 +869,7 @@ impl Editor {
             let Some(line) = self.buf.lines.get(line_no) else {
                 break;
             };
+            let row = y as u16 + first;
             let mut vis = 0;
             for (i, c) in line.chars().enumerate() {
                 let cells = cell_width(c, vis);
@@ -846,32 +889,369 @@ impl Editor {
                         break;
                     }
                     if c == '\t' {
-                        s.fill(x as u16, y as u16 + 1, cells as u16, 1, ' ', style);
+                        s.fill(x as u16, row, cells as u16, 1, ' ', style);
                     } else {
-                        s.put(
-                            x as u16,
-                            y as u16 + 1,
-                            visible_char(c).encode_utf8(&mut buf),
-                            style,
-                        );
+                        s.put(x as u16, row, visible_char(c).encode_utf8(&mut buf), style);
                     }
                 }
                 vis += cells;
             }
         }
         let x = vis_of(self.line(), self.cursor.col).saturating_sub(self.left);
-        s.cursor = Some((x as u16, (self.cursor.line - self.top) as u16 + 1));
-        s.keybar(
-            s.h - 1,
-            &[
-                "Help", "Save", "", "", "", "View", "Search", "Encod", "", "Quit", "", "",
-            ],
-        );
+        s.cursor = Some((x as u16, (self.cursor.line - self.top) as u16 + first));
+        if keybar {
+            s.keybar(
+                s.h.saturating_sub(1),
+                &[
+                    "Help", "Save", "", "Quit", "", "View", "Search", "Encod", "", "Quit", "", "",
+                ],
+            );
+        }
+    }
+
+    /// The word under or just before the cursor.
+    fn word_at_cursor(&self) -> String {
+        let chars: Vec<char> = self.line().chars().collect();
+        let mut start = self.cursor.col.min(chars.len());
+        let mut end = start;
+        while start > 0 && is_word_char(chars[start - 1]) {
+            start -= 1;
+        }
+        while end < chars.len() && is_word_char(chars[end]) {
+            end += 1;
+        }
+        chars[start..end].iter().collect()
+    }
+
+    /// Where the next search starts. An empty match must not be found twice.
+    fn search_start(&self, backward: bool) -> Option<Pos> {
+        let empty_here = self
+            .last_hit
+            .is_some_and(|(a, b)| a == b && b == self.cursor);
+        if !backward {
+            return Some(if empty_here {
+                pos(self.cursor.line, self.cursor.col + 1)
+            } else {
+                self.cursor
+            });
+        }
+        if let Some((a, _)) = self.stream_range() {
+            return Some(a);
+        }
+        if !empty_here {
+            return Some(self.cursor);
+        }
+        position_before(&self.buf, self.cursor)
+    }
+
+    fn select_hit(&mut self, a: Pos, b: Pos) {
+        self.selection = Some(Selection {
+            kind: SelKind::Stream,
+            anchor: a,
+            anchor_vis: 0,
+        });
+        self.cursor = b;
+        self.last_hit = Some((a, b));
+        self.sync_vis();
+    }
+
+    /// Moves to the next or previous match. Returns false if there is none.
+    pub fn find_next(&mut self, m: &Matcher, backward: bool) -> bool {
+        let Some(from) = self.search_start(backward) else {
+            return false;
+        };
+        match self.buf.find_with(m, from, backward) {
+            Some((a, b, _)) => {
+                self.select_hit(a, b);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Lists every match in the file.
+    pub fn find_all(&self, m: &Matcher) -> Vec<(Pos, Pos)> {
+        let mut hits = Vec::new();
+        let mut at = Pos::default();
+        while let Some((a, b, _)) = self.buf.find_with(m, at, false) {
+            hits.push((a, b));
+            at = if a == b { pos(b.line, b.col + 1) } else { b };
+        }
+        hits
+    }
+
+    /// Replaces every match from the cursor without asking. Returns the count.
+    pub fn replace_remaining(&mut self, m: &Matcher, backward: bool) -> usize {
+        let mut count = 0;
+        let Some(mut at) = self.search_start(backward) else {
+            return 0;
+        };
+        self.buf.begin_group();
+        while let Some((a, b, hit)) = self.buf.find_with(m, at, backward) {
+            match self.replace_hit(m, a, b, &hit, backward) {
+                Some(next) => at = next,
+                None => {
+                    count += 1;
+                    break;
+                }
+            }
+            count += 1;
+        }
+        self.buf.end_group();
+        self.selection = None;
+        self.cursor = self.buf.clamp(at);
+        self.sync_vis();
+        count
+    }
+
+    /// Replaces one match. Returns where to continue, or `None` at the start
+    /// of the file when going backward.
+    fn replace_hit(
+        &mut self,
+        m: &Matcher,
+        a: Pos,
+        b: Pos,
+        hit: &Hit,
+        backward: bool,
+    ) -> Option<Pos> {
+        let end = self.buf.replace(a, b, &m.replacement(hit), a);
+        self.cursor = end;
+        self.last_hit = None;
+        if backward {
+            return if a == b {
+                position_before(&self.buf, a)
+            } else {
+                Some(a)
+            };
+        }
+        Some(if a == b {
+            pos(end.line, end.col + 1)
+        } else {
+            end
+        })
+    }
+
+    /// Lines covered by the selection, or the current line.
+    fn selected_lines(&self) -> (usize, usize) {
+        if let Some((a, b)) = self.stream_range() {
+            // A selection ending at column 0 does not include that line.
+            let last = if b.col == 0 && b.line > a.line {
+                b.line - 1
+            } else {
+                b.line
+            };
+            return (a.line, last);
+        }
+        if let Some((lo, hi, _, _)) = self.block_range() {
+            return (lo, hi);
+        }
+        (self.cursor.line, self.cursor.line)
+    }
+
+    /// Alt+I and Alt+U: shifts lines right or left by one position.
+    pub fn shift_lines(&mut self, right: bool) {
+        let (lo, hi) = self.selected_lines();
+        let before = self.cursor;
+        self.buf.begin_group();
+        for l in lo..=hi {
+            if right {
+                self.buf.replace(pos(l, 0), pos(l, 0), " ", before);
+            } else if self.buf.lines[l].starts_with([' ', '\t']) {
+                self.buf.replace(pos(l, 0), pos(l, 1), "", before);
+            }
+        }
+        self.buf.end_group();
+        self.cursor = self.buf.clamp(before);
+        self.sync_vis();
+    }
+
+    /// Ctrl+C with no selection copies the current line.
+    fn copy_or_line(&self) -> Clipboard {
+        self.copy_selection().unwrap_or_else(|| Clipboard {
+            text: format!("{}\n", self.line()),
+            vertical: false,
+        })
+    }
+
+    fn insert_name(&mut self, name: Option<&str>) {
+        if let Some(name) = name {
+            self.type_text(name);
+        }
+    }
+}
+
+/// The position just before `p`, or `None` at the start of the file.
+fn position_before(buf: &Buffer, p: Pos) -> Option<Pos> {
+    if p.col > 0 {
+        Some(pos(p.line, p.col - 1))
+    } else if p.line > 0 {
+        Some(pos(p.line - 1, line_len(&buf.lines[p.line - 1])))
+    } else {
+        None
+    }
+}
+
+/// Parses one value of the go-to dialog into a zero-based index: absolute,
+/// `+n` or `-n` relative, `n%`, and `0xN`, `$N`, `Nh` or `Nm` number forms.
+pub fn parse_goto_value(text: &str, current: usize, total: usize, hex: bool) -> Option<usize> {
+    let text = text.trim();
+    let (sign, body) = match text.chars().next()? {
+        '+' => (1, &text[1..]),
+        '-' => (-1, &text[1..]),
+        _ => (0, text),
+    };
+    let lower = body.to_lowercase();
+    if let Some(percent) = lower.strip_suffix('%') {
+        let value: usize = percent.parse().ok()?;
+        return Some((total.saturating_mul(value.min(100)) / 100).min(total.saturating_sub(1)));
+    }
+    let number = if let Some(digits) = lower.strip_prefix("0x").or(lower.strip_prefix('$')) {
+        usize::from_str_radix(digits, 16).ok()?
+    } else if let Some(digits) = lower.strip_suffix('h') {
+        usize::from_str_radix(digits, 16).ok()?
+    } else if let Some(digits) = lower.strip_suffix('m') {
+        digits.parse().ok()?
+    } else if hex {
+        usize::from_str_radix(&lower, 16).ok()?
+    } else {
+        lower.parse().ok()?
+    };
+    Some(match sign {
+        1 => current.saturating_add(number),
+        -1 => current.saturating_sub(number),
+        _ => number.saturating_sub(1),
+    })
+}
+
+/// Parses `line[,column]`. Either part may be left out to keep its value.
+pub fn parse_goto(text: &str, cursor: Pos, buf: &Buffer, hex: bool) -> Option<Pos> {
+    let mut parts = text.splitn(2, |c: char| " ,.;:".contains(c));
+    let line_text = parts.next().unwrap_or("").trim();
+    let col_text = parts.next().unwrap_or("").trim();
+    if line_text.is_empty() && col_text.is_empty() {
+        return None;
+    }
+    let line = if line_text.is_empty() {
+        cursor.line
+    } else {
+        parse_goto_value(line_text, cursor.line, buf.lines.len(), hex)?
+    };
+    let line = line.min(buf.lines.len() - 1);
+    let col = if col_text.is_empty() {
+        cursor.col
+    } else {
+        parse_goto_value(col_text, cursor.col, line_len(&buf.lines[line]), hex)?
+    };
+    Some(buf.clamp(pos(line, col)))
+}
+
+/// The character Ctrl+Q inserts for the next key.
+pub fn literal_char(key: Key) -> Option<char> {
+    match key.code {
+        KeyCode::Char(c) if key.mods.contains(CTRL) && c.is_ascii() => {
+            Some(((c.to_ascii_uppercase() as u8) & 0x1f) as char)
+        }
+        KeyCode::Char(c) => Some(c),
+        KeyCode::Tab => Some('\t'),
+        KeyCode::Enter => Some('\r'),
+        KeyCode::Esc => Some('\x1b'),
+        KeyCode::Backspace => Some('\x08'),
+        _ => None,
+    }
+}
+
+/// What the editor needs from the rest of the program.
+pub struct EditorContext<'a> {
+    pub clipboard: &'a mut Clipboard,
+    pub keybar: &'a mut bool,
+    pub db: &'a Rc<History>,
+    /// Name under the cursor on the active panel, for Shift+Enter.
+    pub active_name: Option<String>,
+    /// Name under the cursor on the passive panel, for Ctrl+Shift+Enter.
+    pub passive_name: Option<String>,
+}
+
+const HELP: &[(&str, &str)] = &[
+    ("Movement", ""),
+    ("Ctrl+Left, Ctrl+Right", "Word left, word right"),
+    ("Ctrl+S", "Left, staying on the line"),
+    ("Ctrl+Up, Ctrl+Down", "Scroll the screen"),
+    (
+        "Ctrl+Home, Ctrl+End",
+        "Start, end of file (also Ctrl+PgUp, Ctrl+PgDn)",
+    ),
+    ("Ctrl+N, Ctrl+E", "Start, end of screen"),
+    ("Alt+F8", "Go to line and column"),
+    ("Ctrl+Shift+0..9, Ctrl+0..9", "Set, go to bookmark"),
+    ("", ""),
+    ("Deleting", ""),
+    ("Ctrl+Y, Ctrl+K", "Delete line, delete to end of line"),
+    ("Ctrl+BS", "Delete word left"),
+    ("Ctrl+T, Ctrl+Del", "Delete word right"),
+    ("Ctrl+D", "Delete block"),
+    ("", ""),
+    ("Blocks", ""),
+    ("Shift+arrows, Ctrl+Shift+arrows", "Select"),
+    ("Alt+arrows, Alt+Shift+arrows", "Select vertical block"),
+    ("Ctrl+A, Ctrl+U", "Select all, deselect"),
+    (
+        "Ctrl+C, Ctrl+Ins",
+        "Copy, or the current line if nothing is selected",
+    ),
+    ("Ctrl+X, Shift+Del", "Cut"),
+    ("Ctrl+V, Shift+Ins", "Paste"),
+    ("Ctrl++", "Append to clipboard"),
+    ("Alt+I, Alt+U", "Shift right, shift left"),
+    ("", ""),
+    ("Search", ""),
+    ("F7, Ctrl+F7", "Search, replace"),
+    ("Shift+F7, Alt+F7", "Continue forward, backward"),
+    ("", ""),
+    ("File", ""),
+    ("F2, Shift+F2", "Save, save as"),
+    ("F4, F10, Esc", "Quit"),
+    ("Shift+F10", "Save and quit"),
+    ("Shift+F4", "Edit a new file"),
+    ("F6", "Viewer"),
+    ("F8, Shift+F8", "Next encoding, choose encoding"),
+    ("Ctrl+F10", "Go to this file in the panel"),
+    ("Alt+F11", "File view and edit history"),
+    ("", ""),
+    ("Other", ""),
+    ("Ctrl+Z, Alt+BS", "Undo"),
+    ("Ctrl+Shift+Z", "Redo"),
+    ("Ins", "Insert or overwrite"),
+    ("Ctrl+L", "Lock against changes"),
+    ("Ctrl+O", "User screen"),
+    ("Ctrl+Q", "Insert the next key as a character"),
+    ("Shift+Enter", "Insert file name from the active panel"),
+    (
+        "Ctrl+Shift+Enter",
+        "Insert file name from the passive panel",
+    ),
+    ("Ctrl+F", "Insert the full name of this file"),
+    ("Ctrl+B, Ctrl+Shift+B", "Key bar, status line"),
+];
+
+/// Keys that change the text, which Ctrl+L blocks.
+fn changes_text(key: Key) -> bool {
+    match (key.mods, key.code) {
+        (NONE, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) => true,
+        (NONE, KeyCode::Backspace | KeyCode::Delete) => true,
+        (SHIFT, KeyCode::Enter | KeyCode::Delete | KeyCode::Insert) => true,
+        (CTRL_SHIFT, KeyCode::Enter | KeyCode::Char('z')) => true,
+        (CTRL, KeyCode::Backspace | KeyCode::Delete | KeyCode::Insert) => {
+            key.code != KeyCode::Insert
+        }
+        (CTRL, KeyCode::Char(c)) => "htykzxvdqf".contains(c),
+        (ALT, KeyCode::Backspace | KeyCode::Char('i') | KeyCode::Char('u')) => true,
+        (NONE | CTRL, KeyCode::F(7)) => key.mods == CTRL,
+        _ => false,
     }
 }
 
 /// Runs the editor until it is closed.
-pub fn run(tui: &mut Tui, path: &Path, clip: &mut Clipboard) -> io::Result<EditorExit> {
+pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<EditorExit> {
     let mut ed = match Editor::open(path) {
         Ok(ed) => ed,
         Err(text) => {
@@ -879,13 +1259,15 @@ pub fn run(tui: &mut Tui, path: &Path, clip: &mut Clipboard) -> io::Result<Edito
             return Ok(EditorExit::Close);
         }
     };
+    ed.search = ctx.db.load_search();
+    let ctrl_alt = CTRL | ALT;
     loop {
-        ed.draw(&mut tui.screen);
+        ed.draw(&mut tui.screen, *ctx.keybar);
         tui.draw()?;
         let input = tui.read(Duration::from_millis(1000))?;
         let key = match input {
             Some(Input::Key(key)) => key,
-            Some(Input::Paste(text)) => {
+            Some(Input::Paste(text)) if !ed.locked => {
                 let text = text.replace("\r\n", "\n").replace('\r', "\n");
                 let start = ed.cursor;
                 ed.selection = None;
@@ -895,42 +1277,53 @@ pub fn run(tui: &mut Tui, path: &Path, clip: &mut Clipboard) -> io::Result<Edito
             }
             _ => continue,
         };
-        let rows = (tui.screen.h as usize).saturating_sub(2).max(1) as isize;
-        let moving = matches!(key.mods, NONE | SHIFT | ALT_SHIFT);
+        if ed.locked && changes_text(key) {
+            continue;
+        }
+        let rows = ed.text_rows(tui.screen.h, *ctx.keybar) as isize;
+        let selecting = matches!(key.mods, NONE | SHIFT | ALT | ALT_SHIFT) || key.mods == ctrl_alt;
         match (key.mods, key.code) {
-            (_, KeyCode::Up) if moving => {
+            (_, KeyCode::Up) if selecting => {
                 ed.select_for(key.mods);
                 ed.move_vertical(-1);
             }
-            (_, KeyCode::Down) if moving => {
+            (_, KeyCode::Down) if selecting => {
                 ed.select_for(key.mods);
                 ed.move_vertical(1);
             }
-            (_, KeyCode::Left) if moving => {
+            (_, KeyCode::Left) if selecting => {
                 ed.select_for(key.mods);
                 ed.move_left();
             }
-            (_, KeyCode::Right) if moving => {
+            (_, KeyCode::Right) if selecting => {
                 ed.select_for(key.mods);
                 ed.move_right();
             }
-            (_, KeyCode::PageUp) if moving => {
+            (_, KeyCode::PageUp) if selecting => {
                 ed.select_for(key.mods);
                 ed.move_vertical(-rows);
             }
-            (_, KeyCode::PageDown) if moving => {
+            (_, KeyCode::PageDown) if selecting => {
                 ed.select_for(key.mods);
                 ed.move_vertical(rows);
             }
-            (_, KeyCode::Home) if moving => {
+            (_, KeyCode::Home) if selecting => {
                 ed.select_for(key.mods);
                 ed.cursor.col = 0;
                 ed.sync_vis();
             }
-            (_, KeyCode::End) if moving => {
+            (_, KeyCode::End) if selecting => {
                 ed.select_for(key.mods);
                 ed.cursor.col = line_len(ed.line());
                 ed.sync_vis();
+            }
+            (CTRL_SHIFT, KeyCode::Up) => {
+                ed.select_for(SHIFT);
+                ed.move_vertical(-1);
+            }
+            (CTRL_SHIFT, KeyCode::Down) => {
+                ed.select_for(SHIFT);
+                ed.move_vertical(1);
             }
             (CTRL, KeyCode::Left) | (CTRL_SHIFT, KeyCode::Left) => {
                 ed.select_for(key.mods - CTRL);
@@ -950,10 +1343,37 @@ pub fn run(tui: &mut Tui, path: &Path, clip: &mut Clipboard) -> io::Result<Edito
                 ed.cursor = ed.buf.clamp(pos(usize::MAX, usize::MAX));
                 ed.sync_vis();
             }
+            (CTRL, KeyCode::Char('s')) => {
+                ed.selection = None;
+                ed.cursor.col = ed.cursor.col.saturating_sub(1);
+                ed.sync_vis();
+            }
+            (CTRL, KeyCode::Char('n')) => {
+                ed.selection = None;
+                ed.cursor.line = ed.top;
+                ed.move_vertical(0);
+            }
+            (CTRL, KeyCode::Char('e')) => {
+                ed.selection = None;
+                ed.cursor.line = ed.top + rows as usize - 1;
+                ed.move_vertical(0);
+            }
             (CTRL, KeyCode::Up) => ed.top = ed.top.saturating_sub(1),
             (CTRL, KeyCode::Down) => ed.top = (ed.top + 1).min(ed.buf.lines.len() - 1),
-            (NONE, KeyCode::Enter) | (SHIFT, KeyCode::Enter) => ed.type_text("\n"),
+            (NONE, KeyCode::Enter) => ed.type_text("\n"),
             (NONE, KeyCode::Tab) => ed.type_text("\t"),
+            (SHIFT, KeyCode::Enter) => {
+                let name = ctx.active_name.clone();
+                ed.insert_name(name.as_deref());
+            }
+            (CTRL_SHIFT, KeyCode::Enter) => {
+                let name = ctx.passive_name.clone();
+                ed.insert_name(name.as_deref());
+            }
+            (CTRL, KeyCode::Char('f')) => {
+                let name = ed.path.display().to_string();
+                ed.type_text(&name);
+            }
             (NONE, KeyCode::Char(c)) => {
                 let mut b = [0u8; 4];
                 ed.type_text(c.encode_utf8(&mut b));
@@ -1008,20 +1428,53 @@ pub fn run(tui: &mut Tui, path: &Path, clip: &mut Clipboard) -> io::Result<Edito
             }
             (CTRL, KeyCode::Char('u')) => ed.selection = None,
             (CTRL, KeyCode::Char('c')) | (CTRL, KeyCode::Insert) => {
+                let copied = ed.copy_or_line();
+                tui.set_clipboard(&copied.text);
+                *ctx.clipboard = copied;
+            }
+            (CTRL, KeyCode::Char('+')) | (CTRL, KeyCode::Char('=')) => {
                 if let Some(copied) = ed.copy_selection() {
-                    tui.set_clipboard(&copied.text);
-                    *clip = copied;
+                    ctx.clipboard.text.push_str(&copied.text);
+                    tui.set_clipboard(&ctx.clipboard.text);
                 }
             }
             (CTRL, KeyCode::Char('x')) | (SHIFT, KeyCode::Delete) => {
                 if let Some(copied) = ed.copy_selection() {
                     tui.set_clipboard(&copied.text);
-                    *clip = copied;
+                    *ctx.clipboard = copied;
                     ed.delete_selection();
                 }
             }
-            (CTRL, KeyCode::Char('v')) | (SHIFT, KeyCode::Insert) => ed.paste(clip),
+            (CTRL, KeyCode::Char('v')) | (SHIFT, KeyCode::Insert) => ed.paste(ctx.clipboard),
             (CTRL, KeyCode::Char('d')) => ed.delete_selection(),
+            (ALT, KeyCode::Char('i')) => ed.shift_lines(true),
+            (ALT, KeyCode::Char('u')) => ed.shift_lines(false),
+            (CTRL, KeyCode::Char('q')) => {
+                let next = loop {
+                    if let Some(Input::Key(next)) = tui.read(Duration::from_millis(1000))? {
+                        break next;
+                    }
+                };
+                if let Some(c) = literal_char(next) {
+                    let mut b = [0u8; 4];
+                    ed.type_text(c.encode_utf8(&mut b));
+                }
+            }
+            (CTRL_SHIFT, KeyCode::Char(c)) if c.is_ascii_digit() => {
+                ed.bookmarks[c as usize - '0' as usize] = Some(ed.cursor);
+            }
+            (CTRL, KeyCode::Char(c)) if c.is_ascii_digit() => {
+                if let Some(p) = ed.bookmarks[c as usize - '0' as usize] {
+                    ed.selection = None;
+                    ed.cursor = ed.buf.clamp(p);
+                    ed.sync_vis();
+                }
+            }
+            (CTRL, KeyCode::Char('l')) => ed.locked = !ed.locked,
+            (CTRL, KeyCode::Char('o')) => tui.user_screen()?,
+            (CTRL, KeyCode::Char('b')) => *ctx.keybar = !*ctx.keybar,
+            (CTRL_SHIFT, KeyCode::Char('b')) => ed.status_bar = !ed.status_bar,
+            (NONE, KeyCode::F(1)) => dialog::help_list(tui, "Editor", HELP)?,
             (NONE, KeyCode::F(2)) => save_interactive(tui, &mut ed)?,
             (SHIFT, KeyCode::F(2)) => save_as(tui, &mut ed)?,
             (SHIFT, KeyCode::F(10)) => {
@@ -1035,48 +1488,54 @@ pub fn run(tui: &mut Tui, path: &Path, clip: &mut Clipboard) -> io::Result<Edito
                     return Ok(EditorExit::View);
                 }
             }
-            (_, KeyCode::Esc) | (NONE, KeyCode::F(10)) => {
+            (SHIFT, KeyCode::F(4)) => {
+                if confirm_leave(tui, &mut ed)? {
+                    return Ok(EditorExit::NewFile);
+                }
+            }
+            (CTRL, KeyCode::F(10)) => {
+                if confirm_leave(tui, &mut ed)? {
+                    return Ok(EditorExit::GoToFile);
+                }
+            }
+            (ALT, KeyCode::F(11)) => {
+                if confirm_leave(tui, &mut ed)? {
+                    return Ok(EditorExit::History);
+                }
+            }
+            (_, KeyCode::Esc) | (NONE, KeyCode::F(10)) | (NONE, KeyCode::F(4)) => {
                 if confirm_leave(tui, &mut ed)? {
                     return Ok(EditorExit::Close);
                 }
             }
             (NONE, KeyCode::F(8)) => change_encoding(&mut ed)?,
-            (NONE, KeyCode::F(7)) => {
-                let mut form = Form::new(vec![
-                    Field::text("Search for:", &ed.search),
-                    Field::check("Ignore case", ed.ignore_case),
-                ]);
-                if form.run(tui, "Search")? {
-                    ed.search = form.text(0);
-                    ed.ignore_case = form.checked(1);
-                    find_step(tui, &mut ed, false)?;
+            (SHIFT, KeyCode::F(8)) => {
+                let items: Vec<String> = encoding::NAMES.iter().map(|n| n.to_string()).collect();
+                if let Some(i) = dialog::menu(tui, "Encoding", &items, ed.format.enc)? {
+                    ed.format.enc = (i + encoding::NAMES.len() - 1) % encoding::NAMES.len();
+                    change_encoding(&mut ed)?;
                 }
             }
-            (SHIFT, KeyCode::F(7)) => find_step(tui, &mut ed, false)?,
-            (ALT, KeyCode::F(7)) => find_step(tui, &mut ed, true)?,
-            (CTRL, KeyCode::F(7)) => replace_all(tui, &mut ed)?,
-            (ALT, KeyCode::F(8)) => {
-                if let Some(text) = dialog::prompt(tui, "Go to", "Line [,column]:", "")? {
-                    let mut parts = text.split(',').map(|p| p.trim().parse::<usize>());
-                    match parts.next() {
-                        Some(Ok(line)) => {
-                            let col = parts.next().and_then(Result::ok).unwrap_or(1);
-                            ed.cursor = ed
-                                .buf
-                                .clamp(pos(line.saturating_sub(1), col.saturating_sub(1)));
-                            ed.selection = None;
-                            ed.sync_vis();
-                        }
-                        _ => dialog::alert(tui, "Go to", "Enter a line number")?,
-                    }
-                }
-            }
+            (NONE, KeyCode::F(7)) => search_dialog(tui, &mut ed, ctx.db, false)?,
+            (CTRL, KeyCode::F(7)) => search_dialog(tui, &mut ed, ctx.db, true)?,
+            (SHIFT, KeyCode::F(7)) => continue_search(tui, &mut ed, ctx.db, false)?,
+            (ALT, KeyCode::F(7)) => continue_search(tui, &mut ed, ctx.db, true)?,
+            (ALT, KeyCode::F(8)) => goto_dialog(tui, &mut ed)?,
             _ => {}
         }
     }
 }
 
 fn save_interactive(tui: &mut Tui, ed: &mut Editor) -> io::Result<()> {
+    if fs::metadata(&ed.path).is_ok_and(|m| m.mode() & 0o222 == 0) {
+        let lines = vec![
+            "This file is read-only.".to_string(),
+            "Overwrite it anyway?".to_string(),
+        ];
+        if dialog::message(tui, "Save", &lines, &["Overwrite", "Cancel"], true)? != Some(0) {
+            return Ok(());
+        }
+    }
     if ed.changed_on_disk() {
         let lines = vec![
             "The file was changed by another program.".to_string(),
@@ -1151,7 +1610,11 @@ fn change_encoding(ed: &mut Editor) -> io::Result<()> {
         ed.format.enc = next;
         return Ok(());
     }
-    let bytes = fs::read(&ed.path)?;
+    // The file may be gone by now. The text in the editor is still good.
+    let Ok(bytes) = fs::read(&ed.path) else {
+        ed.format.enc = next;
+        return Ok(());
+    };
     let body = if ed.format.bom {
         bytes.strip_prefix(BOM).unwrap_or(&bytes)
     } else {
@@ -1179,83 +1642,235 @@ fn change_encoding(ed: &mut Editor) -> io::Result<()> {
     Ok(())
 }
 
-fn select_hit(ed: &mut Editor, a: Pos, b: Pos) {
-    ed.selection = Some(Selection {
-        kind: SelKind::Stream,
-        anchor: a,
-        anchor_vis: 0,
-    });
-    ed.cursor = b;
-    ed.sync_vis();
-}
-
-fn find_step(tui: &mut Tui, ed: &mut Editor, backward: bool) -> io::Result<()> {
-    if ed.search.is_empty() {
+/// F7 and Ctrl+F7.
+fn search_dialog(
+    tui: &mut Tui,
+    ed: &mut Editor,
+    db: &Rc<History>,
+    replacing: bool,
+) -> io::Result<()> {
+    let o = ed.search.clone();
+    let mut fields = vec![Field::with_history("&Search for", &o.text, Kind::Search)];
+    if replacing {
+        fields.push(Field::with_history(
+            "&Replace with",
+            &o.replace,
+            Kind::Replace,
+        ));
+    }
+    let first_option = fields.len();
+    fields.push(Field::check("&Case sensitive", o.case_sensitive));
+    fields.push(Field::check("&Whole words", o.whole_words));
+    fields.push(Field::check("Fu&zzy search", o.fuzzy));
+    fields.push(Field::check("R&egular expressions", o.regex));
+    if replacing {
+        fields.push(Field::check("&Preserve style", o.preserve_style));
+    }
+    let buttons: &[&str] = if replacing {
+        &[
+            "Replace next",
+            "Replace pre&vious",
+            "&All",
+            "W&ord",
+            "Se&lection",
+            "Cancel",
+        ]
+    } else {
+        &[
+            "Find next",
+            "Find pre&vious",
+            "&All",
+            "W&ord",
+            "Se&lection",
+            "Cancel",
+        ]
+    };
+    let title = if replacing { "Replace" } else { "Search" };
+    let mut form = Form::new(fields).with_buttons(buttons).with_db(db);
+    let choice = loop {
+        match form.run_buttons(tui, title)? {
+            Some(3) => {
+                let word = ed.word_at_cursor();
+                form.set_text(0, &word);
+            }
+            Some(4) => {
+                if let Some(copied) = ed.copy_selection() {
+                    let first = copied.text.split('\n').next().unwrap_or("").to_string();
+                    form.set_text(0, &first);
+                }
+            }
+            Some(5) | None => return Ok(()),
+            Some(button) => break button,
+        }
+    };
+    if form.text(0).is_empty() {
         return Ok(());
     }
-    let from = match (ed.stream_range(), backward) {
-        (Some((a, _)), true) => a,
-        (_, _) => ed.cursor,
+    ed.search = SearchOptions {
+        text: form.text(0),
+        replace: if replacing { form.text(1) } else { o.replace },
+        case_sensitive: form.checked(first_option),
+        whole_words: form.checked(first_option + 1),
+        fuzzy: form.checked(first_option + 2),
+        regex: form.checked(first_option + 3),
+        preserve_style: replacing && form.checked(first_option + 4),
     };
-    match ed.buf.find(&ed.search, from, ed.ignore_case, backward) {
-        Some((a, b)) => select_hit(ed, a, b),
-        None => {
-            let text = format!("Not found: {}", ed.search);
+    db.save_search(&ed.search, replacing);
+    ed.last_replace = replacing;
+    match choice {
+        2 => show_all_matches(tui, ed),
+        button => run_search(tui, ed, button == 1),
+    }
+}
+
+fn compile(tui: &mut Tui, ed: &Editor) -> io::Result<Option<Matcher>> {
+    match Matcher::new(&ed.search) {
+        Ok(m) => Ok(Some(m)),
+        Err(text) => {
             dialog::alert(tui, "Search", &text)?;
+            Ok(None)
         }
+    }
+}
+
+/// Shift+F7 and Alt+F7 repeat the last search or replace.
+fn continue_search(
+    tui: &mut Tui,
+    ed: &mut Editor,
+    db: &Rc<History>,
+    backward: bool,
+) -> io::Result<()> {
+    if ed.search.text.is_empty() {
+        return search_dialog(tui, ed, db, false);
+    }
+    run_search(tui, ed, backward)
+}
+
+fn run_search(tui: &mut Tui, ed: &mut Editor, backward: bool) -> io::Result<()> {
+    let Some(m) = compile(tui, ed)? else {
+        return Ok(());
+    };
+    if ed.last_replace {
+        return replace_interactive(tui, ed, &m, backward);
+    }
+    if !ed.find_next(&m, backward) {
+        let text = format!("Not found: {}", ed.search.text);
+        dialog::alert(tui, "Search", &text)?;
     }
     Ok(())
 }
 
-fn replace_all(tui: &mut Tui, ed: &mut Editor) -> io::Result<()> {
-    let mut form = Form::new(vec![
-        Field::text("Search for:", &ed.search),
-        Field::text("Replace with:", &ed.replace),
-        Field::check("Ignore case", ed.ignore_case),
-    ]);
-    if !form.run(tui, "Replace")? || form.text(0).is_empty() {
+fn show_all_matches(tui: &mut Tui, ed: &mut Editor) -> io::Result<()> {
+    let Some(m) = compile(tui, ed)? else {
         return Ok(());
+    };
+    let hits = ed.find_all(&m);
+    if hits.is_empty() {
+        let text = format!("Not found: {}", ed.search.text);
+        return dialog::alert(tui, "Search", &text);
     }
-    ed.search = form.text(0);
-    ed.replace = form.text(1);
-    ed.ignore_case = form.checked(2);
-    let (needle, with) = (ed.search.clone(), ed.replace.clone());
-    let mut at = ed.cursor;
-    let mut all = false;
+    let items: Vec<String> = hits
+        .iter()
+        .map(|(a, _)| {
+            format!(
+                "{}:{}  {}",
+                a.line + 1,
+                a.col + 1,
+                ed.buf.lines[a.line].trim()
+            )
+        })
+        .collect();
+    let title = format!("{} matches", hits.len());
+    if let Some(i) = dialog::menu(tui, &title, &items, 0)? {
+        ed.select_hit(hits[i].0, hits[i].1);
+    }
+    Ok(())
+}
+
+fn replace_interactive(
+    tui: &mut Tui,
+    ed: &mut Editor,
+    m: &Matcher,
+    backward: bool,
+) -> io::Result<()> {
+    let Some(mut at) = ed.search_start(backward) else {
+        return Ok(());
+    };
     let mut count = 0;
     ed.buf.begin_group();
-    while let Some((a, b)) = ed.buf.find(&needle, at, ed.ignore_case, false) {
-        let mut answer = 0;
-        if !all {
-            select_hit(ed, a, b);
-            ed.draw(&mut tui.screen);
-            let lines = vec![format!("Replace \"{needle}\" with \"{with}\"?")];
-            match dialog::message(
-                tui,
-                "Replace",
-                &lines,
-                &["Replace", "All", "Skip", "Cancel"],
-                false,
-            )? {
-                Some(0) => {}
-                Some(1) => all = true,
-                Some(2) => answer = 2,
-                _ => break,
+    while let Some((a, b, hit)) = ed.buf.find_with(m, at, backward) {
+        ed.select_hit(a, b);
+        ed.draw(&mut tui.screen, true);
+        let lines = vec![
+            "Replace".to_string(),
+            ed.buf.text_between(a, b),
+            "with".to_string(),
+            m.replacement(&hit),
+        ];
+        let buttons = ["Replace", "All", "Skip", "Cancel"];
+        match dialog::message(tui, "Replace", &lines, &buttons, false)? {
+            Some(0) => {
+                count += 1;
+                match ed.replace_hit(m, a, b, &hit, backward) {
+                    Some(next) => at = next,
+                    None => break,
+                }
+            }
+            Some(1) => {
+                ed.buf.end_group();
+                ed.cursor = a;
+                ed.last_hit = None;
+                ed.selection = None;
+                ed.replace_remaining(m, backward);
+                return Ok(());
+            }
+            Some(2) => {
+                at = if backward {
+                    match position_before(&ed.buf, a) {
+                        Some(p) if a == b => p,
+                        None if a == b => break,
+                        _ => a,
+                    }
+                } else if a == b {
+                    pos(b.line, b.col + 1)
+                } else {
+                    b
+                };
+            }
+            _ => {
+                ed.buf.end_group();
+                ed.selection = None;
+                return Ok(());
             }
         }
-        if answer == 2 {
-            at = b;
-            continue;
-        }
-        at = ed.buf.replace(a, b, &with, a);
-        count += 1;
     }
     ed.buf.end_group();
     ed.selection = None;
     ed.cursor = ed.buf.clamp(at);
     ed.sync_vis();
-    if count == 0 && !all {
+    if count == 0 {
+        let text = format!("Not found: {}", ed.search.text);
+        dialog::alert(tui, "Replace", &text)?;
+    }
+    Ok(())
+}
+
+/// Alt+F8.
+fn goto_dialog(tui: &mut Tui, ed: &mut Editor) -> io::Result<()> {
+    let mut form = Form::new(vec![
+        Field::text("Line [,column], with +, -, % or 0x if needed:", ""),
+        Field::check("&Hex value", false),
+    ]);
+    if !form.run(tui, "Go to")? {
         return Ok(());
+    }
+    match parse_goto(&form.text(0), ed.cursor, &ed.buf, form.checked(1)) {
+        Some(p) => {
+            ed.cursor = p;
+            ed.selection = None;
+            ed.sync_vis();
+        }
+        None => dialog::alert(tui, "Go to", "Enter a line number")?,
     }
     Ok(())
 }
@@ -1280,9 +1895,12 @@ mod tests {
             selection: None,
             overwrite: false,
             mtime: None,
-            search: String::new(),
-            replace: String::new(),
-            ignore_case: true,
+            search: SearchOptions::default(),
+            last_replace: false,
+            last_hit: None,
+            bookmarks: [None; 10],
+            locked: false,
+            status_bar: true,
         }
     }
 
@@ -1434,27 +2052,307 @@ mod tests {
         assert_eq!(col_of("\tx", 4), 0);
     }
 
+    fn matcher(o: SearchOptions) -> Matcher {
+        Matcher::new(&o).unwrap()
+    }
+
+    fn text_opts(text: &str) -> SearchOptions {
+        SearchOptions {
+            text: text.into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn search_in_both_directions_and_with_case_folding() {
         let b = Buffer::from_text("Foo bar\nbar foo");
-        assert_eq!(
-            b.find("bar", pos(0, 0), false, false),
-            Some((pos(0, 4), pos(0, 7)))
-        );
-        assert_eq!(
-            b.find("bar", pos(0, 5), false, false),
-            Some((pos(1, 0), pos(1, 3)))
-        );
-        assert_eq!(
-            b.find("foo", pos(0, 0), true, false),
-            Some((pos(0, 0), pos(0, 3)))
-        );
-        assert_eq!(
-            b.find("foo", pos(1, 7), false, true),
-            Some((pos(1, 4), pos(1, 7)))
-        );
-        assert_eq!(b.find("foo", pos(1, 6), false, true), None);
-        assert_eq!(b.find("zzz", pos(0, 0), false, false), None);
+        let spans = |m: &Matcher, from, back| b.find_with(m, from, back).map(|h| (h.0, h.1));
+        let bar = matcher(text_opts("bar"));
+        assert_eq!(spans(&bar, pos(0, 0), false), Some((pos(0, 4), pos(0, 7))));
+        assert_eq!(spans(&bar, pos(0, 5), false), Some((pos(1, 0), pos(1, 3))));
+        let foo = matcher(text_opts("foo"));
+        assert_eq!(spans(&foo, pos(0, 0), false), Some((pos(0, 0), pos(0, 3))));
+        let exact = matcher(SearchOptions {
+            case_sensitive: true,
+            ..text_opts("foo")
+        });
+        assert_eq!(spans(&exact, pos(1, 7), true), Some((pos(1, 4), pos(1, 7))));
+        assert_eq!(spans(&exact, pos(1, 6), true), None);
+        assert_eq!(spans(&matcher(text_opts("zzz")), pos(0, 0), false), None);
+    }
+
+    #[test]
+    fn shift_f7_style_continuation_visits_each_match_then_stops() {
+        let mut ed = editor_with("one foo\ntwo\nthree foo\nfive foo");
+        let m = matcher(text_opts("foo"));
+        assert!(ed.find_next(&m, false));
+        assert_eq!(ed.cursor, pos(0, 7));
+        assert!(ed.find_next(&m, false));
+        assert_eq!(ed.cursor, pos(2, 9));
+        assert!(ed.find_next(&m, false));
+        assert_eq!(ed.cursor, pos(3, 8));
+        assert!(!ed.find_next(&m, false));
+        assert!(ed.find_next(&m, true));
+        assert_eq!(ed.cursor, pos(2, 9));
+        assert!(ed.find_next(&m, true));
+        assert_eq!(ed.cursor, pos(0, 7));
+        assert!(!ed.find_next(&m, true));
+    }
+
+    #[test]
+    fn empty_regex_matches_advance_instead_of_sticking() {
+        let mut ed = editor_with("ab\ncd");
+        let m = matcher(SearchOptions {
+            regex: true,
+            ..text_opts("^")
+        });
+        assert!(ed.find_next(&m, false));
+        assert_eq!(ed.cursor, pos(0, 0));
+        assert!(ed.find_next(&m, false));
+        assert_eq!(ed.cursor, pos(1, 0));
+        assert!(!ed.find_next(&m, false));
+    }
+
+    #[test]
+    fn replace_all_handles_growth_and_undoes_as_one_step() {
+        let mut ed = editor_with("a a\na");
+        let m = matcher(SearchOptions {
+            replace: "aa".into(),
+            ..text_opts("a")
+        });
+        assert_eq!(ed.replace_remaining(&m, false), 3);
+        assert_eq!(ed.buf.to_text(), "aa aa\naa");
+        ed.buf.undo();
+        assert_eq!(ed.buf.to_text(), "a a\na");
+    }
+
+    #[test]
+    fn replace_backward_works_from_the_end() {
+        let mut ed = editor_with("x x x");
+        ed.cursor = pos(0, 5);
+        let m = matcher(SearchOptions {
+            replace: "yy".into(),
+            ..text_opts("x")
+        });
+        assert_eq!(ed.replace_remaining(&m, true), 3);
+        assert_eq!(ed.buf.to_text(), "yy yy yy");
+    }
+
+    #[test]
+    fn regex_replace_uses_groups_and_finishes_on_empty_matches() {
+        let mut ed = editor_with("john smith");
+        let m = matcher(SearchOptions {
+            regex: true,
+            replace: "$2 $1".into(),
+            ..text_opts(r"(\w+) (\w+)")
+        });
+        assert_eq!(ed.replace_remaining(&m, false), 1);
+        assert_eq!(ed.buf.to_text(), "smith john");
+
+        let mut ed = editor_with("ab\ncd");
+        let m = matcher(SearchOptions {
+            regex: true,
+            replace: "> ".into(),
+            ..text_opts("^")
+        });
+        assert_eq!(ed.replace_remaining(&m, false), 2);
+        assert_eq!(ed.buf.to_text(), "> ab\n> cd");
+
+        let mut ed = editor_with("ab");
+        let m = matcher(SearchOptions {
+            regex: true,
+            replace: "-".into(),
+            ..text_opts("x*")
+        });
+        assert_eq!(ed.replace_remaining(&m, false), 3);
+        assert_eq!(ed.buf.to_text(), "-a-b-");
+    }
+
+    #[test]
+    fn find_all_lists_every_match() {
+        let ed = editor_with("a a\nb\na");
+        let hits = ed.find_all(&matcher(text_opts("a")));
+        assert_eq!(hits.len(), 3);
+        assert_eq!(hits[2].0, pos(2, 0));
+    }
+
+    #[test]
+    fn goto_accepts_every_documented_form() {
+        let b = Buffer::from_text(&"x\n".repeat(200));
+        let at = pos(49, 0);
+        let go = |t: &str| parse_goto(t, at, &b, false).map(|p| p.line);
+        assert_eq!(go("10"), Some(9));
+        assert_eq!(go("+10"), Some(59));
+        assert_eq!(go("-10"), Some(39));
+        assert_eq!(go("50%"), Some(100));
+        assert_eq!(go("0x10"), Some(15));
+        assert_eq!(go("$10"), Some(15));
+        assert_eq!(go("10h"), Some(15));
+        assert_eq!(go("10m"), Some(9));
+        assert_eq!(go(""), None);
+        assert_eq!(go("x"), None);
+        assert_eq!(parse_goto("10", at, &b, true).map(|p| p.line), Some(15));
+        assert_eq!(go("999999"), Some(200));
+        let wide = Buffer::from_text("abcdef\nxyz");
+        assert_eq!(parse_goto("1,3", pos(1, 0), &wide, false), Some(pos(0, 2)));
+        assert_eq!(parse_goto("1:3", pos(1, 0), &wide, false), Some(pos(0, 2)));
+        assert_eq!(parse_goto(",2", pos(1, 0), &wide, false), Some(pos(1, 1)));
+    }
+
+    #[test]
+    fn shifting_changes_selected_lines_and_undoes_together() {
+        let mut ed = editor_with("a\nb\nc");
+        ed.select_for(SHIFT);
+        ed.cursor = pos(2, 0);
+        ed.shift_lines(true);
+        assert_eq!(ed.buf.to_text(), " a\n b\nc");
+        ed.shift_lines(false);
+        assert_eq!(ed.buf.to_text(), "a\nb\nc");
+        ed.selection = None;
+        ed.cursor = pos(1, 0);
+        ed.shift_lines(false);
+        assert_eq!(ed.buf.to_text(), "a\nb\nc");
+        ed.shift_lines(true);
+        ed.buf.undo();
+        assert_eq!(ed.buf.to_text(), "a\nb\nc");
+    }
+
+    /// A file that accepts `room` bytes, then fails once.
+    struct FullDisk {
+        data: Vec<u8>,
+        at: usize,
+        room: usize,
+        failed: bool,
+    }
+
+    impl Write for FullDisk {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.failed && self.at + buf.len() > self.room {
+                self.failed = true;
+                let part = self.room - self.at;
+                self.data.splice(
+                    self.at..(self.at + part).min(self.data.len()),
+                    buf[..part].to_vec(),
+                );
+                self.at += part;
+                return Err(io::Error::other("no space left"));
+            }
+            let end = (self.at + buf.len()).min(self.data.len());
+            self.data.splice(self.at..end, buf.to_vec());
+            self.at += buf.len();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seek for FullDisk {
+        fn seek(&mut self, _: SeekFrom) -> io::Result<u64> {
+            self.at = 0;
+            Ok(0)
+        }
+    }
+
+    impl Rewritable for FullDisk {
+        fn set_length(&mut self, length: u64) -> io::Result<()> {
+            self.data.truncate(length as usize);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_in_place_save_puts_the_old_contents_back() {
+        let old = b"original contents".to_vec();
+        let mut file = FullDisk {
+            data: old.clone(),
+            at: 0,
+            room: 4,
+            failed: false,
+        };
+        let new = vec![b'N'; 1000];
+        assert!(rewrite_keeping_old(&mut file, &old, &new).is_err());
+        assert_eq!(file.data, old);
+    }
+
+    #[test]
+    fn a_successful_in_place_save_can_shrink_the_file() {
+        let old = b"long original".to_vec();
+        let mut file = FullDisk {
+            data: old.clone(),
+            at: 0,
+            room: 1000,
+            failed: false,
+        };
+        rewrite_keeping_old(&mut file, &old, b"new").unwrap();
+        assert_eq!(file.data, b"new");
+    }
+
+    #[test]
+    fn saving_clears_setuid_and_writes_through_hard_links() {
+        let dir = std::env::temp_dir().join(format!("far_ed_modes_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("prog");
+        fs::write(&file, "old").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o4755)).unwrap();
+        write_file(&file, b"new").unwrap();
+        assert_eq!(fs::metadata(&file).unwrap().mode() & 0o7777, 0o755);
+        let other = dir.join("other");
+        fs::hard_link(&file, &other).unwrap();
+        write_file(&file, b"shared").unwrap();
+        assert_eq!(fs::read_to_string(&other).unwrap(), "shared");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_without_a_block_copies_the_line() {
+        let mut ed = editor_with("first\nsecond");
+        ed.cursor = pos(1, 2);
+        assert_eq!(ed.copy_or_line().text, "second\n");
+    }
+
+    #[test]
+    fn word_at_cursor_finds_the_word_from_either_side() {
+        let mut ed = editor_with("hello big_world");
+        ed.cursor = pos(0, 8);
+        assert_eq!(ed.word_at_cursor(), "big_world");
+        ed.cursor = pos(0, 5);
+        assert_eq!(ed.word_at_cursor(), "hello");
+    }
+
+    #[test]
+    fn literal_keys_become_characters() {
+        let key = |code, mods| Key { code, mods };
+        assert_eq!(literal_char(key(KeyCode::Char('a'), CTRL)), Some('\u{1}'));
+        assert_eq!(literal_char(key(KeyCode::Char('x'), NONE)), Some('x'));
+        assert_eq!(literal_char(key(KeyCode::Tab, NONE)), Some('\t'));
+        assert_eq!(literal_char(key(KeyCode::F(1), NONE)), None);
+    }
+
+    #[test]
+    fn the_lock_blocks_edits_but_not_movement_or_saving_keys() {
+        let key = |code, mods| Key { code, mods };
+        assert!(changes_text(key(KeyCode::Char('a'), NONE)));
+        assert!(changes_text(key(KeyCode::Char('y'), CTRL)));
+        assert!(changes_text(key(KeyCode::Char('z'), CTRL)));
+        assert!(changes_text(key(KeyCode::F(7), CTRL)));
+        assert!(!changes_text(key(KeyCode::F(7), NONE)));
+        assert!(!changes_text(key(KeyCode::Up, NONE)));
+        assert!(!changes_text(key(KeyCode::Char('c'), CTRL)));
+        assert!(!changes_text(key(KeyCode::Char('l'), CTRL)));
+        assert!(!changes_text(key(KeyCode::Insert, CTRL)));
+    }
+
+    #[test]
+    fn hiding_the_bars_gives_their_rows_to_the_text() {
+        let mut ed = editor_with("line");
+        let mut s = Screen::new(40, 10);
+        assert_eq!(ed.text_rows(10, true), 8);
+        ed.status_bar = false;
+        assert_eq!(ed.text_rows(10, false), 10);
+        ed.draw(&mut s, false);
+        assert_eq!(s.cursor, Some((0, 0)));
     }
 
     #[test]
@@ -1560,7 +2458,7 @@ mod tests {
     fn drawing_handles_small_and_empty_buffers() {
         let mut ed = editor_with("");
         let mut s = Screen::new(20, 4);
-        ed.draw(&mut s);
+        ed.draw(&mut s, true);
         assert_eq!(s.cursor, Some((0, 1)));
     }
 }

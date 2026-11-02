@@ -22,7 +22,10 @@ pass trivially if tmux is missing, because they skip themselves.
 |---|---|
 | `src/app.rs` | Main loop, hot keys, `Action` dispatch, file operation dialogs, F9 menu |
 | `src/fsops.rs` | Copy, move, delete, trash, attributes, find. No UI code |
-| `src/panel.rs` | Directory listing, sorting, selection, panel drawing |
+| `src/archive.rs` | List, extract, create and change archives. No UI code |
+| `src/history.rs` | SQLite history and remembered options |
+| `src/search.rs` | Search engine shared by editor and viewer: regex, whole words, fuzzy, preserve style |
+| `src/panel.rs` | Directory and archive listing, sorting, selection, panel drawing |
 | `src/viewer.rs` | F3 viewer. Reads on demand and never loads the whole file |
 | `src/editor.rs` | F4 editor: buffer, undo, blocks, search, saving |
 | `src/shell.rs` | Runs commands in bash and carries cwd and exports between them |
@@ -46,6 +49,15 @@ pass trivially if tmux is missing, because they skip themselves.
 - Use `OsString` and `Path` for file operations. `Entry::name` is lossy and is
   for display only.
 
+- Archive contents are untrusted. Entry names go through `safe_name`, and
+  extraction must not write through a symbolic link or create setuid files. The
+  hostile archive tests in `archive.rs` cover this.
+- Changing an archive writes a new file and renames it, and keeps entries that
+  this program refuses to extract.
+- Move into an archive removes the sources only after nothing was skipped and
+  the archive tests clean.
+- A symbolic link must never replace the file it points to.
+
 Add a test for any change to these paths. In `fsops.rs`, use the scripted
 `OpUi` implementation.
 
@@ -60,6 +72,9 @@ Add a test for any change to these paths. In `fsops.rs`, use the scripted
 - Add commands as an `Action` and bind them in `key_action`. Add them to the F9
   menu and the `HELP` table too, because terminals may not deliver every key.
 - Match the keys of Far Manager 3. Record intentional differences in `README.md`.
+  Check keys against Far's own help (`FarEng.hlf`), not from memory. Far's help
+  on this machine is at `/mnt/c/Program Files/Far Manager/FarEng.hlf`.
+- See `docs/DESIGN.md` for the design, plan and known issues. Keep it current.
 
 ## Testing notes
 
@@ -67,6 +82,9 @@ Add a test for any change to these paths. In `fsops.rs`, use the scripted
   end-to-end test, wait until the dialogs are gone before sending more keys.
   File names also appear in dialogs, so seeing a name does not prove that the
   panels are back.
+- The key bar is on screen in panels, so `wait("Copy ")` matches `5Copy   `.
+  Wait for text only the dialog has.
+- Tests set `XDG_DATA_HOME` so that they never touch the real history database.
 - Terminal key handling differs between terminals. Passing in tmux does not prove
   a key works in another terminal.
 

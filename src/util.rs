@@ -2,6 +2,14 @@
 
 use std::path::{Path, PathBuf};
 
+/// Replaces control characters, for text printed directly to the console. A
+/// folder name must not be able to send escape codes to the terminal.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// Matches `name` against a `*`/`?` wildcard mask, ignoring ASCII case.
 /// Far's traditional `*.*` means "everything", including names with no dot.
 pub fn wildcard(mask: &str, name: &str) -> bool {
@@ -228,6 +236,11 @@ pub fn mode_string(mode: u32, is_dir: bool, is_link: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn printable_removes_escape_codes() {
+        assert_eq!(printable("a\x1b]0;x\x07b\nж"), "a?]0;x?b?ж");
+    }
 
     #[test]
     fn wildcard_matching() {

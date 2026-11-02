@@ -1,10 +1,14 @@
 //! Modal dialogs: messages, forms and menus. Each one draws over a snapshot
 //! of what was on screen and returns when the user answers.
 
+use crate::history::{History, Kind};
 use crate::lineedit::LineEdit;
-use crate::screen::{fit, fit_left, str_width, theme, Input, Screen, Tui, NONE, SHIFT};
+use crate::screen::{
+    fit, fit_left, str_width, theme, Input, Key, Screen, Tui, ALT, CTRL, NONE, SHIFT,
+};
 use crossterm::event::KeyCode;
 use std::io;
+use std::rc::Rc;
 use std::time::Duration;
 
 const WAIT: Duration = Duration::from_millis(500);
@@ -39,7 +43,7 @@ pub fn draw_message(
         .max(str_width(title) + 2)
         .min(max.saturating_sub(4));
     let w = (inner + 6) as u16;
-    let h = (lines.len() + 4 + usize::from(!buttons.is_empty())) as u16;
+    let h = (lines.len() + 2 + usize::from(!buttons.is_empty())) as u16;
     let (x, y) = centered(s, w, h);
     s.fill(x, y, w, h, ' ', normal);
     s.frame(x + 1, y, w.saturating_sub(2), h, true, normal);
@@ -115,11 +119,33 @@ pub fn alert(tui: &mut Tui, title: &str, text: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// One row of a form.
+/// Splits `&Label` into the shown text and its Alt hotkey.
+fn parse_label(label: &str) -> (String, Option<char>) {
+    match label.find('&') {
+        Some(i) => {
+            let shown = format!("{}{}", &label[..i], &label[i + 1..]);
+            let hotkey = label[i + 1..]
+                .chars()
+                .next()
+                .and_then(|c| c.to_lowercase().next());
+            (shown, hotkey)
+        }
+        None => (label.to_string(), None),
+    }
+}
+
+/// One row of a form. A `&` in a label marks its Alt hotkey.
 pub enum Field {
     Label(String),
-    Text { label: String, edit: LineEdit },
-    Check { label: String, on: bool },
+    Text {
+        label: String,
+        edit: LineEdit,
+        history: Option<Kind>,
+    },
+    Check {
+        label: String,
+        on: bool,
+    },
 }
 
 impl Field {
@@ -128,6 +154,16 @@ impl Field {
         Field::Text {
             label: label.to_string(),
             edit: LineEdit::prefilled(value),
+            history: None,
+        }
+    }
+
+    /// A text box with a history list on Ctrl+Up and Ctrl+Down.
+    pub fn with_history(label: &str, value: &str, kind: Kind) -> Field {
+        Field::Text {
+            label: label.to_string(),
+            edit: LineEdit::prefilled(value),
+            history: Some(kind),
         }
     }
 
@@ -149,16 +185,41 @@ impl Field {
             _ => 1,
         }
     }
+
+    fn hotkey(&self) -> Option<char> {
+        match self {
+            Field::Text { label, .. } | Field::Check { label, .. } => parse_label(label).1,
+            Field::Label(_) => None,
+        }
+    }
 }
 
-/// A dialog made of text boxes and checkboxes.
+/// A dialog of text boxes, checkboxes and optional buttons.
 pub struct Form {
     pub fields: Vec<Field>,
+    buttons: Vec<String>,
+    db: Option<Rc<History>>,
 }
 
 impl Form {
     pub fn new(fields: Vec<Field>) -> Self {
-        Form { fields }
+        Form {
+            fields,
+            buttons: Vec::new(),
+            db: None,
+        }
+    }
+
+    /// Adds buttons, which take the place of the OK and Cancel hint.
+    pub fn with_buttons(mut self, buttons: &[&str]) -> Self {
+        self.buttons = buttons.iter().map(|b| b.to_string()).collect();
+        self
+    }
+
+    /// Connects the fields made with `Field::with_history` to the database.
+    pub fn with_db(mut self, db: &Rc<History>) -> Self {
+        self.db = Some(db.clone());
+        self
     }
 
     /// Text of the field at `index`.
@@ -169,6 +230,13 @@ impl Form {
         }
     }
 
+    /// Replaces the text of the field at `index`.
+    pub fn set_text(&mut self, index: usize, value: &str) {
+        if let Field::Text { edit, .. } = &mut self.fields[index] {
+            edit.set(value);
+        }
+    }
+
     /// State of the checkbox at `index`.
     pub fn checked(&self, index: usize) -> bool {
         matches!(&self.fields[index], Field::Check { on: true, .. })
@@ -176,6 +244,12 @@ impl Form {
 
     /// Runs the form. Returns true on Enter and false on Esc.
     pub fn run(&mut self, tui: &mut Tui, title: &str) -> io::Result<bool> {
+        Ok(self.run_buttons(tui, title)?.is_some())
+    }
+
+    /// Runs the form. Returns the chosen button, or `None` on Esc. Enter in a
+    /// text box or checkbox chooses the first button.
+    pub fn run_buttons(&mut self, tui: &mut Tui, title: &str) -> io::Result<Option<usize>> {
         let backdrop = tui.screen.clone();
         let mut focus = self.fields.iter().position(Field::focusable).unwrap_or(0);
         loop {
@@ -186,45 +260,86 @@ impl Form {
             let key = match input {
                 Some(Input::Key(key)) => key,
                 Some(Input::Paste(text)) => {
-                    if let Field::Text { edit, .. } = &mut self.fields[focus] {
+                    if let Some(Field::Text { edit, .. }) = self.fields.get_mut(focus) {
                         edit.insert_str(&text);
                     }
                     continue;
                 }
                 _ => continue,
             };
+            let on_button = focus.checked_sub(self.fields.len());
             match (key.code, key.mods) {
                 (KeyCode::Esc, _) | (KeyCode::F(10), _) => {
                     tui.screen.cursor = None;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 (KeyCode::Enter, _) => {
                     tui.screen.cursor = None;
-                    return Ok(true);
+                    return Ok(Some(on_button.unwrap_or(0)));
+                }
+                (KeyCode::Char(c), ALT) => {
+                    if let Some(index) = self.fields.iter().position(|f| f.hotkey() == Some(c)) {
+                        focus = index;
+                        if let Field::Check { on, .. } = &mut self.fields[index] {
+                            *on = !*on;
+                        }
+                    } else if let Some(index) = self
+                        .buttons
+                        .iter()
+                        .position(|b| parse_label(b).1 == Some(c))
+                    {
+                        tui.screen.cursor = None;
+                        return Ok(Some(index));
+                    }
+                }
+                (KeyCode::Up | KeyCode::Down, CTRL) => {
+                    let Some(db) = self.db.clone() else {
+                        continue;
+                    };
+                    if let Some(Field::Text {
+                        edit,
+                        history: Some(kind),
+                        ..
+                    }) = self.fields.get_mut(focus)
+                    {
+                        if let Some(value) = history_popup(tui, &db, *kind)? {
+                            edit.set(&value);
+                        }
+                    }
                 }
                 (KeyCode::Down, _) | (KeyCode::Tab, NONE) => focus = self.step(focus, 1),
                 (KeyCode::Up, _) | (KeyCode::Tab, SHIFT) => focus = self.step(focus, -1),
-                _ => match &mut self.fields[focus] {
-                    Field::Text { edit, .. } => {
+                (KeyCode::Right, _) if on_button.is_some() => focus = self.step(focus, 1),
+                (KeyCode::Left, _) if on_button.is_some() => focus = self.step(focus, -1),
+                _ => match self.fields.get_mut(focus) {
+                    Some(Field::Text { edit, .. }) => {
                         edit.handle(key.code, key.mods);
                     }
-                    Field::Check { on, .. } => {
+                    Some(Field::Check { on, .. }) => {
                         if key.code == KeyCode::Char(' ') {
                             *on = !*on;
                         }
                     }
-                    Field::Label(_) => {}
+                    _ => {
+                        if key.code == KeyCode::Char(' ') {
+                            if let Some(index) = on_button {
+                                tui.screen.cursor = None;
+                                return Ok(Some(index));
+                            }
+                        }
+                    }
                 },
             }
         }
     }
 
     fn step(&self, focus: usize, dir: isize) -> usize {
-        let n = self.fields.len() as isize;
+        let n = (self.fields.len() + self.buttons.len()) as isize;
         let mut i = focus as isize;
         for _ in 0..n {
             i = (i + dir).rem_euclid(n);
-            if self.fields[i as usize].focusable() {
+            let usable = self.fields.get(i as usize).is_none_or(Field::focusable);
+            if usable {
                 break;
             }
         }
@@ -233,13 +348,14 @@ impl Form {
 
     fn draw(&self, s: &mut Screen, title: &str, focus: usize) {
         let w = s.w.saturating_sub(8).clamp(20, 72);
+        let inner = w.saturating_sub(6) as usize;
+        let button_rows = self.button_rows(inner);
         let body: u16 = self.fields.iter().map(Field::height).sum();
-        let h = body + 3;
+        let h = body + 2 + button_rows.len().max(1) as u16;
         let (x, y) = centered(s, w, h);
         s.fill(x, y, w, h, ' ', theme::DIALOG);
         s.frame(x + 1, y, w.saturating_sub(2), h, true, theme::DIALOG);
         s.title(x + 1, y, w.saturating_sub(2), title, theme::DIALOG);
-        let inner = w.saturating_sub(6) as usize;
         let mut row = y + 1;
         s.cursor = None;
         for (i, field) in self.fields.iter().enumerate() {
@@ -248,11 +364,12 @@ impl Form {
                     s.put(x + 3, row, &fit_left(text, inner), theme::DIALOG);
                     row += 1;
                 }
-                Field::Text { label, edit } => {
-                    s.put(x + 3, row, &fit_left(label, inner), theme::DIALOG);
+                Field::Text { label, edit, .. } => {
+                    let shown = parse_label(label).0;
+                    s.put(x + 3, row, &fit_left(&shown, inner), theme::DIALOG);
                     row += 1;
-                    let (shown, cursor) = visible_text(edit, inner);
-                    s.put(x + 3, row, &fit(&shown, inner), theme::INPUT);
+                    let (visible, cursor) = visible_text(edit, inner);
+                    s.put(x + 3, row, &fit(&visible, inner), theme::INPUT);
                     if i == focus {
                         s.cursor = Some((x + 3 + cursor as u16, row));
                     }
@@ -265,7 +382,8 @@ impl Form {
                     } else {
                         theme::DIALOG
                     };
-                    s.put(x + 3, row, &format!("[{mark}] {label}"), style);
+                    let shown = parse_label(label).0;
+                    s.put(x + 3, row, &format!("[{mark}] {shown}"), style);
                     if i == focus {
                         s.cursor = Some((x + 4, row));
                     }
@@ -273,9 +391,48 @@ impl Form {
                 }
             }
         }
-        let buttons = "[ OK: Enter ]  [ Cancel: Esc ]";
-        let bx = x + w.saturating_sub(str_width(buttons) as u16) / 2;
-        s.put(bx, row, buttons, theme::DIALOG);
+        if self.buttons.is_empty() {
+            let hint = "[ OK: Enter ]  [ Cancel: Esc ]";
+            let bx = x + w.saturating_sub(str_width(hint) as u16) / 2;
+            s.put(bx, row, hint, theme::DIALOG);
+            return;
+        }
+        for indexes in button_rows {
+            let total: usize = indexes.iter().map(|i| self.button_width(*i) + 1).sum();
+            let mut bx = x + w.saturating_sub(total as u16) / 2;
+            for i in indexes {
+                let style = if focus == self.fields.len() + i {
+                    theme::DIALOG_FOCUS
+                } else {
+                    theme::DIALOG
+                };
+                let label = format!("[ {} ]", parse_label(&self.buttons[i]).0);
+                bx = s.put(bx, row, &label, style) + 1;
+            }
+            row += 1;
+        }
+    }
+
+    fn button_width(&self, index: usize) -> usize {
+        str_width(&parse_label(&self.buttons[index]).0) + 4
+    }
+
+    /// Splits the buttons into rows that fit the dialog.
+    fn button_rows(&self, inner: usize) -> Vec<Vec<usize>> {
+        let mut rows: Vec<Vec<usize>> = Vec::new();
+        let mut used = 0;
+        for i in 0..self.buttons.len() {
+            let width = self.button_width(i) + 1;
+            match rows.last_mut() {
+                Some(row) if used + width <= inner => row.push(i),
+                _ => {
+                    rows.push(vec![i]);
+                    used = 0;
+                }
+            }
+            used += width;
+        }
+        rows
     }
 }
 
@@ -309,8 +466,31 @@ pub fn menu(
     items: &[String],
     start: usize,
 ) -> io::Result<Option<usize>> {
+    Ok(match menu_keys(tui, title, items, start, &[])? {
+        MenuResult::Chosen(index) => Some(index),
+        _ => None,
+    })
+}
+
+/// How a menu ended.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MenuResult {
+    Chosen(usize),
+    /// One of the extra keys, with the item that had the focus.
+    Key(Key, usize),
+    Closed,
+}
+
+/// A menu where the listed keys also close it, for lists with item commands.
+pub fn menu_keys(
+    tui: &mut Tui,
+    title: &str,
+    items: &[String],
+    start: usize,
+    extra: &[Key],
+) -> io::Result<MenuResult> {
     if items.is_empty() {
-        return Ok(None);
+        return Ok(MenuResult::Closed);
     }
     let backdrop = tui.screen.clone();
     let mut focus = start.min(items.len() - 1);
@@ -320,10 +500,22 @@ pub fn menu(
         tui.screen.cursor = None;
         let s = &mut tui.screen;
         let widest = items.iter().map(|i| str_width(i)).max().unwrap_or(0);
-        let w = (widest.max(str_width(title) + 2) + 6).min(s.w as usize - 2) as u16;
+        let w = (widest.max(str_width(title) + 2) + 6).min((s.w as usize).saturating_sub(2)) as u16;
+        if w < 6 || s.h < 3 {
+            // Too small to draw. Keys still work, and a resize brings it back.
+            let Some(Input::Key(key)) = tui.read(WAIT)? else {
+                continue;
+            };
+            if key.code == KeyCode::Esc {
+                return Ok(MenuResult::Closed);
+            }
+            continue;
+        }
         let rows = items.len().min(s.h.saturating_sub(6) as usize).max(1);
         let h = rows as u16 + 2;
         let (x, y) = centered(s, w, h);
+        // After the terminal grows, the old top can leave too few items.
+        top = top.min(items.len() - rows);
         if focus < top {
             top = focus;
         }
@@ -350,9 +542,12 @@ pub fn menu(
         let Some(Input::Key(key)) = tui.read(WAIT)? else {
             continue;
         };
+        if extra.contains(&key) {
+            return Ok(MenuResult::Key(key, focus));
+        }
         match key.code {
-            KeyCode::Esc | KeyCode::F(10) => return Ok(None),
-            KeyCode::Enter => return Ok(Some(focus)),
+            KeyCode::Esc | KeyCode::F(10) => return Ok(MenuResult::Closed),
+            KeyCode::Enter => return Ok(MenuResult::Chosen(focus)),
             KeyCode::Up => focus = (focus + items.len() - 1) % items.len(),
             KeyCode::Down => focus = (focus + 1) % items.len(),
             KeyCode::PageUp => focus = focus.saturating_sub(rows),
@@ -362,6 +557,84 @@ pub fn menu(
             _ => {}
         }
     }
+}
+
+/// The history of a text box: Enter picks, Ins locks, Shift+Del removes one
+/// item and Del clears all that are not locked.
+pub fn history_popup(tui: &mut Tui, db: &History, kind: Kind) -> io::Result<Option<String>> {
+    let del = Key {
+        code: KeyCode::Delete,
+        mods: NONE,
+    };
+    let shift_del = Key {
+        code: KeyCode::Delete,
+        mods: SHIFT,
+    };
+    let ins = Key {
+        code: KeyCode::Insert,
+        mods: NONE,
+    };
+    let mut focus = 0;
+    loop {
+        let found = db.items(kind);
+        let items: Vec<String> = found
+            .iter()
+            .map(|(value, locked)| format!("{} {value}", if *locked { "+" } else { " " }))
+            .collect();
+        match menu_keys(tui, "History", &items, focus, &[del, shift_del, ins])? {
+            MenuResult::Chosen(index) => return Ok(Some(found[index].0.clone())),
+            MenuResult::Closed => return Ok(None),
+            MenuResult::Key(key, index) => {
+                focus = index;
+                let value = &found[index].0;
+                if key == ins {
+                    db.toggle_lock(kind, value);
+                } else if key == shift_del {
+                    db.remove(kind, value);
+                } else {
+                    db.clear(kind);
+                }
+            }
+        }
+    }
+}
+
+/// Shows a scrollable list of keys and what they do. An entry with an empty
+/// description is a heading.
+pub fn help_list(tui: &mut Tui, title: &str, entries: &[(&str, &str)]) -> io::Result<()> {
+    let width = entries.iter().map(|(k, _)| str_width(k)).max().unwrap_or(0);
+    let items: Vec<String> = entries
+        .iter()
+        .map(|(key, what)| {
+            if what.is_empty() && !key.is_empty() {
+                format!("--- {key} ---")
+            } else if key.is_empty() {
+                String::new()
+            } else {
+                format!("{}  {what}", fit(key, width))
+            }
+        })
+        .collect();
+    menu(tui, title, &items, 0)?;
+    Ok(())
+}
+
+/// Asks for one line of text, offering and extending a history list.
+pub fn prompt_history(
+    tui: &mut Tui,
+    db: &Rc<History>,
+    kind: Kind,
+    title: &str,
+    label: &str,
+    value: &str,
+) -> io::Result<Option<String>> {
+    let mut form = Form::new(vec![Field::with_history(label, value, kind)]).with_db(db);
+    if !form.run(tui, title)? {
+        return Ok(None);
+    }
+    let text = form.text(0);
+    db.add(kind, &text);
+    Ok(Some(text))
 }
 
 /// Asks for one line of text. Returns `None` on Esc.
@@ -377,6 +650,47 @@ pub fn prompt(tui: &mut Tui, title: &str, label: &str, value: &str) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn labels_give_their_hotkey_and_hide_the_marker() {
+        assert_eq!(parse_label("R&egular"), ("Regular".to_string(), Some('e')));
+        assert_eq!(parse_label("Plain"), ("Plain".to_string(), None));
+    }
+
+    #[test]
+    fn form_draws_options_and_buttons_inside_small_screens() {
+        let form = Form::new(vec![
+            Field::text("&Search for", "x"),
+            Field::check("&Case sensitive", true),
+        ])
+        .with_buttons(&["Find next", "&All"]);
+        let mut s = Screen::new(80, 20);
+        form.draw(&mut s, "Search", 0);
+        let all: String = (0..20).map(|y| s.row_text(y)).collect();
+        assert!(all.contains("Search for"));
+        assert!(all.contains("[x] Case sensitive"));
+        assert!(all.contains("[ Find next ]"));
+        assert!(all.contains("[ All ]"));
+        assert!(!all.contains('&'));
+        form.draw(&mut Screen::new(10, 3), "Search", 0);
+    }
+
+    #[test]
+    fn buttons_that_do_not_fit_wrap_to_another_row() {
+        let form = Form::new(vec![]).with_buttons(&["aaaaaa", "bbbbbb", "cccccc"]);
+        assert_eq!(form.button_rows(40), vec![vec![0, 1, 2]]);
+        assert_eq!(form.button_rows(24), vec![vec![0, 1], vec![2]]);
+        assert_eq!(form.button_rows(5), vec![vec![0], vec![1], vec![2]]);
+    }
+
+    #[test]
+    fn focus_steps_through_fields_and_buttons_and_skips_labels() {
+        let form = Form::new(vec![Field::Label("x".into()), Field::text("t", "")])
+            .with_buttons(&["A", "B"]);
+        assert_eq!(form.step(1, 1), 2);
+        assert_eq!(form.step(3, 1), 1);
+        assert_eq!(form.step(1, -1), 3);
+    }
 
     #[test]
     fn short_text_is_shown_whole() {
