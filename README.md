@@ -92,4 +92,5 @@ cargo clippy --all-targets
 ```
 
 The end-to-end tests in `tests/tui.rs` run the real binary in tmux. They are
-skipped if tmux is not installed.
+skipped if tmux is not installed. See [AGENTS.md](AGENTS.md) for the code layout
+and project rules.
