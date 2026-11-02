@@ -77,22 +77,23 @@ pub struct CopyOptions {
     pub follow_symlinks: bool,
 }
 
-struct Cancelled;
-type Step<T> = Result<Option<T>, Cancelled>;
+pub(crate) struct Cancelled;
+pub(crate) type Step<T> = Result<Option<T>, Cancelled>;
 
-struct Ctx<'a, U: OpUi> {
-    ui: &'a mut U,
-    progress: Progress,
-    overwrite_all: Option<bool>,
+pub(crate) struct Ctx<'a, U: OpUi> {
+    pub(crate) ui: &'a mut U,
+    pub(crate) progress: Progress,
+    pub(crate) overwrite_all: Option<bool>,
     skip_errors: bool,
     delete_all: bool,
-    skipped: u64,
-    done: u64,
+    pub(crate) skipped: u64,
+    pub(crate) done: u64,
     follow: bool,
+    durable: bool,
 }
 
 impl<'a, U: OpUi> Ctx<'a, U> {
-    fn new(ui: &'a mut U, follow: bool) -> Self {
+    pub(crate) fn new(ui: &'a mut U, follow: bool) -> Self {
         Ctx {
             ui,
             progress: Progress::default(),
@@ -102,10 +103,11 @@ impl<'a, U: OpUi> Ctx<'a, U> {
             skipped: 0,
             done: 0,
             follow,
+            durable: false,
         }
     }
 
-    fn check(&self) -> Result<(), Cancelled> {
+    pub(crate) fn check(&self) -> Result<(), Cancelled> {
         if self.ui.cancelled() {
             Err(Cancelled)
         } else {
@@ -115,7 +117,11 @@ impl<'a, U: OpUi> Ctx<'a, U> {
 
     /// Runs `f`, asking the user what to do when it fails. `Ok(None)` means
     /// the step was skipped.
-    fn attempt<T>(&mut self, path: &Path, mut f: impl FnMut() -> io::Result<T>) -> Step<T> {
+    pub(crate) fn attempt<T>(
+        &mut self,
+        path: &Path,
+        mut f: impl FnMut() -> io::Result<T>,
+    ) -> Step<T> {
         loop {
             self.check()?;
             match f() {
@@ -144,7 +150,7 @@ impl<'a, U: OpUi> Ctx<'a, U> {
     }
 
     /// Reports a failure that already happened. `Ok(true)` means try again.
-    fn ask_retry(&mut self, path: &Path, message: &str) -> Result<bool, Cancelled> {
+    pub(crate) fn ask_retry(&mut self, path: &Path, message: &str) -> Result<bool, Cancelled> {
         self.check()?;
         if self.skip_errors {
             self.skipped += 1;
@@ -166,7 +172,7 @@ impl<'a, U: OpUi> Ctx<'a, U> {
     }
 
     /// Decides whether an existing destination may be replaced.
-    fn may_overwrite(&mut self, src: &Path, dst: &Path) -> Result<bool, Cancelled> {
+    pub(crate) fn may_overwrite(&mut self, src: &Path, dst: &Path) -> Result<bool, Cancelled> {
         if let Some(all) = self.overwrite_all {
             if !all {
                 self.skipped += 1;
@@ -192,11 +198,11 @@ impl<'a, U: OpUi> Ctx<'a, U> {
         }
     }
 
-    fn report(&mut self) {
+    pub(crate) fn report(&mut self) {
         self.ui.progress(&self.progress);
     }
 
-    fn finish(self, result: Result<(), Cancelled>) -> OpSummary {
+    pub(crate) fn finish(self, result: Result<(), Cancelled>) -> OpSummary {
         OpSummary {
             done: self.done,
             skipped: self.skipped,
@@ -308,14 +314,14 @@ pub fn copy_items<U: OpUi>(
     ctx.finish(result)
 }
 
-fn temp_name(dst: &Path) -> PathBuf {
+pub(crate) fn temp_name(dst: &Path) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let name = format!(".far_tmp_{}_{n}", std::process::id());
     dst.with_file_name(name)
 }
 
-fn set_times(path: &Path, meta: &Metadata) -> io::Result<()> {
+pub(crate) fn set_times(path: &Path, meta: &Metadata) -> io::Result<()> {
     let times = [
         libc::timespec {
             tv_sec: meta.atime() as libc::time_t,
@@ -442,10 +448,36 @@ fn read_names(dir: &Path) -> io::Result<Vec<OsString>> {
     Ok(names)
 }
 
+/// True when `src` is a link to the regular file at `dst`. Replacing that file
+/// with the link would destroy the data and leave a link pointing at itself.
+fn link_points_at(src: &Path, dst: &Path) -> bool {
+    let is_link = |p: &Path| fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    if !is_link(src) || is_link(dst) {
+        return false;
+    }
+    match (fs::metadata(src), fs::metadata(dst)) {
+        (Ok(a), Ok(b)) => is_same_file(&a, &b),
+        _ => false,
+    }
+}
+
+fn refuse_link_onto_target<U: OpUi>(ctx: &mut Ctx<U>, src: &Path) -> Result<(), Cancelled> {
+    ctx.attempt::<()>(src, || {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the link points to the destination, which would destroy it",
+        ))
+    })?;
+    Ok(())
+}
+
 fn copy_link<U: OpUi>(ctx: &mut Ctx<U>, src: &Path, dst: &Path) -> Result<(), Cancelled> {
     let Some(link) = ctx.attempt(src, || fs::read_link(src))? else {
         return Ok(());
     };
+    if link_points_at(src, dst) {
+        return refuse_link_onto_target(ctx, src);
+    }
     if let Ok(existing) = fs::symlink_metadata(dst) {
         if existing.is_dir() {
             ctx.attempt::<()>(dst, || {
@@ -533,10 +565,18 @@ fn copy_file<U: OpUi>(
         break;
     }
     let finished = ctx.attempt(dst, || {
-        let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(meta.mode()));
+        // Not setuid or setgid: the copy may have another owner than the source.
+        let _ = fs::set_permissions(&temp, fs::Permissions::from_mode(meta.mode() & 0o777));
         let _ = set_times(&temp, meta);
         fs::rename(&temp, dst)
-    })?;
+    });
+    let finished = match finished {
+        Ok(finished) => finished,
+        Err(cancelled) => {
+            let _ = fs::remove_file(&temp);
+            return Err(cancelled);
+        }
+    };
     if finished.is_none() {
         let _ = fs::remove_file(&temp);
     } else {
@@ -586,6 +626,13 @@ fn stream_copy<U: OpUi>(
             ctx.report();
         }
     }
+    // A move deletes the only other copy next, so delayed write errors, as on
+    // network file systems, must surface now.
+    if ctx.durable {
+        if let Err(e) = output.sync_all() {
+            return Ok(Err(e));
+        }
+    }
     Ok(Ok(()))
 }
 
@@ -621,7 +668,7 @@ pub fn move_items<U: OpUi>(
     ctx.finish(result)
 }
 
-fn move_one<U: OpUi>(ctx: &mut Ctx<U>, src: &Path, dst: &Path) -> Result<(), Cancelled> {
+pub(crate) fn move_one<U: OpUi>(ctx: &mut Ctx<U>, src: &Path, dst: &Path) -> Result<(), Cancelled> {
     ctx.check()?;
     ctx.progress.from = src.to_path_buf();
     ctx.progress.to = dst.to_path_buf();
@@ -640,6 +687,9 @@ fn move_one<U: OpUi>(ctx: &mut Ctx<U>, src: &Path, dst: &Path) -> Result<(), Can
             ))
         })?;
         return Ok(());
+    }
+    if link_points_at(src, dst) {
+        return refuse_link_onto_target(ctx, src);
     }
     if let Ok(existing) = fs::symlink_metadata(dst) {
         if !is_same_file(&existing, &meta) {
@@ -707,7 +757,9 @@ fn move_across<U: OpUi>(
         ctx.overwrite_all = Some(true);
     }
     let before = ctx.skipped;
+    ctx.durable = true;
     let result = copy_one(ctx, src, dst);
+    ctx.durable = false;
     ctx.overwrite_all = saved;
     result?;
     if ctx.skipped != before {
@@ -748,7 +800,10 @@ fn trash_one<U: OpUi>(ctx: &mut Ctx<U>, src: &Path) -> Result<(), Cancelled> {
     let Some(home) = util::home_dir() else {
         return trash_refused(ctx, src);
     };
-    let trash = home.join(".local/share/Trash");
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|v| !v.is_empty())
+        .map_or_else(|| home.join(".local/share"), PathBuf::from);
+    let trash = data.join("Trash");
     match move_to_trash(src, &trash) {
         Ok(()) => {
             ctx.done += 1;
@@ -1432,6 +1487,58 @@ mod tests {
         move_items(std::slice::from_ref(&a), &target, &base(), &mut ui);
         assert_eq!(fs::read_to_string(&a).unwrap(), "1");
         assert!(ui.errors.is_empty());
+    }
+
+    #[test]
+    fn a_link_never_replaces_the_file_it_points_to() {
+        let d = TestDir::new("linktarget");
+        d.write("b/file", "precious");
+        fs::create_dir(d.p("a")).unwrap();
+        symlink(d.p("b/file"), d.p("a/file")).unwrap();
+        for moving in [false, true] {
+            let mut ui = Script::default();
+            let sources = [d.p("a/file")];
+            let target = d.p("b").display().to_string();
+            let summary = if moving {
+                move_items(&sources, &target, &d.0, &mut ui)
+            } else {
+                let options = CopyOptions::default();
+                copy_items(&sources, &target, &d.0, &options, &mut ui)
+            };
+            assert_eq!(summary.done, 0);
+            assert_eq!(fs::read_to_string(d.p("b/file")).unwrap(), "precious");
+            let kept = fs::symlink_metadata(d.p("a/file")).unwrap();
+            assert!(kept.file_type().is_symlink());
+        }
+    }
+
+    #[test]
+    fn a_link_to_another_file_can_still_replace_a_file() {
+        let d = TestDir::new("linkother");
+        d.write("other", "x");
+        d.write("b/file", "old");
+        fs::create_dir(d.p("a")).unwrap();
+        symlink(d.p("other"), d.p("a/file")).unwrap();
+        let mut ui = Script::default();
+        let target = d.p("b").display().to_string();
+        let options = CopyOptions::default();
+        copy_items(&[d.p("a/file")], &target, &d.0, &options, &mut ui);
+        assert!(fs::symlink_metadata(d.p("b/file"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[test]
+    fn copies_do_not_keep_setuid() {
+        let d = TestDir::new("setuid");
+        let file = d.write("prog", "x");
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o6755)).unwrap();
+        let mut ui = Script::default();
+        let options = CopyOptions::default();
+        copy_items(&[file], "copy", &d.0, &options, &mut ui);
+        let mode = fs::metadata(d.p("copy")).unwrap().mode() & 0o7777;
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

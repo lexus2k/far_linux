@@ -38,7 +38,7 @@ impl Session {
         setup(&root);
         let session = Session { socket, root };
         let launch = format!(
-            "env HOME={home} PS1= {bin} {left} {right}; sleep 30",
+            "env HOME={home} XDG_DATA_HOME={home}/data PS1= {bin} {left} {right}; sleep 30",
             home = session.root.join("home").display(),
             bin = env!("CARGO_BIN_EXE_far"),
             left = session.root.join("left").display(),
@@ -240,7 +240,7 @@ fn f8_uses_the_trash_and_shift_delete_is_permanent() {
     s.wait("Move to the trash:");
     s.keys(&["Enter"]);
     s.wait_file(&s.p("left/alpha.txt"), false);
-    let trashed = s.p("home/.local/share/Trash/files/alpha.txt");
+    let trashed = s.p("home/data/Trash/files/alpha.txt");
     assert_eq!(
         fs::read_to_string(trashed).unwrap(),
         "alpha contents\nsecond line\n"
@@ -250,7 +250,7 @@ fn f8_uses_the_trash_and_shift_delete_is_permanent() {
     s.wait("Permanently delete");
     s.keys(&["Enter"]);
     s.wait_file(&s.p("left/gone.txt"), false);
-    assert!(!s.p("home/.local/share/Trash/files/gone.txt").exists());
+    assert!(!s.p("home/data/Trash/files/gone.txt").exists());
 }
 
 #[test]
@@ -513,6 +513,302 @@ fn f9_menu_runs_commands_and_escape_closes_it() {
     s.wait("Make folder");
     s.keys(&["Escape"]);
     s.wait_gone("Make folder");
+}
+
+#[test]
+fn editor_search_has_far_options_and_shift_f7_continues() {
+    let Some(s) = Session::start(|root| {
+        fs::write(
+            root.join("left/f.txt"),
+            "alpha1\nbeta\nalpha22\ngamma\nalpha333\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("f.txt");
+    s.keys(&["Down", "F4"]);
+    s.wait("Ln 1/");
+    s.keys(&["F7"]);
+    s.wait("Regular expressions");
+    let dialog = s.screen();
+    for label in [
+        "Case sensitive",
+        "Whole words",
+        "Fuzzy search",
+        "Find previous",
+    ] {
+        assert!(dialog.contains(label), "{label} missing:\n{dialog}");
+    }
+    s.text(r"alpha\d+");
+    s.keys(&["M-e", "Enter"]);
+    s.wait_gone("Regular expressions");
+    s.wait("Ln 1/");
+    s.keys(&["S-F7"]);
+    s.wait("Ln 3/");
+    s.keys(&["S-F7"]);
+    s.wait("Ln 5/");
+    s.keys(&["M-F7"]);
+    s.wait("Ln 3/");
+    s.keys(&["S-F7", "S-F7"]);
+    s.wait("Not found");
+}
+
+#[test]
+fn editor_replace_continues_and_preserves_the_rest() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/f.txt"), "old one\nold two\n").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("f.txt");
+    s.keys(&["Down", "F4"]);
+    s.wait("Ln 1/");
+    s.keys(&["C-F7"]);
+    s.wait("Replace with");
+    assert!(s.screen().contains("Preserve style"));
+    s.text("old");
+    s.keys(&["Tab"]);
+    s.text("new");
+    s.keys(&["Enter"]);
+    s.wait("Skip");
+    s.keys(&["Enter"]);
+    s.wait_for("second prompt", |t| {
+        t.contains("Skip") && t.contains("new one")
+    });
+    s.keys(&["Enter"]);
+    s.wait_gone("Skip");
+    s.keys(&["F2", "F10"]);
+    s.wait_gone("Ln ");
+    assert_eq!(
+        fs::read_to_string(s.p("left/f.txt")).unwrap(),
+        "new one\nnew two\n"
+    );
+}
+
+#[test]
+fn viewer_space_and_shift_f7_continue_a_search() {
+    let Some(s) = Session::start(|root| {
+        fs::write(
+            root.join("left/f.txt"),
+            "first\nneedle a\nthird\nneedle b\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("f.txt");
+    s.keys(&["Down", "F3"]);
+    s.wait("needle a");
+    s.keys(&["F7"]);
+    s.wait("Regular expressions");
+    s.text("needle");
+    s.keys(&["Enter"]);
+    s.wait_gone("Regular expressions");
+    s.keys(&["Space"]);
+    s.wait_for("second match on top", |t| {
+        t.lines().nth(1).is_some_and(|l| l.contains("needle b"))
+    });
+    s.keys(&["Space"]);
+    s.wait("Not found");
+}
+
+#[test]
+fn search_history_is_kept_in_the_database() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/f.txt"), "x\n").unwrap();
+        let db = root.join("home/data/far_linux/history.db");
+        let h = far_linux::history::History::open(&db).unwrap();
+        h.add(far_linux::history::Kind::Search, "from an earlier run");
+    }) else {
+        return;
+    };
+    s.wait("f.txt");
+    s.keys(&["Down", "F4"]);
+    s.wait("Ln 1/");
+    s.keys(&["F7"]);
+    s.wait("from an earlier run");
+    s.keys(&["BSpace"]);
+    s.keys(&["C-a"]);
+    s.text("typed now");
+    s.keys(&["Enter"]);
+    s.wait("Not found");
+    s.keys(&["Enter"]);
+    s.wait_gone("Not found");
+    s.keys(&["F7"]);
+    s.wait("typed now");
+    s.keys(&["C-Down"]);
+    s.wait("History");
+    assert!(s.screen().contains("from an earlier run"));
+    s.keys(&["Escape", "Escape", "F10"]);
+    s.wait_gone("Ln 1/");
+    s.keys(&["F10"]);
+    s.wait("Do you want to quit");
+    s.keys(&["Enter"]);
+    s.wait_gone("Do you want to quit");
+    let db = s.p("home/data/far_linux/history.db");
+    s.wait_file(&db, true);
+    let h = far_linux::history::History::open(&db).unwrap();
+    let list = h.list(far_linux::history::Kind::Search);
+    assert!(list.iter().any(|v| v.contains("typed now")), "{list:?}");
+}
+
+#[test]
+fn shift_f1_packs_enter_browses_f5_extracts_and_f8_deletes() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir_all(root.join("left/data/sub")).unwrap();
+        fs::write(root.join("left/data/a.txt"), "aaa").unwrap();
+        fs::write(root.join("left/data/sub/b.txt"), "bbb").unwrap();
+        fs::write(root.join("left/data/c.txt"), "ccc").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("data");
+    s.keys(&["Down", "S-F1"]);
+    s.wait("Archive name");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/data.zip"), true);
+    s.wait("1 files");
+    // The cursor is on the new archive. Enter opens it like a folder.
+    s.keys(&["Enter"]);
+    s.wait("data.zip:/");
+    s.keys(&["Down", "Enter"]);
+    s.wait("data.zip:/data");
+    s.wait("a.txt");
+    // ".." then a.txt, c.txt or sub, depending on sorting: folders come first.
+    s.keys(&["End", "F3"]);
+    s.wait("ccc");
+    s.keys(&["Escape"]);
+    s.wait_gone("ccc");
+    s.keys(&["F5"]);
+    s.wait("Extract");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/c.txt"), true);
+    assert_eq!(fs::read_to_string(s.p("right/c.txt")).unwrap(), "ccc");
+    // The file appears before the operation ends, and keys sent during an
+    // operation are discarded. The right panel's count shows that it ended.
+    s.wait("3 bytes, 1 files");
+    s.keys(&["F8"]);
+    s.wait("Delete from the archive");
+    s.keys(&["Enter"]);
+    s.wait_gone("Delete from the archive");
+    // Both panels now hold one 3-byte file: a.txt on the left, c.txt on the right.
+    s.wait_for("the file to leave the archive", |t| {
+        t.matches("3 bytes, 1 files").count() == 2
+    });
+    assert!(fs::read_to_string(s.p("left/data/c.txt")).is_ok());
+    // Leaving through ".." at the top puts the cursor back on the archive.
+    s.keys(&["C-PageUp", "C-PageUp"]);
+    s.wait_gone("data.zip:/");
+    let entries = far_linux::archive::list(&s.p("left/data.zip"), far_linux::archive::Format::Zip);
+    let names: Vec<String> = entries.unwrap().into_iter().map(|e| e.path).collect();
+    assert!(names.iter().any(|n| n == "data/sub/b.txt"), "{names:?}");
+    assert!(!names.iter().any(|n| n == "data/c.txt"), "{names:?}");
+}
+
+#[test]
+fn shift_f2_extracts_a_tar_gz_made_with_the_format_button() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/note.txt"), "hello").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("note.txt");
+    s.keys(&["Down", "S-F1"]);
+    s.wait("Archive name");
+    s.keys(&["M-f"]);
+    s.wait("Format");
+    s.keys(&["Down", "Enter"]);
+    s.wait("note.txt.tar.gz");
+    s.keys(&["Tab", "Tab", "Enter"]);
+    s.wait_file(&s.p("left/note.txt.tar.gz"), true);
+    s.wait("2 files");
+    s.keys(&["S-F2"]);
+    s.wait("Extract to");
+    s.keys(&["M-i", "Tab"]);
+    s.keys(&["Tab", "Enter"]);
+    let out = s.p("right/note.txt/note.txt");
+    s.wait_file(&out, true);
+    assert_eq!(fs::read_to_string(out).unwrap(), "hello");
+}
+
+#[test]
+fn f6_to_an_archive_on_the_other_panel_moves_the_files() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/move.txt"), "m").unwrap();
+        fs::write(root.join("right/seed.txt"), "s").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("move.txt");
+    s.keys(&["Tab"]);
+    s.wait("seed.txt");
+    s.keys(&["Down", "S-F1"]);
+    s.wait("Archive name");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/seed.txt.zip"), true);
+    s.wait("2 files");
+    s.keys(&["Enter"]);
+    s.wait("seed.txt.zip:/");
+    s.keys(&["Tab", "Down", "F6"]);
+    s.wait("Move to archive");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/move.txt"), false);
+    let entries =
+        far_linux::archive::list(&s.p("right/seed.txt.zip"), far_linux::archive::Format::Zip);
+    let names: Vec<String> = entries.unwrap().into_iter().map(|e| e.path).collect();
+    assert!(names.contains(&"move.txt".to_string()), "{names:?}");
+}
+
+#[test]
+fn renaming_a_non_utf8_name_without_editing_keeps_its_bytes() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    let name = OsStr::from_bytes(b"bad\xff.txt");
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left").join(name), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("bad");
+    s.keys(&["Down", "S-F6"]);
+    s.wait("Rename or move");
+    s.keys(&["Enter"]);
+    s.wait_gone("Rename or move");
+    s.keys(&["S-F5"]);
+    s.wait("Copy contents of symbolic links");
+    s.keys(&["Enter"]);
+    s.wait_gone("Copy contents of symbolic links");
+    let names: Vec<_> = fs::read_dir(s.p("left"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .collect();
+    assert_eq!(names, [name]);
+}
+
+#[test]
+fn ctrl_a_recursive_leaves_unchanged_modes_alone() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/d")).unwrap();
+        fs::write(root.join("left/d/secret"), "x").unwrap();
+        let private = fs::Permissions::from_mode(0o600);
+        fs::set_permissions(root.join("left/d/secret"), private).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("d");
+    s.keys(&["Down", "C-a"]);
+    s.wait("Apply to folder contents");
+    s.keys(&["M-Up"]);
+    s.keys(&["Up", "Space", "Enter"]);
+    s.wait_gone("Apply to folder contents");
+    let mode = fs::metadata(s.p("left/d/secret"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
 }
 
 #[test]

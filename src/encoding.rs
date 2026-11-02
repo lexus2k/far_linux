@@ -60,9 +60,9 @@ mod tests {
     #[test]
     fn every_byte_round_trips_in_single_byte_encodings() {
         let all: Vec<u8> = (0..=255).collect();
-        for index in 1..NAMES.len() {
+        for (index, name) in NAMES.iter().enumerate().skip(1) {
             let text = decode(&all, index).unwrap();
-            assert_eq!(encode(&text, index).unwrap(), all, "{}", NAMES[index]);
+            assert_eq!(encode(&text, index).unwrap(), all, "{name}");
         }
     }
 

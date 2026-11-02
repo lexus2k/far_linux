@@ -103,7 +103,7 @@ pub fn fit(s: &str, width: usize) -> String {
         out.push(c);
         used += w;
     }
-    out.extend(std::iter::repeat(' ').take(width - used));
+    out.extend(std::iter::repeat_n(' ', width - used));
     out
 }
 
@@ -114,7 +114,7 @@ pub fn fit_name(s: &str, width: usize) -> String {
     }
     let mut out = fit(s, width - 1).trim_end_matches(' ').to_string();
     let used = str_width(&out);
-    out.extend(std::iter::repeat(' ').take(width - 1 - used));
+    out.extend(std::iter::repeat_n(' ', width - 1 - used));
     out.push('}');
     out
 }
@@ -221,7 +221,7 @@ impl Screen {
 
     /// Fills a rectangle with one character.
     pub fn fill(&mut self, x: u16, y: u16, w: u16, h: u16, ch: char, style: Style) {
-        let line: String = std::iter::repeat(ch).take(w as usize).collect();
+        let line: String = std::iter::repeat_n(ch, w as usize).collect();
         for row in y..y.saturating_add(h).min(self.h) {
             self.put(x, row, &line, style);
         }
@@ -237,7 +237,7 @@ impl Screen {
         } else {
             ('┌', '┐', '└', '┘', '─', '│')
         };
-        let bar: String = std::iter::repeat(hz).take(w as usize - 2).collect();
+        let bar: String = std::iter::repeat_n(hz, w as usize - 2).collect();
         self.put(x, y, &format!("{tl}{bar}{tr}"), style);
         self.put(x, y + h - 1, &format!("{bl}{bar}{br}"), style);
         self.fill(x + 1, y + 1, w - 2, h - 2, ' ', style);
@@ -400,6 +400,18 @@ impl Tui {
         )?;
         self.on_alt = false;
         Ok(())
+    }
+
+    /// Shows the console until a key is pressed, for Ctrl+O in the viewer and
+    /// editor.
+    pub fn user_screen(&mut self) -> io::Result<()> {
+        self.show_console()?;
+        loop {
+            if let Some(Input::Key(_)) = self.read(Duration::from_millis(500))? {
+                break;
+            }
+        }
+        self.enter()
     }
 
     /// Writes the differences between the buffer and the terminal.

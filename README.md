@@ -42,12 +42,51 @@ Press F1 in the program for the full list.
 |---|---|
 | Panels | `Tab` other panel, `Enter` open or run, `Ctrl+PgUp` parent, `Ctrl+\` root, `Ctrl+U` swap |
 | Console | `Ctrl+O` show or hide panels, `Ctrl+P` hide inactive panel, `Ctrl+F1` / `Ctrl+F2` hide left / right |
-| File operations | `F5` copy, `F6` rename or move, `Shift+F5` / `Shift+F6` on the file under the cursor, `F7` make folder, `F8` delete to trash, `Shift+Del` delete permanently, `Alt+F6` link, `Ctrl+A` permissions and owner |
+| File operations | `F5` copy, `F6` rename or move, `Shift+F5` / `Shift+F6` on the file under the cursor, `F7` make folder, `F8` delete to trash, `Shift+F8` delete the item under the cursor to trash, `Shift+Del` delete permanently, `Alt+F6` link, `Ctrl+A` permissions and owner |
 | Selection | `Ins`, `Shift+arrows`, `+` / `-` by mask, `*` invert |
 | Finding | `Alt+letter` quick search, `Alt+F7` find files |
 | Display | `Ctrl+F3`..`Ctrl+F11` sort, `Ctrl+F12` sort menu, `Ctrl+1`..`Ctrl+4` columns, `Ctrl+H` hidden files, `Ctrl+L` info, `Ctrl+Q` quick view, `F9` menu |
-| Viewer (`F3`) | `F2` wrap, `F4` hex, `F6` edit, `F7` search, `F8` encoding, `Alt+F8` go to |
-| Editor (`F4`) | `F2` save, `Shift+arrows` block, `Alt+Shift+arrows` vertical block, `Ctrl+C/X/V`, `Ctrl+Z`, `F7` search, `Ctrl+F7` replace, `F8` encoding |
+| Viewer (`F3`) | `F2` wrap, `Shift+F2` word wrap, `F4` hex, `Shift+F4` mode, `F6` edit, `F7` search, `Shift+F7` or `Space` next, `Alt+F7` previous, `F8` encoding, `Alt+F8` go to, `+` / `-` next or previous file. `F1` lists all keys |
+| Editor (`F4`) | `F2` save, `Shift+arrows` block, `Alt+arrows` vertical block, `Ctrl+C/X/V`, `Ctrl+Z`, `F7` search, `Ctrl+F7` replace, `Shift+F7` next, `Alt+F7` previous, `Alt+F8` go to, `F8` encoding, `Ctrl+Shift+0..9` / `Ctrl+0..9` bookmarks. `F1` lists all keys |
+
+## Archives
+
+Zip, tar, tar.gz, tar.bz2, tar.xz and 7z work. Tar.bz2 and tar.xz use the `bzip2`
+and `xz` programs, and 7z uses `7z`. Zip, tar and tar.gz need nothing installed.
+
+| Key | Action |
+|---|---|
+| `Enter`, `Ctrl+PgDn` | Open the archive under the cursor |
+| `Ctrl+PgUp` | Go up, leaving the archive from its top folder |
+| `Shift+F1` | Add the selection to a new or existing archive |
+| `Shift+F2` | Extract the chosen archives |
+| `Shift+F3` | Archive commands: test the archive |
+| `F3`, `F4` | Inside an archive: view or edit a temporary copy |
+| `F5` | Inside an archive: extract. Otherwise, with an archive on the other panel: add to it |
+| `F6` | The same, then remove the originals |
+| `F7`, `F8` | Inside an archive: make a folder, delete |
+
+The format comes from the name's extension, or from the Format button in
+`Shift+F1`. Changing an archive writes a new file and renames it into place, so a
+failure leaves the original intact. Names that would leave the destination are
+refused, and extraction does not follow links or create setuid files.
+
+Limits: password protected archives, rar and renaming inside an archive are not
+supported. Listing and testing run in the foreground and cannot be cancelled, so
+a large compressed tar can pause the program. Esc does not stop a 7z command once
+it has started.
+
+## History
+
+Commands, folders, viewed and edited files, search and replace text, search
+options, masks and copy targets are kept in
+`$XDG_DATA_HOME/far_linux/history.db`, or `~/.local/share/far_linux/history.db`.
+Only you can read the file, because commands can contain secrets. Delete it to
+clear everything. If it cannot be opened, history lasts until you quit.
+
+In search, find, mask and copy target boxes, `Ctrl+Up` or `Ctrl+Down` opens the
+list. `Enter` picks an item, `Ins` locks it, `Shift+Del` removes it and `Del`
+clears everything that is not locked.
 
 ## How file operations behave
 
@@ -73,10 +112,13 @@ Press F1 in the program for the full list.
   association system.
 
 Not implemented yet: user menu (`F2`), plugins (`F11`), screens (`F12`), macros,
-tree panel, file descriptions, wipe (`Alt+Del`), saved settings and history, and
+tree panel, file descriptions, wipe (`Alt+Del`), saved settings, the editor's
+persistent blocks (`Ctrl+P`, `Ctrl+M`), and
 editing UTF-16 files (the viewer shows them as bytes).
 
 ## Terminal support
+
+Run `far --keys` to see what your terminal sends for a key, such as `Shift+F7`.
 
 Some key combinations depend on the terminal, and some terminals keep certain
 keys for themselves, such as `Alt+F4` or `F11` in Windows Terminal. `Ctrl+1`..`4`
