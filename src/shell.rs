@@ -6,7 +6,7 @@
 use crate::util;
 use std::fs;
 use std::io;
-use std::os::unix::fs::DirBuilderExt;
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,6 +27,227 @@ shopt -s expand_aliases 2>/dev/null
 [ -r "$HOME/.bash_aliases" ] && . "$HOME/.bash_aliases" 2>/dev/null
 eval "$__far_cmd"
 "#;
+
+/// Commands bash knows that are not files on `PATH`.
+const BUILTINS: &[&str] = &[
+    "alias", "bg", "break", "builtin", "cd", "command", "continue", "declare", "dirs", "echo",
+    "eval", "exec", "exit", "export", "false", "fg", "hash", "help", "history", "jobs", "kill",
+    "local", "popd", "printf", "pushd", "pwd", "read", "return", "set", "shift", "source", "test",
+    "times", "trap", "true", "type", "ulimit", "umask", "unalias", "unset", "wait",
+];
+
+/// The word Tab completes.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Word {
+    /// Character index where it starts.
+    start: usize,
+    /// Its text with quotes and escapes removed.
+    value: String,
+    /// It is where a command name goes.
+    is_command: bool,
+    /// The command it is an argument of, with quotes removed.
+    command: String,
+}
+
+/// Finds the last word of a command line, following shell quoting.
+fn last_word(line: &str) -> Word {
+    let mut word = Word {
+        is_command: true,
+        ..Word::default()
+    };
+    let mut started = false;
+    let mut words = 0;
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, c) in line.chars().enumerate() {
+        if escaped {
+            escaped = false;
+            word.value.push(c);
+            continue;
+        }
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some('"') if c == '\\' => escaped = true,
+            Some(_) => word.value.push(c),
+            None => match c {
+                '\\' | '\'' | '"' => {
+                    if !started {
+                        started = true;
+                        word.start = i;
+                    }
+                    match c {
+                        '\\' => escaped = true,
+                        _ => quote = Some(c),
+                    }
+                }
+                ' ' | '\t' | '|' | ';' | '&' | '(' | ')' | '<' | '>' => {
+                    if started {
+                        if words == 0 {
+                            word.command = std::mem::take(&mut word.value);
+                        }
+                        words += 1;
+                    }
+                    if matches!(c, '|' | ';' | '&' | '(') {
+                        words = 0;
+                        word.command.clear();
+                    }
+                    started = false;
+                    word.value.clear();
+                    word.start = i + 1;
+                }
+                _ => {
+                    if !started {
+                        started = true;
+                        word.start = i;
+                    }
+                    word.value.push(c);
+                }
+            },
+        }
+    }
+    word.is_command = words == 0;
+    word
+}
+
+/// Names on `PATH` and among the builtins that start with `prefix`.
+fn command_matches(prefix: &str, path: Option<&std::ffi::OsStr>) -> Vec<String> {
+    let mut found: Vec<String> = BUILTINS
+        .iter()
+        .filter(|b| b.starts_with(prefix))
+        .map(|b| b.to_string())
+        .collect();
+    for dir in std::env::split_paths(path.unwrap_or_default()) {
+        let Ok(items) = fs::read_dir(dir) else {
+            continue;
+        };
+        for item in items.flatten() {
+            let raw = item.file_name();
+            let Some(name) = raw.to_str().filter(|n| n.starts_with(prefix)) else {
+                continue;
+            };
+            let runnable = fs::metadata(item.path())
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0);
+            if runnable {
+                found.push(name.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Paths matching `typed`, spelled as typed. Folders end in `/`.
+fn file_matches(typed: &str, cwd: &Path, dirs_only: bool) -> Vec<String> {
+    let (folder, prefix) = match typed.rfind('/') {
+        Some(i) => typed.split_at(i + 1),
+        None => ("", typed),
+    };
+    let dir = if folder.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        util::resolve_path(cwd, folder)
+    };
+    let Ok(items) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for item in items.flatten() {
+        let raw = item.file_name();
+        // A name that is not text, or holds a line break, cannot be typed here.
+        let Some(name) = raw
+            .to_str()
+            .filter(|n| n.starts_with(prefix) && !n.chars().any(char::is_control))
+        else {
+            continue;
+        };
+        if name.starts_with('.') && !prefix.starts_with('.') {
+            continue;
+        }
+        let is_dir = fs::metadata(item.path()).is_ok_and(|m| m.is_dir());
+        if dirs_only && !is_dir {
+            continue;
+        }
+        found.push(format!("{folder}{name}{}", if is_dir { "/" } else { "" }));
+    }
+    found
+}
+
+fn common_prefix(items: &[String]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut len = first.chars().count();
+    for item in items {
+        let same = first.chars().zip(item.chars());
+        len = len.min(same.take_while(|(a, b)| a == b).count());
+    }
+    first.chars().take(len).collect()
+}
+
+/// Escapes text for bash. A leading `~` stays active, because bash expands it.
+fn escape_word(text: &str) -> String {
+    let mut out = String::new();
+    for (i, c) in text.chars().enumerate() {
+        let tilde = c == '~' && (i > 0 || text == "~" || text.starts_with("~/"));
+        let plain = !c.is_ascii() || c.is_ascii_alphanumeric() || "_./+=:,@%-".contains(c) || tilde;
+        if !plain {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// What Tab does to a command line.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Completion {
+    /// Character index where the replaced word starts.
+    pub start: usize,
+    /// What replaces the word, or `None` if there is nothing to add.
+    pub text: Option<String>,
+    /// Names to list when the word could not be extended, sorted.
+    pub choices: Vec<String>,
+}
+
+/// Completes the last word of `line`: a command name at the start of a command,
+/// and otherwise a path, as bash does.
+pub fn complete(line: &str, cwd: &Path, path_var: Option<&std::ffi::OsStr>) -> Completion {
+    let word = last_word(line);
+    let mut matches = if word.is_command && !word.value.is_empty() && !word.value.contains('/') {
+        command_matches(&word.value, path_var)
+    } else {
+        file_matches(&word.value, cwd, word.command == "cd")
+    };
+    matches.sort();
+    matches.dedup();
+    let common = common_prefix(&matches);
+    let single = matches.len() == 1;
+    let extended = common.chars().count() > word.value.chars().count();
+    let text = if single {
+        let end = if common.ends_with('/') { "" } else { " " };
+        Some(escape_word(&common) + end)
+    } else if extended {
+        Some(escape_word(&common))
+    } else {
+        None
+    };
+    let choices = if text.is_none() {
+        matches
+            .iter()
+            .map(|m| {
+                let bare = m.trim_end_matches('/');
+                let tail = bare.rsplit('/').next().unwrap_or(bare);
+                format!("{tail}{}", if m.ends_with('/') { "/" } else { "" })
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Completion {
+        start: word.start,
+        text,
+        choices,
+    }
+}
 
 /// Result of a finished command.
 #[derive(Debug, PartialEq, Eq)]
@@ -157,6 +378,114 @@ mod tests {
         shell
             .run(&format!("{{ {cmd} ; }} >/dev/null"), cwd)
             .unwrap()
+    }
+
+    struct Tree(PathBuf);
+
+    impl Tree {
+        fn new(tag: &str, files: &[&str]) -> Tree {
+            let root = std::env::temp_dir().join(format!(
+                "far_complete_{tag}_{}_{}",
+                std::process::id(),
+                util::now_secs()
+            ));
+            let _ = fs::remove_dir_all(&root);
+            for file in files {
+                let path = root.join(file);
+                if let Some(dir) = file.strip_suffix('/') {
+                    fs::create_dir_all(root.join(dir)).unwrap();
+                } else {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(path, "").unwrap();
+                }
+            }
+            Tree(root)
+        }
+    }
+
+    impl Drop for Tree {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn text(line: &str, tree: &Tree) -> Option<String> {
+        complete(line, &tree.0, None).text
+    }
+
+    #[test]
+    fn tab_completes_a_single_file_and_adds_a_space() {
+        let t = Tree::new("single", &["readme.txt"]);
+        let c = complete("cat rea", &t.0, None);
+        assert_eq!((c.start, c.text.as_deref()), (4, Some("readme.txt ")));
+    }
+
+    #[test]
+    fn tab_completes_a_folder_with_a_slash_and_keeps_the_path_typed() {
+        let t = Tree::new("folder", &["src/main.rs", "src/lib.rs"]);
+        assert_eq!(text("ls sr", &t), Some("src/".into()));
+        let c = complete("ls src/m", &t.0, None);
+        assert_eq!((c.start, c.text.as_deref()), (3, Some("src/main.rs ")));
+    }
+
+    #[test]
+    fn tab_extends_to_the_common_part_then_lists_choices() {
+        let t = Tree::new("common", &["report_a", "report_b", "other"]);
+        assert_eq!(text("cat re", &t), Some("report_".into()));
+        let c = complete("cat report_", &t.0, None);
+        assert_eq!(c.text, None);
+        assert_eq!(c.choices, ["report_a", "report_b"]);
+    }
+
+    #[test]
+    fn completed_names_are_escaped_and_quoted_words_are_understood() {
+        let t = Tree::new("escape", &["my file (1).txt", "тест файл"]);
+        assert_eq!(text("cat my", &t), Some("my\\ file\\ \\(1\\).txt ".into()));
+        assert_eq!(
+            text("cat \"my fi", &t),
+            Some("my\\ file\\ \\(1\\).txt ".into())
+        );
+        assert_eq!(
+            text("cat my\\ fi", &t),
+            Some("my\\ file\\ \\(1\\).txt ".into())
+        );
+        assert_eq!(text("cat те", &t), Some("тест\\ файл ".into()));
+    }
+
+    #[test]
+    fn hidden_names_need_a_leading_dot() {
+        let t = Tree::new("hidden", &[".secret", "seen"]);
+        assert_eq!(text("cat ", &t), Some("seen ".into()));
+        assert_eq!(text("cat .s", &t), Some(".secret ".into()));
+    }
+
+    #[test]
+    fn cd_completes_only_folders() {
+        let t = Tree::new("cd", &["data/", "data.txt"]);
+        assert_eq!(text("cd da", &t), Some("data/".into()));
+        assert_eq!(text("cat data", &t), None);
+    }
+
+    #[test]
+    fn first_word_completes_commands_after_any_separator() {
+        let t = Tree::new("cmd", &["bin/frobnicate", "frobfile"]);
+        let tool = t.0.join("bin/frobnicate");
+        fs::set_permissions(&tool, fs::Permissions::from_mode(0o755)).unwrap();
+        let path = t.0.join("bin");
+        let run = |line: &str| complete(line, &t.0, Some(path.as_os_str())).text;
+        assert_eq!(run("frob"), Some("frobnicate ".into()));
+        assert_eq!(run("ls | frob"), Some("frobnicate ".into()));
+        assert_eq!(run("ls; frob"), Some("frobnicate ".into()));
+        assert_eq!(run("cat frob"), Some("frobfile ".into()));
+        assert_eq!(run("expor"), Some("export ".into()));
+    }
+
+    #[test]
+    fn nothing_to_complete_changes_nothing() {
+        let t = Tree::new("none", &["a"]);
+        let c = complete("cat zzz", &t.0, None);
+        assert_eq!((c.text, c.choices.len()), (None, 0));
+        assert_eq!(complete("cat /no/such/dir/x", &t.0, None).text, None);
     }
 
     #[test]

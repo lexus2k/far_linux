@@ -110,6 +110,26 @@ clears everything that is not locked.
   from `~/.bashrc` are not. `Ctrl+Z` is ignored for commands.
 - `Enter` on a non-executable file opens the viewer, because there is no file
   association system.
+- `exit` ends far without asking, and `exit 3` ignores the code: far itself exits
+  with 0.
+- `Tab` completes file and command names on the console (`Ctrl+O`), as bash does.
+  With panels on screen it changes panel, as in Far.
+- Files highlighting is a text file, `~/.config/far_linux/highlight.ini`, not Far's
+  dialog, and `F9`, Commands, Files highlighting opens it. It has Far's masks,
+  including `<name>` and `|` to exclude, and its four colours, but no regular
+  expression masks, marking character or "continue processing". Deleting the file restores the defaults.
+- The default groups are Far's: hidden (names starting with a dot), folders, `<arc>`,
+  `<temp>` and executables, plus links, images, media, documents and source. Linux
+  uses the execute permission rather than Far's `<exec>` masks, and it comes after
+  archives, temporary files, images, media and documents, because Windows drives
+  mark every file executable.
+- `Ctrl+C` clears the command line and cancels a running operation, as in a shell.
+  Far's panels have no such key.
+- `F3` on a folder shows the size in the Size column and the panel footer. Any
+  re-read of the panel clears it, so that it never shows a stale number. It does
+  not work inside an archive yet.
+- A read-only file asks before a permanent delete only, because the trash can
+  bring it back.
 
 Not implemented yet: user menu (`F2`), plugins (`F11`), screens (`F12`), macros,
 tree panel, file descriptions, wipe (`Alt+Del`), saved settings, the editor's
@@ -119,6 +139,15 @@ editing UTF-16 files (the viewer shows them as bytes).
 ## Terminal support
 
 Run `far --keys` to see what your terminal sends for a key, such as `Shift+F7`.
+
+The key bar changes while `Shift`, `Alt` or `Ctrl` is held only where the terminal
+reports those keys alone. far uses Windows Terminal's win32-input-mode for this,
+if the terminal confirms it at startup. `far --keys` says whether it is on and
+prints `Held:` lines. Set `FAR_WIN32_INPUT=0` to turn it off, or `1` to skip the
+check. Inside tmux or screen, or in other terminals, the key bar stays as it is.
+
+Colours do not use the terminal's colour scheme where it has 256 colours, because
+a scheme can redefine bright yellow to look brown.
 
 Some key combinations depend on the terminal, and some terminals keep certain
 keys for themselves, such as `Alt+F4` or `F11` in Windows Terminal. `Ctrl+1`..`4`

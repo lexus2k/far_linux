@@ -42,6 +42,26 @@ pub enum TrashChoice {
     Cancel,
 }
 
+/// Why a delete needs confirming, as Far asks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteAsk {
+    /// A selected folder that has something in it. `to_trash` tells whether it
+    /// goes to the trash or is removed for good.
+    NonEmptyFolder { to_trash: bool },
+    /// A file without write permission.
+    ReadOnly,
+}
+
+/// Answer to a delete confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeleteChoice {
+    Delete,
+    All,
+    Skip,
+    SkipAll,
+    Cancel,
+}
+
 /// A progress snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct Progress {
@@ -60,6 +80,7 @@ pub trait OpUi {
     fn overwrite(&mut self, src: &Path, dst: &Path) -> OverwriteChoice;
     fn error(&mut self, path: &Path, message: &str) -> ErrorChoice;
     fn trash_fallback(&mut self, path: &Path) -> TrashChoice;
+    fn confirm_delete(&mut self, path: &Path, ask: DeleteAsk) -> DeleteChoice;
 }
 
 /// Final tally of an operation.
@@ -86,9 +107,17 @@ pub(crate) struct Ctx<'a, U: OpUi> {
     pub(crate) overwrite_all: Option<bool>,
     skip_errors: bool,
     delete_all: bool,
+    /// Remembered "All" or "Skip all" for non-empty folders.
+    folders_all: Option<bool>,
+    /// Remembered "All" or "Skip all" for read-only files.
+    read_only_all: Option<bool>,
+    /// Whether a read-only file needs confirming. Only a permanent delete asks.
+    ask_read_only: bool,
     pub(crate) skipped: u64,
     pub(crate) done: u64,
     follow: bool,
+    /// Folders being copied when following links, to catch a link back to one.
+    follow_stack: Vec<(u64, u64)>,
     durable: bool,
 }
 
@@ -100,9 +129,13 @@ impl<'a, U: OpUi> Ctx<'a, U> {
             overwrite_all: None,
             skip_errors: false,
             delete_all: false,
+            folders_all: None,
+            read_only_all: None,
+            ask_read_only: false,
             skipped: 0,
             done: 0,
             follow,
+            follow_stack: Vec::new(),
             durable: false,
         }
     }
@@ -403,6 +436,28 @@ fn copy_dir<U: OpUi>(
         })?;
         return Ok(());
     }
+    let id = (meta.dev(), meta.ino());
+    if ctx.follow && ctx.follow_stack.contains(&id) {
+        ctx.attempt::<()>(src, || {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this link leads back to a folder being copied",
+            ))
+        })?;
+        return Ok(());
+    }
+    ctx.follow_stack.push(id);
+    let result = copy_dir_contents(ctx, src, dst, meta);
+    ctx.follow_stack.pop();
+    result
+}
+
+fn copy_dir_contents<U: OpUi>(
+    ctx: &mut Ctx<U>,
+    src: &Path,
+    dst: &Path,
+    meta: &Metadata,
+) -> Result<(), Cancelled> {
     let existing = fs::symlink_metadata(dst).ok();
     if let Some(existing) = &existing {
         let _ = existing;
@@ -779,11 +834,33 @@ fn move_across<U: OpUi>(
 /// Deletes sources: into the trash, or permanently.
 pub fn delete_items<U: OpUi>(sources: &[PathBuf], permanent: bool, ui: &mut U) -> OpSummary {
     let mut ctx = Ctx::new(ui, false);
+    ctx.ask_read_only = permanent;
+    delete_with(ctx, sources, permanent)
+}
+
+/// Removes what has been moved elsewhere, such as into an archive. This is not
+/// a delete the user asked for, so it does not ask about each item.
+pub fn remove_moved<U: OpUi>(sources: &[PathBuf], ui: &mut U) -> OpSummary {
+    let mut ctx = Ctx::new(ui, false);
+    ctx.folders_all = Some(true);
+    delete_with(ctx, sources, true)
+}
+
+fn delete_with<U: OpUi>(mut ctx: Ctx<U>, sources: &[PathBuf], permanent: bool) -> OpSummary {
     prepare(&mut ctx, sources);
     let mut run = || -> Result<(), Cancelled> {
         for src in sources {
+            ctx.check()?;
             ctx.progress.from = src.clone();
             ctx.report();
+            if is_nonempty_folder(src) {
+                let ask = DeleteAsk::NonEmptyFolder {
+                    to_trash: !permanent,
+                };
+                if !confirm(&mut ctx, src, ask)? {
+                    continue;
+                }
+            }
             if permanent {
                 remove_tree(&mut ctx, src)?;
             } else {
@@ -794,6 +871,43 @@ pub fn delete_items<U: OpUi>(sources: &[PathBuf], permanent: bool, ui: &mut U) -
     };
     let result = run();
     ctx.finish(result)
+}
+
+/// A symbolic link to a folder is not a folder here: deleting it removes only
+/// the link.
+fn is_nonempty_folder(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+        && fs::read_dir(path).is_ok_and(|mut items| items.next().is_some())
+}
+
+/// Asks about one item, unless "All" or "Skip all" already answered. Returns
+/// whether to delete it, and counts it as skipped if not.
+fn confirm<U: OpUi>(ctx: &mut Ctx<U>, path: &Path, ask: DeleteAsk) -> Result<bool, Cancelled> {
+    let remembered = match ask {
+        DeleteAsk::NonEmptyFolder { .. } => ctx.folders_all,
+        DeleteAsk::ReadOnly => ctx.read_only_all,
+    };
+    let delete = match remembered {
+        Some(answer) => answer,
+        None => {
+            let choice = ctx.ui.confirm_delete(path, ask);
+            if choice == DeleteChoice::Cancel {
+                return Err(Cancelled);
+            }
+            let answer = matches!(choice, DeleteChoice::Delete | DeleteChoice::All);
+            if matches!(choice, DeleteChoice::All | DeleteChoice::SkipAll) {
+                match ask {
+                    DeleteAsk::NonEmptyFolder { .. } => ctx.folders_all = Some(answer),
+                    DeleteAsk::ReadOnly => ctx.read_only_all = Some(answer),
+                }
+            }
+            answer
+        }
+    };
+    if !delete {
+        ctx.skipped += 1;
+    }
+    Ok(delete)
 }
 
 fn trash_one<U: OpUi>(ctx: &mut Ctx<U>, src: &Path) -> Result<(), Cancelled> {
@@ -907,12 +1021,20 @@ fn remove_tree<U: OpUi>(ctx: &mut Ctx<U>, path: &Path) -> Result<(), Cancelled> 
         let Some(names) = ctx.attempt(path, || read_names(path))? else {
             return Ok(());
         };
+        let skipped_before = ctx.skipped;
         for name in names {
             remove_tree(ctx, &path.join(name))?;
         }
-        if ctx.attempt(path, || fs::remove_dir(path))?.is_some() {
+        // A folder that kept something cannot be removed, and that is no error.
+        if ctx.skipped == skipped_before && ctx.attempt(path, || fs::remove_dir(path))?.is_some() {
             ctx.done += 1;
         }
+    } else if ctx.ask_read_only
+        && !meta.file_type().is_symlink()
+        && meta.mode() & 0o200 == 0
+        && !confirm(ctx, path, DeleteAsk::ReadOnly)?
+    {
+        // Counted as skipped by `confirm`.
     } else if ctx.attempt(path, || fs::remove_file(path))?.is_some() {
         ctx.done += 1;
         ctx.progress.bytes_done += meta.len();
@@ -1203,6 +1325,10 @@ mod tests {
         prompts: u32,
         cancel_after_progress: Option<u32>,
         reports: std::cell::Cell<u32>,
+        confirms: Vec<(PathBuf, DeleteAsk)>,
+        delete: Option<DeleteChoice>,
+        /// After this many questions, answer with this instead.
+        delete_after: Option<(usize, DeleteChoice)>,
     }
 
     impl Default for Script {
@@ -1215,6 +1341,9 @@ mod tests {
                 prompts: 0,
                 cancel_after_progress: None,
                 reports: std::cell::Cell::new(0),
+                confirms: Vec::new(),
+                delete: None,
+                delete_after: None,
             }
         }
     }
@@ -1237,6 +1366,13 @@ mod tests {
         }
         fn trash_fallback(&mut self, _: &Path) -> TrashChoice {
             self.trash
+        }
+        fn confirm_delete(&mut self, path: &Path, ask: DeleteAsk) -> DeleteChoice {
+            self.confirms.push((path.to_path_buf(), ask));
+            match self.delete_after {
+                Some((n, choice)) if self.confirms.len() > n => choice,
+                _ => self.delete.unwrap_or(DeleteChoice::Delete),
+            }
         }
     }
 
@@ -1309,6 +1445,42 @@ mod tests {
         let meta = fs::symlink_metadata(d.p("copy")).unwrap();
         assert!(meta.is_file());
         assert_eq!(fs::read_to_string(d.p("copy")).unwrap(), "data");
+    }
+
+    #[test]
+    fn following_a_link_back_to_its_own_folder_stops() {
+        let d = TestDir::new("follow_cycle");
+        fs::create_dir(d.p("top")).unwrap();
+        d.write("top/file", "data");
+        symlink(d.p("top"), d.p("top/back")).unwrap();
+        let mut ui = Script::default();
+        let options = CopyOptions {
+            follow_symlinks: true,
+        };
+        let target = d.p("copy").display().to_string();
+        let s = copy_items(&[d.p("top")], &target, &base(), &options, &mut ui);
+        assert_eq!(ui.errors.len(), 1, "{:?}", ui.errors);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(fs::read_to_string(d.p("copy/file")).unwrap(), "data");
+        assert!(!d.p("copy/back").exists());
+    }
+
+    #[test]
+    fn following_the_same_folder_by_two_links_is_not_a_cycle() {
+        let d = TestDir::new("follow_diamond");
+        fs::create_dir(d.p("shared")).unwrap();
+        d.write("shared/file", "data");
+        fs::create_dir(d.p("top")).unwrap();
+        symlink(d.p("shared"), d.p("top/one")).unwrap();
+        symlink(d.p("shared"), d.p("top/two")).unwrap();
+        let mut ui = Script::default();
+        let options = CopyOptions {
+            follow_symlinks: true,
+        };
+        let target = d.p("copy").display().to_string();
+        copy_items(&[d.p("top")], &target, &base(), &options, &mut ui);
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert!(d.p("copy/one/file").exists() && d.p("copy/two/file").exists());
     }
 
     #[test]
@@ -1422,6 +1594,9 @@ mod tests {
     fn retry_runs_the_failed_copy_again() {
         struct FixThenRetry(PathBuf, u32);
         impl OpUi for FixThenRetry {
+            fn confirm_delete(&mut self, _: &Path, _: DeleteAsk) -> DeleteChoice {
+                DeleteChoice::Delete
+            }
             fn cancelled(&self) -> bool {
                 false
             }
@@ -1568,6 +1743,186 @@ mod tests {
         let _ = move_across(&mut ctx, &d.p("a"), &d.p("c"), &meta);
         assert!(!d.p("a").exists());
         assert_eq!(fs::read_to_string(d.p("c/x")).unwrap(), "data");
+    }
+
+    fn folder_with_file(d: &TestDir, name: &str) -> PathBuf {
+        fs::create_dir(d.p(name)).unwrap();
+        d.write(&format!("{name}/inner"), "x");
+        d.p(name)
+    }
+
+    fn read_only_file(d: &TestDir, name: &str) -> PathBuf {
+        let path = d.write(name, "x");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
+        path
+    }
+
+    #[test]
+    fn cancel_stops_a_trash_delete_too() {
+        let d = TestDir::new("del_trash_cancel");
+        let items = [d.write("a", "x"), d.write("b", "x")];
+        let mut ui = Script {
+            cancel_after_progress: Some(0),
+            ..Default::default()
+        };
+        let s = delete_items(&items, false, &mut ui);
+        assert!(s.cancelled);
+        assert!(items[0].exists() && items[1].exists());
+    }
+
+    #[test]
+    fn removing_moved_items_does_not_ask() {
+        let d = TestDir::new("del_moved");
+        let items = [folder_with_file(&d, "dir"), read_only_file(&d, "locked")];
+        let mut ui = Script {
+            delete: Some(DeleteChoice::Cancel),
+            ..Default::default()
+        };
+        let s = remove_moved(&items, &mut ui);
+        assert!(ui.confirms.is_empty());
+        assert_eq!(s.skipped, 0);
+        assert!(!items[0].exists() && !items[1].exists());
+    }
+
+    #[test]
+    fn non_empty_folder_asks_and_all_stops_asking() {
+        let d = TestDir::new("del_folder_all");
+        let items = [folder_with_file(&d, "a"), folder_with_file(&d, "b")];
+        let mut ui = Script {
+            delete: Some(DeleteChoice::All),
+            ..Default::default()
+        };
+        let s = delete_items(&items, true, &mut ui);
+        assert_eq!(ui.confirms.len(), 1);
+        assert_eq!(
+            ui.confirms[0].1,
+            DeleteAsk::NonEmptyFolder { to_trash: false }
+        );
+        assert_eq!(s.skipped, 0);
+        assert!(!items[0].exists() && !items[1].exists());
+    }
+
+    #[test]
+    fn empty_folder_and_file_are_not_asked_about() {
+        let d = TestDir::new("del_no_ask");
+        fs::create_dir(d.p("empty")).unwrap();
+        let items = [d.p("empty"), d.write("file", "x")];
+        let mut ui = Script::default();
+        delete_items(&items, true, &mut ui);
+        assert!(ui.confirms.is_empty());
+        assert!(!items[0].exists() && !items[1].exists());
+    }
+
+    #[test]
+    fn link_to_a_full_folder_is_not_asked_about_and_target_survives() {
+        let d = TestDir::new("del_link_ask");
+        let target = folder_with_file(&d, "target");
+        std::os::unix::fs::symlink(&target, d.p("link")).unwrap();
+        let mut ui = Script::default();
+        delete_items(&[d.p("link")], true, &mut ui);
+        assert!(ui.confirms.is_empty());
+        assert!(fs::symlink_metadata(d.p("link")).is_err());
+        assert!(target.join("inner").exists());
+    }
+
+    #[test]
+    fn skipped_folder_is_kept_and_the_rest_still_go() {
+        let d = TestDir::new("del_folder_skip");
+        let folder = folder_with_file(&d, "keep");
+        let file = d.write("gone", "x");
+        let mut ui = Script {
+            delete: Some(DeleteChoice::Skip),
+            ..Default::default()
+        };
+        let s = delete_items(&[folder.clone(), file.clone()], true, &mut ui);
+        assert_eq!(s.skipped, 1);
+        assert!(folder.join("inner").exists());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn skip_all_stops_asking_and_keeps_every_folder() {
+        let d = TestDir::new("del_folder_skipall");
+        let items = [folder_with_file(&d, "a"), folder_with_file(&d, "b")];
+        let mut ui = Script {
+            delete: Some(DeleteChoice::SkipAll),
+            ..Default::default()
+        };
+        let s = delete_items(&items, true, &mut ui);
+        assert_eq!((ui.confirms.len(), s.skipped), (1, 2));
+        assert!(items[0].exists() && items[1].exists());
+    }
+
+    #[test]
+    fn cancel_at_the_folder_prompt_deletes_nothing_more() {
+        let d = TestDir::new("del_folder_cancel");
+        let items = [folder_with_file(&d, "a"), d.write("later", "x")];
+        let mut ui = Script {
+            delete: Some(DeleteChoice::Cancel),
+            ..Default::default()
+        };
+        let s = delete_items(&items, true, &mut ui);
+        assert!(s.cancelled);
+        assert!(items[0].join("inner").exists() && items[1].exists());
+    }
+
+    #[test]
+    fn trash_of_non_empty_folder_asks_too() {
+        let d = TestDir::new("del_folder_trash");
+        let folder = folder_with_file(&d, "a");
+        let mut ui = Script {
+            delete: Some(DeleteChoice::Skip),
+            ..Default::default()
+        };
+        delete_items(std::slice::from_ref(&folder), false, &mut ui);
+        assert_eq!(
+            ui.confirms[0].1,
+            DeleteAsk::NonEmptyFolder { to_trash: true }
+        );
+        assert!(folder.join("inner").exists());
+    }
+
+    #[test]
+    fn read_only_file_asks_and_skip_keeps_its_folder_without_an_error() {
+        let d = TestDir::new("del_ro_skip");
+        let folder = folder_with_file(&d, "dir");
+        let locked = read_only_file(&d, "dir/locked");
+        // The folder prompt takes the first answer, the read-only one the next.
+        let mut ui = Script {
+            delete_after: Some((1, DeleteChoice::Skip)),
+            ..Default::default()
+        };
+        let s = delete_items(std::slice::from_ref(&folder), true, &mut ui);
+        assert_eq!(ui.confirms.len(), 2);
+        assert_eq!(ui.confirms[1], (locked.clone(), DeleteAsk::ReadOnly));
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert_eq!(s.skipped, 1);
+        assert!(locked.exists());
+        assert!(!folder.join("inner").exists());
+    }
+
+    #[test]
+    fn read_only_all_answers_only_read_only_files() {
+        let d = TestDir::new("del_ro_all");
+        let items = [read_only_file(&d, "a"), read_only_file(&d, "b")];
+        let mut ui = Script {
+            delete: Some(DeleteChoice::All),
+            ..Default::default()
+        };
+        delete_items(&items, true, &mut ui);
+        assert_eq!(ui.confirms.len(), 1);
+        assert!(!items[0].exists() && !items[1].exists());
+    }
+
+    #[test]
+    fn link_to_read_only_file_is_not_asked_about() {
+        let d = TestDir::new("del_ro_link");
+        let target = read_only_file(&d, "target");
+        std::os::unix::fs::symlink(&target, d.p("link")).unwrap();
+        let mut ui = Script::default();
+        delete_items(&[d.p("link")], true, &mut ui);
+        assert!(ui.confirms.is_empty());
+        assert!(target.exists());
     }
 
     #[test]

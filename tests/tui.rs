@@ -24,6 +24,11 @@ fn tmux_available() -> bool {
 impl Session {
     /// Starts far in a private tmux server with panels on `left` and `right`.
     fn start(setup: impl FnOnce(&Path)) -> Option<Session> {
+        Self::start_with("", setup)
+    }
+
+    /// Starts far with extra `env` arguments, such as `NAME=value`.
+    fn start_with(extra_env: &str, setup: impl FnOnce(&Path)) -> Option<Session> {
         if !tmux_available() {
             eprintln!("tmux not found: skipping");
             return None;
@@ -38,7 +43,7 @@ impl Session {
         setup(&root);
         let session = Session { socket, root };
         let launch = format!(
-            "env HOME={home} XDG_DATA_HOME={home}/data PS1= {bin} {left} {right}; sleep 30",
+            "env HOME={home} XDG_DATA_HOME={home}/data XDG_CONFIG_HOME={home}/config PS1= {extra_env} {bin} {left} {right}; sleep 30",
             home = session.root.join("home").display(),
             bin = env!("CARGO_BIN_EXE_far"),
             left = session.root.join("left").display(),
@@ -840,4 +845,432 @@ fn terminal_is_restored_on_exit() {
             .trim(),
         "1"
     );
+}
+
+/// Sends a Windows Terminal input mode event for a key going down.
+fn win32_key(vk: u32, unit: u32, state: u32) -> String {
+    format!("\x1b[{vk};0;{unit};1;{state};1_")
+}
+
+const WIN32: &str = "FAR_WIN32_INPUT=1";
+const SHIFT: u32 = 0x10;
+const LEFT_CTRL: u32 = 0x08;
+const LEFT_ALT: u32 = 0x02;
+
+#[test]
+fn key_bar_follows_held_modifiers_in_windows_terminal_mode() {
+    let Some(s) = Session::start_with(WIN32, with_file) else {
+        return;
+    };
+    s.wait("5Copy");
+    assert!(s.screen().contains("6RenMov"), "{}", s.screen());
+    s.text(&win32_key(0x10, 0, SHIFT));
+    s.wait("6Rename");
+    s.wait("1Add");
+    s.text(&format!(
+        "\x1b[16;0;0;0;0;1_{}",
+        win32_key(0x11, 0, LEFT_CTRL)
+    ));
+    s.wait("3Name");
+    s.text(&format!(
+        "\x1b[17;0;0;0;0;1_{}",
+        win32_key(0x12, 0, LEFT_ALT)
+    ));
+    s.wait("7Find");
+    // Losing focus can swallow the release of a modifier.
+    s.text("\x1b[O");
+    s.wait("6RenMov");
+}
+
+#[test]
+fn keys_work_in_windows_terminal_mode() {
+    let Some(s) = Session::start_with(WIN32, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text(&win32_key(0x76, 0, 0));
+    s.wait("Create the folder");
+    s.text(&win32_key(0x1B, 27, 0));
+    s.wait_gone("Create the folder");
+    // Typed text reaches the command line, with its repeat count.
+    s.text("\x1b[65;0;97;1;0;2_");
+    s.wait("aa");
+    s.text(&win32_key(0x08, 8, 0));
+    s.text(&win32_key(0x08, 8, 0));
+    // Ctrl+O goes through the Ctrl key, not the control code alone.
+    s.text(&win32_key(0x4F, 15, LEFT_CTRL));
+    s.wait_gone("5Copy");
+    // The console is back to ordinary keys, as the mode is off there.
+    s.keys(&["C-o"]);
+    s.wait("5Copy");
+}
+
+#[test]
+fn selected_names_and_headers_use_colours_a_scheme_cannot_change() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    let color = |wanted: &str| {
+        s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+            .contains(wanted)
+    };
+    // Far's bright yellow: the column titles straight away.
+    assert!(color("38;5;226"), "no fixed yellow");
+    s.keys(&["Down", "IC"]);
+    s.wait("in 1 items");
+    assert!(color("38;5;226"));
+}
+
+#[test]
+fn f3_on_up_counts_the_current_folder_into_the_size_column() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/data.bin"), vec![0u8; 12345]).unwrap();
+        fs::create_dir(root.join("left/sub")).unwrap();
+        fs::write(root.join("left/sub/more.bin"), vec![0u8; 10000]).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("data.bin");
+    // The cursor starts on `..`, and the footer shows it.
+    s.keys(&["F3"]);
+    s.wait("22 345 bytes");
+    assert!(!s.screen().contains("Folder size"), "{}", s.screen());
+}
+
+#[test]
+fn f3_on_a_folder_counts_it_and_leaves_the_panel_usable() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/sub")).unwrap();
+        fs::write(root.join("left/sub/more.bin"), vec![0u8; 4321]).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("sub");
+    s.keys(&["Down", "F3"]);
+    s.wait("4 321 bytes");
+    s.keys(&["Enter"]);
+    s.wait("more.bin");
+}
+
+#[test]
+fn delete_of_full_folder_asks_with_all_and_skip_buttons() {
+    let Some(s) = Session::start(|root| {
+        for name in ["one", "two"] {
+            fs::create_dir(root.join("left").join(name)).unwrap();
+            fs::write(root.join("left").join(name).join("inner"), "x").unwrap();
+        }
+    }) else {
+        return;
+    };
+    s.wait("two");
+    s.keys(&["Down", "IC", "IC"]);
+    s.wait("in 2 items");
+    // Shift+Del: no trash is involved, so the test leaves nothing behind.
+    s.keys(&["S-DC"]);
+    s.wait("Permanently delete");
+    s.keys(&["Enter"]);
+    s.wait("The following folder will be deleted:");
+    assert!(s.screen().contains("[ All ]"), "{}", s.screen());
+    assert!(s.screen().contains("[ Skip all ]"), "{}", s.screen());
+    s.keys(&["Right", "Enter"]);
+    s.wait_file(&s.p("left/one"), false);
+    s.wait_file(&s.p("left/two"), false);
+    s.wait_gone("will be deleted");
+}
+
+#[test]
+fn tab_completes_on_the_console_and_changes_panel_otherwise() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/unique_name.txt"), "x").unwrap();
+        fs::write(root.join("left/two_a"), "x").unwrap();
+        fs::write(root.join("left/two_b"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("unique_name");
+    s.keys(&["C-o"]);
+    s.wait_gone("5Copy");
+    s.text("cat uni");
+    s.wait("cat uni");
+    s.keys(&["Tab"]);
+    s.wait("cat unique_name.txt");
+    s.keys(&["C-u"]);
+    s.keys(&["Escape"]);
+    s.wait_gone("cat unique");
+    s.text("ls two");
+    s.keys(&["Tab"]);
+    s.wait("ls two_");
+    // No further progress is possible, so the choices are listed.
+    s.keys(&["Tab"]);
+    s.wait("two_a");
+    s.wait("two_b");
+    s.keys(&["Escape", "C-o"]);
+    s.wait("5Copy");
+    // With panels on screen Tab still changes panel, as in Far: the cursor can
+    // now reach the right panel, so `F7` creates its folder there.
+    s.keys(&["Tab", "F7"]);
+    s.wait("Create the folder");
+    s.text("made_right");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/made_right"), true);
+}
+
+#[test]
+fn being_told_to_end_gives_the_terminal_back() {
+    let Some(s) = Session::start_with(WIN32, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    assert_eq!(
+        s.tmux(&["display", "-p", "-t", "t", "#{alternate_on}"])
+            .trim(),
+        "1"
+    );
+    let shell = s.tmux(&["display", "-p", "-t", "t", "#{pane_pid}"]);
+    let far = Command::new("pgrep")
+        .args(["-P", shell.trim(), "far"])
+        .output()
+        .expect("pgrep runs");
+    let far = String::from_utf8_lossy(&far.stdout);
+    Command::new("kill")
+        .args(["-TERM", far.trim()])
+        .status()
+        .expect("kill runs");
+    let start = Instant::now();
+    while s
+        .tmux(&["display", "-p", "-t", "t", "#{alternate_on}"])
+        .trim()
+        != "0"
+    {
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "still on the alternate screen"
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+
+#[test]
+fn exit_command_ends_far_from_panels_and_console() {
+    for console in [false, true] {
+        let Some(s) = Session::start(with_file) else {
+            return;
+        };
+        s.wait("alpha.txt");
+        if console {
+            s.keys(&["C-o"]);
+            s.wait_gone("5Copy");
+        }
+        s.text("exit");
+        s.wait("exit");
+        s.keys(&["Enter"]);
+        let start = Instant::now();
+        while s
+            .tmux(&["display", "-p", "-t", "t", "#{alternate_on}"])
+            .trim()
+            != "0"
+            || s.screen().contains("5Copy")
+        {
+            assert!(start.elapsed() < Duration::from_secs(8), "{}", s.screen());
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        // The harness keeps the pane alive with `sleep`: far itself must be gone.
+        let shell = s.tmux(&["display", "-p", "-t", "t", "#{pane_pid}"]);
+        let far = Command::new("pgrep")
+            .args(["-P", shell.trim(), "far"])
+            .output()
+            .expect("pgrep runs");
+        assert!(far.stdout.is_empty(), "far is still running");
+    }
+}
+
+#[test]
+fn shift_f6_and_shift_f5_on_a_file_named_tilde_stay_in_the_folder() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/~"), "tilde").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("~");
+    s.keys(&["Down", "S-F6"]);
+    s.wait("Rename or move");
+    s.keys(&["Enter"]);
+    s.wait_gone("Rename or move");
+    s.keys(&["S-F5"]);
+    s.wait(" to:");
+    s.keys(&["Enter"]);
+    std::thread::sleep(Duration::from_millis(300));
+    s.keys(&["Escape", "Escape"]);
+    assert_eq!(fs::read_to_string(s.p("left/~")).unwrap(), "tilde");
+    assert!(!s.p("home/~").exists(), "ended up inside the home folder");
+    let home: Vec<_> = fs::read_dir(s.p("home"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| n != "data")
+        .collect();
+    assert!(home.is_empty(), "{home:?}");
+}
+
+#[test]
+fn ctrl_c_clears_the_command_line_on_panels_and_console() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text("typed_on_panels");
+    s.wait("typed_on_panels");
+    s.keys(&["C-c"]);
+    s.wait_gone("typed_on_panels");
+    // Still running, with the panels working.
+    s.wait("5Copy");
+    s.keys(&["C-o"]);
+    s.wait_gone("5Copy");
+    s.text("typed_on_console");
+    s.wait("typed_on_console");
+    s.keys(&["C-c"]);
+    s.wait("^C");
+    s.keys(&["C-o"]);
+    s.wait("5Copy");
+}
+
+fn has_color(s: &Session, color: &str, name: &str) -> bool {
+    s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+        .contains(&format!("38;5;{color}m{name}"))
+}
+
+#[test]
+fn highlighting_comes_from_the_settings_file() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", |root| {
+        fs::write(root.join("left/a.foo"), "").unwrap();
+        fs::create_dir_all(root.join("home/config/far_linux")).unwrap();
+        fs::write(
+            root.join("home/config/far_linux/highlight.ini"),
+            "[group]\nmask = *.foo\nnormal = 123\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("a.foo");
+    assert!(has_color(&s, "123", "a.foo"), "{}", s.screen());
+}
+
+#[test]
+fn a_broken_settings_file_is_reported_and_far_still_starts() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/a.zip"), "").unwrap();
+        fs::create_dir_all(root.join("home/config/far_linux")).unwrap();
+        fs::write(
+            root.join("home/config/far_linux/highlight.ini"),
+            "nonsense\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("line 1: expected key = value");
+    s.keys(&["Enter"]);
+    s.wait("a.zip");
+    s.wait("5Copy");
+}
+
+#[test]
+fn the_menu_opens_the_settings_as_the_defaults_and_applies_them_on_close() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", |root| {
+        fs::write(root.join("left/a.zip"), "").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("a.zip");
+    let file = s.p("home/config/far_linux/highlight.ini");
+    assert!(!file.exists());
+    s.keys(&["F9"]);
+    s.wait("Left");
+    s.keys(&["Right", "Right"]);
+    s.wait("Files highlighting");
+    for _ in 0..30 {
+        if s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+            .contains("48;5;30m Files highlighting")
+        {
+            break;
+        }
+        s.keys(&["Down"]);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    s.keys(&["Enter"]);
+    s.wait("File highlighting for far");
+    assert!(fs::read_to_string(&file).unwrap().contains("<arc>"));
+    // Change the file as if edited, then leave: the panels must follow it.
+    fs::write(&file, "[group]\nmask = *.zip\nnormal = 123\n").unwrap();
+    s.keys(&["F10"]);
+    s.wait("a.zip");
+    s.wait_for("new colour", |_| has_color(&s, "123", "a.zip"));
+}
+
+#[test]
+fn ctrl_letters_do_not_answer_a_delete_prompt() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/full")).unwrap();
+        fs::write(root.join("left/full/inner"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("full");
+    s.keys(&["Down", "S-DC"]);
+    s.wait("Permanently delete");
+    s.keys(&["Enter"]);
+    s.wait("The following folder will be deleted:");
+    s.keys(&["C-a", "C-d"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(s.p("left/full/inner").exists());
+    assert!(s.screen().contains("will be deleted"), "{}", s.screen());
+    s.keys(&["Escape"]);
+    s.wait_gone("will be deleted");
+    assert!(s.p("left/full/inner").exists());
+}
+
+#[test]
+fn resizing_at_a_prompt_during_an_operation_leaves_a_clean_screen() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/full")).unwrap();
+        fs::write(root.join("left/full/inner"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("full");
+    s.keys(&["Down", "S-DC"]);
+    s.wait("Permanently delete");
+    s.keys(&["Enter"]);
+    s.wait("will be deleted");
+    s.tmux(&["resize-window", "-t", "t", "-x", "70", "-y", "30"]);
+    std::thread::sleep(Duration::from_millis(200));
+    s.keys(&["Escape"]);
+    s.wait_gone("will be deleted");
+    s.wait("5Copy");
+    let screen = s.screen();
+    let top = screen.lines().next().unwrap_or("");
+    assert!(
+        top.chars().count() <= 70 && top.starts_with('╔'),
+        "{screen}"
+    );
+    assert!(
+        screen.lines().any(|l| l.trim_end().ends_with('╝')),
+        "{screen}"
+    );
+}
+
+#[test]
+fn keys_typed_on_the_console_do_not_wait_for_a_later_visit() {
+    let Some(s) = Session::start_with(WIN32, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text(&win32_key(0x4F, 15, LEFT_CTRL));
+    s.wait_gone("5Copy");
+    // One write holding Ctrl+O and more: crossterm reads it all at once.
+    s.text("\x0ftouch typed_ahead\r");
+    s.wait_file(&s.p("left/typed_ahead"), true);
+    s.wait("5Copy");
 }

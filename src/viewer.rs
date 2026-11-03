@@ -7,7 +7,8 @@ use crate::encoding;
 use crate::fsops::find_bytes;
 use crate::history::{History, Kind};
 use crate::screen::{
-    char_width, fit, fit_left, theme, Input, Screen, Tui, ALT, CTRL, CTRL_SHIFT, NONE, SHIFT,
+    char_width, fit, fit_left, theme, Input, KeyBars, Screen, Tui, ALT, CTRL, CTRL_SHIFT, NONE,
+    SHIFT,
 };
 use crate::search::{parse_hex, Matcher, SearchOptions};
 use crate::util;
@@ -601,20 +602,27 @@ impl Viewer {
         if keybar {
             s.keybar(
                 s.h.saturating_sub(1),
-                &[
-                    "Help",
-                    if self.wrap { "Unwrap" } else { "Wrap" },
-                    "Quit",
-                    if self.hex { "Text" } else { "Hex" },
-                    "",
-                    "Edit",
-                    "Search",
-                    "Encod",
-                    "",
-                    "Quit",
-                    "",
-                    "",
-                ],
+                &KeyBars {
+                    plain: [
+                        "Help",
+                        if self.wrap { "Unwrap" } else { "Wrap" },
+                        "Quit",
+                        if self.hex { "Text" } else { "Hex" },
+                        "",
+                        "Edit",
+                        "Search",
+                        "Encod",
+                        "",
+                        "Quit",
+                        "",
+                        "",
+                    ],
+                    shift: [
+                        "", "WWrap", "", "Mode", "", "", "Next", "CodePg", "", "", "", "",
+                    ],
+                    alt: ["", "", "", "", "", "", "Prev", "Goto", "", "", "ViewHs", ""],
+                    ctrl: ["", "", "", "", "", "", "", "", "", "GoFile", "", ""],
+                },
             );
         }
     }
@@ -811,6 +819,7 @@ pub fn run(
     let mut status: Option<String> = None;
     let ctrl_alt = CTRL | ALT;
     loop {
+        tui.sync_held();
         v.draw(&mut tui.screen, *keybar);
         tui.screen.cursor = None;
         if let Some(text) = &status {

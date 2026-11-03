@@ -1,6 +1,7 @@
 //! A file panel: directory contents, sorting, selection and drawing.
 
 use crate::archive::{self, ArcEntry, Format};
+use crate::highlight::{Facts, Highlight};
 use crate::screen::{fit, fit_left, fit_name, str_width, theme, Screen, Style};
 use crate::util;
 use std::ffi::OsString;
@@ -8,6 +9,7 @@ use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// One line of a panel.
 #[derive(Clone, Debug)]
@@ -26,6 +28,9 @@ pub struct Entry {
     pub gid: u32,
     pub exec: bool,
     pub selected: bool,
+    /// Bytes under this folder, once counted with F3. A reload forgets it, so
+    /// that it never shows a stale number.
+    pub scanned: Option<u64>,
 }
 
 /// Panel sort orders, on Ctrl+F3 to Ctrl+F11 as in Far.
@@ -80,6 +85,7 @@ fn up_entry() -> Entry {
         gid: 0,
         exec: false,
         selected: false,
+        scanned: None,
     }
 }
 
@@ -101,6 +107,8 @@ pub struct Panel {
     /// Rows and columns from the last draw, used for page movement.
     pub rows: usize,
     pub columns: usize,
+    /// The groups that colour names.
+    pub highlight: Rc<Highlight>,
 }
 
 fn entry_from(path: &Path, raw: OsString) -> Option<Entry> {
@@ -128,6 +136,7 @@ fn entry_from(path: &Path, raw: OsString) -> Option<Entry> {
         gid: meta.gid(),
         exec: !shown.is_dir() && shown.is_file() && shown.mode() & 0o111 != 0,
         selected: false,
+        scanned: None,
     })
 }
 
@@ -170,6 +179,7 @@ impl Panel {
             dir_mtime: 0,
             rows: 20,
             columns: 2,
+            highlight: Rc::new(Highlight::default()),
         };
         panel.reload();
         panel
@@ -242,6 +252,7 @@ impl Panel {
                 gid: 0,
                 exec: false,
                 selected: false,
+                scanned: None,
             });
         }
         self.apply_sort();
@@ -563,27 +574,30 @@ impl Panel {
         })
     }
 
-    fn name_style(entry: &Entry, on_cursor: bool) -> Style {
-        match (on_cursor, entry.selected) {
-            (true, true) => theme::PANEL_CURSOR_SELECTED,
-            (true, false) => theme::PANEL_CURSOR,
-            (false, true) => theme::PANEL_SELECTED,
-            (false, false) => {
-                if entry.is_dir {
-                    theme::PANEL_DIR
-                } else if entry.is_link {
-                    theme::PANEL_LINK
-                } else if entry.exec {
-                    theme::PANEL_EXEC
-                } else {
-                    theme::PANEL
-                }
-            }
-        }
+    /// The colour of a name, from the highlighting groups. Without a group, a
+    /// name uses the panel's own colours.
+    fn name_style(&self, entry: &Entry, on_cursor: bool) -> Style {
+        let colors = self.highlight.colors(&Facts {
+            name: &entry.name,
+            is_dir: entry.is_dir,
+            is_link: entry.is_link,
+            hidden: !entry.is_up && entry.name.starts_with('.'),
+            exec: entry.exec,
+            read_only: entry.mode & 0o200 == 0,
+        });
+        let (color, base) = match (entry.selected, on_cursor) {
+            (true, true) => (colors.selected_cursor, theme::PANEL_CURSOR_SELECTED),
+            (true, false) => (colors.selected, theme::PANEL_SELECTED),
+            (false, true) => (colors.cursor, theme::PANEL_CURSOR),
+            (false, false) => (colors.normal, theme::PANEL),
+        };
+        Style::new(color.unwrap_or(base.fg), base.bg)
     }
 
     fn size_text(entry: &Entry, width: usize) -> String {
-        let text = if entry.is_up {
+        let text = if let Some(bytes) = entry.scanned {
+            util::fit_size(bytes, width)
+        } else if entry.is_up {
             "Up".to_string()
         } else if entry.is_dir {
             if entry.is_link { "SymLink" } else { "Folder" }.to_string()
@@ -693,7 +707,7 @@ impl Panel {
             let row = i % self.rows;
             let (start, width) = edges[column];
             let on_cursor = active && self.top + i == self.cursor;
-            let style = Self::name_style(entry, on_cursor);
+            let style = self.name_style(entry, on_cursor);
             let cx = x + 1 + start as u16;
             let cy = y + 2 + row as u16;
             let name_width = width - extra;
@@ -761,7 +775,9 @@ impl Panel {
         }
 
         if let Some(entry) = self.current().cloned() {
-            let detail = if entry.is_up {
+            let detail = if let Some(bytes) = entry.scanned {
+                format!("{} bytes", util::group_digits(bytes))
+            } else if entry.is_up {
                 String::from("Up")
             } else if entry.is_dir {
                 util::format_date(entry.mtime) + " " + &util::format_time(entry.mtime)
@@ -793,7 +809,10 @@ impl Panel {
         // Selection summary sits on the separator, as in Far.
         let selected: Vec<&Entry> = self.entries.iter().filter(|e| e.selected).collect();
         if !selected.is_empty() {
-            let bytes: u64 = selected.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+            let bytes: u64 = selected
+                .iter()
+                .map(|e| e.scanned.unwrap_or(if e.is_dir { 0 } else { e.size }))
+                .sum();
             let text = format!(
                 " {} bytes in {} items ",
                 util::group_digits(bytes),
@@ -857,6 +876,7 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::style::Color;
 
     fn panel(tag: &str, files: &[&str], dirs: &[&str]) -> (Panel, PathBuf) {
         let root = std::env::temp_dir().join(format!("far_panel_{}_{tag}", std::process::id()));
@@ -873,6 +893,67 @@ mod tests {
 
     fn names(p: &Panel) -> Vec<&str> {
         p.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    fn entry(name: &str) -> Entry {
+        let mut e = up_entry();
+        e.name = name.into();
+        e.raw = name.into();
+        e.is_up = false;
+        e.is_dir = false;
+        e
+    }
+
+    fn bare_panel() -> Panel {
+        Panel::new(std::env::temp_dir().join("far_no_such_folder_for_tests"))
+    }
+
+    #[test]
+    fn names_take_group_colours_on_the_panel_background() {
+        let p = bare_panel();
+        assert_eq!(p.name_style(&entry("plain.qqq"), false), theme::PANEL);
+        assert_eq!(p.name_style(&entry("plain.qqq"), true), theme::PANEL_CURSOR);
+        let zip = p.name_style(&entry("a.zip"), false);
+        assert_eq!((zip.fg, zip.bg), (Color::Magenta, theme::PANEL.bg));
+        assert_eq!(p.name_style(&entry(".bashrc"), false).fg, Color::DarkCyan);
+        assert_eq!(p.name_style(&up_entry(), false).fg, Color::White);
+        let mut dir = entry(".config");
+        dir.is_dir = true;
+        assert_eq!(p.name_style(&dir, false).fg, Color::DarkCyan);
+    }
+
+    #[test]
+    fn selection_and_cursor_colours_override_groups() {
+        let p = bare_panel();
+        let mut tool = entry("tool");
+        tool.exec = true;
+        assert_eq!(
+            p.name_style(&tool, true),
+            Style::new(Color::Green, theme::PANEL_CURSOR.bg)
+        );
+        tool.selected = true;
+        assert_eq!(p.name_style(&tool, false), theme::PANEL_SELECTED);
+        assert_eq!(p.name_style(&tool, true), theme::PANEL_CURSOR_SELECTED);
+    }
+
+    #[test]
+    fn a_group_can_set_the_selected_colour() {
+        let mut p = bare_panel();
+        p.highlight = Rc::new(Highlight::parse(
+            "[group]\nmask = *\nselected = red\nselected_cursor = white\n",
+        ));
+        let mut e = entry("x");
+        e.selected = true;
+        assert_eq!(p.name_style(&e, false).fg, Color::Red);
+        assert_eq!(p.name_style(&e, true).fg, Color::White);
+    }
+
+    #[test]
+    fn counted_folder_size_replaces_the_size_label() {
+        let mut up = up_entry();
+        assert!(Panel::size_text(&up, 10).ends_with("Up"));
+        up.scanned = Some(1234);
+        assert!(Panel::size_text(&up, 10).ends_with("1234"));
     }
 
     #[test]

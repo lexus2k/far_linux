@@ -86,25 +86,38 @@ pub fn message(
             KeyCode::Enter => return Ok(Some(focus)),
             KeyCode::Left => focus = (focus + buttons.len() - 1) % buttons.len(),
             KeyCode::Right | KeyCode::Tab => focus = (focus + 1) % buttons.len(),
-            KeyCode::Char(c) => {
-                let c = c.to_lowercase().next().unwrap_or(c);
-                let hits: Vec<usize> = buttons
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, b)| b.to_lowercase().starts_with(c))
-                    .map(|(i, _)| i)
-                    .collect();
-                if hits.len() == 1 {
-                    return Ok(Some(hits[0]));
+            _ => {
+                if let Some(index) = button_for_key(buttons, key) {
+                    return Ok(Some(index));
                 }
             }
-            _ => {}
         }
     }
 }
 
+/// The button a key chooses by its first letter. Only the plain letter or Alt
+/// with it counts: `Ctrl+A` at a delete prompt must not mean All.
+fn button_for_key(buttons: &[&str], key: Key) -> Option<usize> {
+    let KeyCode::Char(c) = key.code else {
+        return None;
+    };
+    if key.mods != NONE && key.mods != ALT {
+        return None;
+    }
+    let c = c.to_lowercase().next().unwrap_or(c);
+    let mut hits = buttons
+        .iter()
+        .enumerate()
+        .filter(|(_, b)| b.to_lowercase().starts_with(c))
+        .map(|(i, _)| i);
+    match (hits.next(), hits.next()) {
+        (Some(index), None) => Some(index),
+        _ => None,
+    }
+}
+
 /// Reuses the snapshot, or a blank screen if the terminal was resized.
-fn resized(backdrop: &Screen, current: &Screen) -> Screen {
+pub fn resized(backdrop: &Screen, current: &Screen) -> Screen {
     if backdrop.w == current.w && backdrop.h == current.h {
         backdrop.clone()
     } else {
@@ -650,6 +663,23 @@ pub fn prompt(tui: &mut Tui, title: &str, label: &str, value: &str) -> io::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn button_letters_need_no_modifier_or_alt() {
+        let buttons = ["Delete", "All", "Skip", "Skip all", "Cancel"];
+        let key = |c, mods| Key {
+            code: KeyCode::Char(c),
+            mods,
+        };
+        assert_eq!(button_for_key(&buttons, key('a', NONE)), Some(1));
+        assert_eq!(button_for_key(&buttons, key('A', NONE)), Some(1));
+        assert_eq!(button_for_key(&buttons, key('a', ALT)), Some(1));
+        assert_eq!(button_for_key(&buttons, key('a', CTRL)), None);
+        assert_eq!(button_for_key(&buttons, key('d', CTRL)), None);
+        // Two buttons share this letter.
+        assert_eq!(button_for_key(&buttons, key('s', NONE)), None);
+        assert_eq!(button_for_key(&buttons, key('x', NONE)), None);
+    }
 
     #[test]
     fn labels_give_their_hotkey_and_hide_the_marker() {
