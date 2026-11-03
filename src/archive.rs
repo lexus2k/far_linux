@@ -1658,6 +1658,13 @@ mod tests {
     }
 
     impl OpUi for Ui {
+        fn confirm_delete(
+            &mut self,
+            _: &Path,
+            _: crate::fsops::DeleteAsk,
+        ) -> crate::fsops::DeleteChoice {
+            crate::fsops::DeleteChoice::Delete
+        }
         fn cancelled(&self) -> bool {
             self.cancel
         }

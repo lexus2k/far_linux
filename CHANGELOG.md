@@ -4,6 +4,15 @@
 
 ### Added
 
+- The key bar shows Far's Shift, Alt and Ctrl labels while the key is held, in
+  panels, the viewer and the editor. This needs Windows Terminal's input mode.
+- `Tab` completes file and command names on the `Ctrl+O` console.
+- Typing `exit` on the command line or the console ends far.
+- Far's default highlight groups: hidden files, archives and temporary files have
+  their own colours, also under the cursor.
+- Deleting a folder with something in it asks first, with `Delete`, `All`, `Skip`,
+  `Skip all` and `Cancel`, as Far does. A permanent delete asks the same about
+  read-only files.
 - Archives: zip, tar, tar.gz, tar.bz2, tar.xz and 7z. Enter or `Ctrl+PgDn` opens
   one like a folder. `Shift+F1` adds, `Shift+F2` extracts and `Shift+F3` tests.
   Inside an archive, `F3` and `F4` work on a temporary copy, `F5` and `F6`
@@ -35,6 +44,11 @@
 
 ### Changed
 
+- `F3` on a folder shows its size in the panel instead of a dialog, as in Far. On
+  `..` it counts the current folder, and it counts all selected folders.
+- Colours no longer depend on the terminal's scheme where 256 colours exist, so
+  selected names and column titles are really yellow and executables bright green.
+- The progress box of file operations keeps one size.
 - `Shift+F8` deletes the item under the cursor to the trash, as in Far 3. Only
   `Shift+Del` skips the trash.
 - Editor `F4` quits, and `Shift+Enter` inserts the panel's file name. Viewer

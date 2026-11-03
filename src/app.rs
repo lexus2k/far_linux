@@ -4,16 +4,17 @@ use crate::archive::{self, ExtractRequest, Format, ScratchDir, FORMATS};
 use crate::dialog::{self, Field, Form};
 use crate::editor::{self, Clipboard, EditorContext, EditorExit};
 use crate::fsops::{
-    self, AttrChange, CopyOptions, ErrorChoice, OpSummary, OpUi, OverwriteChoice, Progress, Totals,
-    TrashChoice,
+    self, AttrChange, CopyOptions, DeleteAsk, DeleteChoice, ErrorChoice, OpSummary, OpUi,
+    OverwriteChoice, Progress, Totals, TrashChoice,
 };
 use crate::history::{History, Kind};
+use crate::input;
 use crate::lineedit::LineEdit;
 use crate::panel::{Panel, Sort, View};
 use crate::screen::{
-    self, fit, fit_left, str_width, theme, Input, Key, Tui, ALT, CTRL, NONE, SHIFT,
+    self, fit, fit_left, str_width, theme, Input, Key, KeyBars, Tui, ALT, CTRL, NONE, SHIFT,
 };
-use crate::shell::Shell;
+use crate::shell::{self, Shell};
 use crate::util;
 use crate::viewer::{self, ViewerExit};
 use crossterm::{
@@ -224,11 +225,30 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl+Ins, Alt+Ins", "Copy names, copy full paths"),
 ];
 
+/// Far's labels from `FarEng.lng`, for the keys that exist here. Every label
+/// must be a bound key: see `every_key_bar_label_is_a_bound_key`.
+const PANEL_KEYS: KeyBars = KeyBars {
+    plain: [
+        "Help", "", "View", "Edit", "Copy", "RenMov", "MkFold", "Delete", "ConfMn", "Quit", "", "",
+    ],
+    shift: [
+        "Add", "Extrct", "ArcCmd", "Edit…", "Copy", "Rename", "", "Delete", "", "", "", "",
+    ],
+    alt: [
+        "Left", "Right", "", "", "", "MkLink", "Find", "Histry", "", "", "ViewHs", "FoldHs",
+    ],
+    ctrl: [
+        "Left", "Right", "Name", "Extens", "Write", "Size", "Unsort", "Creatn", "Access", "",
+        "Owner", "Sort",
+    ],
+};
+
 enum ToUi {
     Progress(Progress),
     Overwrite(PathBuf, PathBuf),
     Error(PathBuf, String),
     Trash(PathBuf),
+    ConfirmDelete(PathBuf, DeleteAsk),
     Done(OpSummary),
 }
 
@@ -236,6 +256,7 @@ enum Reply {
     Overwrite(OverwriteChoice),
     Error(ErrorChoice),
     Trash(TrashChoice),
+    Delete(DeleteChoice),
 }
 
 /// Connects a worker thread to the dialogs on the UI thread.
@@ -272,6 +293,14 @@ impl OpUi for ChannelUi {
         match self.rx.recv() {
             Ok(Reply::Error(choice)) => choice,
             _ => ErrorChoice::Cancel,
+        }
+    }
+
+    fn confirm_delete(&mut self, path: &Path, ask: DeleteAsk) -> DeleteChoice {
+        let _ = self.tx.send(ToUi::ConfirmDelete(path.to_path_buf(), ask));
+        match self.rx.recv() {
+            Ok(Reply::Delete(choice)) => choice,
+            _ => DeleteChoice::Cancel,
         }
     }
 
@@ -373,6 +402,7 @@ pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
     };
     let (left, right) = (resolve(left), resolve(right));
     screen::install_panic_hook();
+    screen::install_signal_restore();
     let shell = Shell::new()?;
     let tui = Tui::new()?;
     let db = Rc::new(History::open_default());
@@ -423,6 +453,7 @@ pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
 /// combinations a terminal delivers.
 pub fn show_keys() -> io::Result<()> {
     let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+    screen::install_signal_restore();
     terminal::enable_raw_mode()?;
     let mut out = io::stdout();
     if enhanced {
@@ -431,28 +462,49 @@ pub fn show_keys() -> io::Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         )?;
     }
+    let win32 = !enhanced && input::try_enable();
+    if win32 {
+        execute!(out, Print(input::ENABLE))?;
+    }
     let protocol = if enhanced { "yes" } else { "no" };
+    let modifiers = if win32 { "yes" } else { "no" };
     execute!(
         out,
         Print(format!(
-            "Keyboard protocol: {protocol}. Press keys; Ctrl+C quits.\r\n"
+            "Keyboard protocol: {protocol}. Windows Terminal input mode: {modifiers}. Press keys; Ctrl+C quits.\r\n"
         ))
     )?;
+    let mut reader = input::Reader::new();
+    let mut next = || -> io::Result<Option<Input>> {
+        if win32 {
+            return reader.read(Duration::from_millis(500));
+        }
+        Ok(match event::read()? {
+            Event::Key(raw) if raw.kind != KeyEventKind::Release => Some(Input::Key(
+                screen::normalize_key(raw.code, raw.modifiers, enhanced),
+            )),
+            _ => None,
+        })
+    };
     let result = (|| -> io::Result<()> {
         loop {
-            let Event::Key(raw) = event::read()? else {
-                continue;
-            };
-            if raw.kind == KeyEventKind::Release {
-                continue;
-            }
-            let key = screen::normalize_key(raw.code, raw.modifiers, enhanced);
-            execute!(out, Print(format!("{:?} {}\r\n", key.code, key.mods)))?;
-            if key.mods == CTRL && key.code == KeyCode::Char('c') {
-                return Ok(());
+            match next()? {
+                Some(Input::Key(key)) => {
+                    execute!(out, Print(format!("{:?} {}\r\n", key.code, key.mods)))?;
+                    if key.mods == CTRL && key.code == KeyCode::Char('c') {
+                        return Ok(());
+                    }
+                }
+                Some(Input::Held(mods)) => {
+                    execute!(out, Print(format!("Held: {mods}\r\n")))?;
+                }
+                _ => {}
             }
         }
     })();
+    if win32 {
+        execute!(out, Print(input::DISABLE))?;
+    }
     if enhanced {
         execute!(out, PopKeyboardEnhancementFlags)?;
     }
@@ -470,12 +522,13 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 impl App {
     fn main_loop(&mut self) -> io::Result<()> {
         while !self.quit {
+            self.tui.sync_held();
             self.draw_main();
             self.tui.draw()?;
             match self.tui.read(TICK)? {
                 Some(Input::Key(key)) => self.on_key(key)?,
                 Some(Input::Paste(text)) => self.cmd.insert_str(&text),
-                Some(Input::Resize) => {}
+                Some(Input::Resize | Input::Held(_)) => {}
                 None => self.refresh_changed(),
             }
         }
@@ -542,13 +595,7 @@ impl App {
         s.put(x, y, &fit(&shown, room), theme::CMDLINE);
         s.cursor = Some((x + column as u16, y));
         if self.keybar && h > 1 {
-            s.keybar(
-                h - 1,
-                &[
-                    "Help", "", "View", "Edit", "Copy", "RenMov", "MkFold", "Delete", "Menu",
-                    "Quit", "", "",
-                ],
-            );
+            s.keybar(h - 1, &PANEL_KEYS);
         }
         // Quick search box under the active panel.
         if let Some(text) = &self.quick {
@@ -913,6 +960,10 @@ impl App {
 
     /// Runs a command on the console, then returns to the panels.
     fn execute(&mut self, command: &str) -> io::Result<()> {
+        if is_exit_command(command) {
+            self.quit = true;
+            return Ok(());
+        }
         self.tui.show_console()?;
         let result = self.run_on_console(command);
         self.tui.enter()?;
@@ -989,7 +1040,7 @@ impl App {
                     self.cmd.insert_str(&text);
                     continue;
                 }
-                Input::Resize => continue,
+                Input::Resize | Input::Held(_) => continue,
             };
             match (key.mods, key.code) {
                 (CTRL, KeyCode::Char('o')) => {
@@ -1010,10 +1061,14 @@ impl App {
                     )?;
                     if text.trim().is_empty() {
                         execute!(out, Print(format!("{prompt}\r\n")))?;
+                    } else if is_exit_command(&text) {
+                        self.quit = true;
+                        return Ok(());
                     } else {
                         self.run_on_console(&text)?;
                     }
                 }
+                (NONE, KeyCode::Tab) => self.complete_command()?,
                 (NONE, KeyCode::Esc) => self.cmd.clear(),
                 (NONE, KeyCode::Up) | (CTRL, KeyCode::Char('e')) => self.history_step(-1),
                 (NONE, KeyCode::Down) | (CTRL, KeyCode::Char('x')) => self.history_step(1),
@@ -1022,6 +1077,26 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Tab on the console. Panels keep Tab for changing panel, as in Far.
+    fn complete_command(&mut self) -> io::Result<()> {
+        let cwd = self.panels[self.active].path.clone();
+        let path = std::env::var_os("PATH");
+        let done = shell::complete(&self.cmd.before_cursor(), &cwd, path.as_deref());
+        if let Some(text) = done.text {
+            self.cmd.replace_to_cursor(done.start, &text);
+        } else if !done.choices.is_empty() {
+            let (w, _) = terminal::size()?;
+            let mut out = io::stdout();
+            execute!(
+                out,
+                Print("\r"),
+                terminal::Clear(terminal::ClearType::CurrentLine),
+                Print(choice_table(&done.choices, w as usize))
+            )?;
+        }
+        Ok(())
     }
 
     fn copy_names(&mut self, full: bool) {
@@ -1142,9 +1217,6 @@ impl App {
         let Some(entry) = self.panels[self.active].current().cloned() else {
             return Ok(());
         };
-        if entry.is_up {
-            return Ok(());
-        }
         if self.panels[self.active].archive.is_some() {
             return if entry.is_dir {
                 Ok(())
@@ -1152,10 +1224,10 @@ impl App {
                 self.view_in_archive()
             };
         }
-        let path = self.panels[self.active].entry_path(&entry);
         if entry.is_dir {
-            return self.folder_size(&path);
+            return self.count_folders();
         }
+        let path = self.panels[self.active].entry_path(&entry);
         self.view_file(&path)
     }
 
@@ -1262,45 +1334,81 @@ impl App {
         self.edit_file(&path)
     }
 
-    fn folder_size(&mut self, path: &Path) -> io::Result<()> {
+    /// F3 on a folder, as in Far: counts the selected folders, or else the one
+    /// under the cursor, where `..` means the current folder. The result shows
+    /// in the panel's Size column, not in a dialog.
+    fn count_folders(&mut self) -> io::Result<()> {
+        let panel = &self.panels[self.active];
+        let mut jobs: Vec<(OsString, PathBuf)> = panel
+            .entries
+            .iter()
+            .filter(|e| e.selected && e.is_dir)
+            .map(|e| (e.raw.clone(), panel.entry_path(e)))
+            .collect();
+        if jobs.is_empty() {
+            if let Some(entry) = panel.current() {
+                let path = if entry.is_up {
+                    panel.path.clone()
+                } else {
+                    panel.entry_path(entry)
+                };
+                jobs.push((entry.raw.clone(), path));
+            }
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
+        let (from_tx, from_rx) = mpsc::channel();
         let flag = cancel.clone();
-        let root = path.to_path_buf();
         std::thread::spawn(move || {
-            let mut totals = Totals::default();
-            let stop = || flag.load(Ordering::Relaxed);
-            fsops::scan(&root, &stop, &mut totals);
-            let _ = tx.send(totals);
+            for (raw, path) in jobs {
+                let _ = from_tx.send(path.clone());
+                // Far counts what a link to a folder points to.
+                let root = fs::canonicalize(&path).unwrap_or(path);
+                let mut totals = Totals::default();
+                let stop = || flag.load(Ordering::Relaxed);
+                fsops::scan(&root, &stop, &mut totals);
+                if flag.load(Ordering::Relaxed) || tx.send((raw, totals.bytes)).is_err() {
+                    return;
+                }
+            }
         });
         let backdrop = self.tui.screen.clone();
+        let mut scanning = PathBuf::new();
         loop {
-            if let Ok(totals) = rx.try_recv() {
+            let mut finished = false;
+            loop {
+                match rx.try_recv() {
+                    Ok((raw, bytes)) => {
+                        if let Some(e) = self.panel().entries.iter_mut().find(|e| e.raw == raw) {
+                            e.scanned = Some(bytes);
+                        }
+                    }
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        finished = true;
+                        break;
+                    }
+                }
+            }
+            if finished {
                 self.tui.screen = backdrop;
-                let lines = vec![
-                    path.display().to_string(),
-                    format!("Bytes:   {}", util::group_digits(totals.bytes)),
-                    format!("Files:   {}", totals.files),
-                    format!("Folders: {}", totals.dirs.saturating_sub(1)),
-                ];
-                dialog::message(&mut self.tui, "Folder size", &lines, &["OK"], false)?;
                 return Ok(());
             }
+            while let Ok(path) = from_rx.try_recv() {
+                scanning = path;
+            }
             self.tui.screen = backdrop.clone();
-            dialog::draw_message(
-                &mut self.tui.screen,
-                "Folder size",
-                &["Scanning. Esc cancels.".to_string()],
-                &[],
-                0,
-                false,
-            );
+            let width = fixed_box_width(self.tui.screen.w);
+            let lines = [
+                fit("Scanning the folder", width),
+                fit(&fit_left(&scanning.display().to_string(), width), width),
+                fit("Esc cancels", width),
+            ];
+            dialog::draw_message(&mut self.tui.screen, "Scanning", &lines, &[], 0, false);
             self.tui.draw()?;
             if let Some(Input::Key(key)) = self.tui.read(OP_TICK)? {
                 if key.code == KeyCode::Esc {
                     cancel.store(true, Ordering::Relaxed);
-                    self.tui.screen = backdrop;
-                    return Ok(());
                 }
             }
         }
@@ -2116,6 +2224,11 @@ impl App {
                         let choice = self.ask_trash(&path)?;
                         let _ = to_worker.send(Reply::Trash(choice));
                     }
+                    Ok(ToUi::ConfirmDelete(path, ask)) => {
+                        self.tui.screen = backdrop.clone();
+                        let choice = self.ask_delete(&path, ask)?;
+                        let _ = to_worker.send(Reply::Delete(choice));
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
                         done = Some(OpSummary {
@@ -2187,6 +2300,43 @@ impl App {
             Some(1) => ErrorChoice::Skip,
             Some(2) => ErrorChoice::SkipAll,
             _ => ErrorChoice::Cancel,
+        })
+    }
+
+    /// Far's second question about a delete. Its text comes from `FarEng.lng`.
+    fn ask_delete(&mut self, path: &Path, ask: DeleteAsk) -> io::Result<DeleteChoice> {
+        let (title, first, last) = match ask {
+            DeleteAsk::NonEmptyFolder { to_trash: true } => (
+                "Delete folder",
+                "The following folder will be moved to the trash:",
+                None,
+            ),
+            DeleteAsk::NonEmptyFolder { to_trash: false } => (
+                "Delete folder",
+                "The following folder will be deleted:",
+                None,
+            ),
+            DeleteAsk::ReadOnly => (
+                "Delete",
+                "The file is read only",
+                Some("Do you wish to delete it?"),
+            ),
+        };
+        let mut lines = vec![first.to_string(), path.display().to_string()];
+        lines.extend(last.map(str::to_string));
+        let answer = dialog::message(
+            &mut self.tui,
+            title,
+            &lines,
+            &["Delete", "All", "Skip", "Skip all", "Cancel"],
+            true,
+        )?;
+        Ok(match answer {
+            Some(0) => DeleteChoice::Delete,
+            Some(1) => DeleteChoice::All,
+            Some(2) => DeleteChoice::Skip,
+            Some(3) => DeleteChoice::SkipAll,
+            _ => DeleteChoice::Cancel,
         })
     }
 
@@ -2461,6 +2611,43 @@ impl App {
 }
 
 /// True when a prefilled attribute field holds a new value.
+/// `exit` typed as a command ends far, as it does in Far and Midnight Commander.
+/// Each command has its own bash, so passing it on would end only that bash. A
+/// longer line such as `exit; ls` or `(exit 1)` still goes to bash.
+fn is_exit_command(command: &str) -> bool {
+    let mut words = command.split_whitespace();
+    words.next() == Some("exit")
+        && words
+            .next()
+            .is_none_or(|code| code.bytes().all(|b| b.is_ascii_digit()))
+        && words.next().is_none()
+}
+
+/// Lays out names in columns for the console, one screen's worth at most.
+fn choice_table(names: &[String], width: usize) -> String {
+    const MOST: usize = 200;
+    let shown = &names[..names.len().min(MOST)];
+    let cell = shown
+        .iter()
+        .map(|n| str_width(&util::printable(n)))
+        .max()
+        .unwrap_or(0)
+        + 2;
+    let columns = (width / cell.max(1)).max(1);
+    let mut out = String::new();
+    for row in shown.chunks(columns) {
+        for name in row {
+            out.push_str(&fit(&util::printable(name), cell));
+        }
+        out.truncate(out.trim_end_matches(' ').len());
+        out.push_str("\r\n");
+    }
+    if names.len() > MOST {
+        out.push_str(&format!("…and {} more\r\n", names.len() - MOST));
+    }
+    out
+}
+
 fn field_changed(text: &str, prefilled: &str) -> bool {
     !text.trim().is_empty() && text.trim() != prefilled.trim()
 }
@@ -2583,8 +2770,16 @@ fn draw_top_menu(
     }
 }
 
+/// Inner width of a box whose size must not follow its text.
+fn fixed_box_width(screen_width: u16) -> usize {
+    (screen_width as usize).saturating_sub(11).clamp(15, 65)
+}
+
+/// Draws the progress box. Its size is fixed: text is cut or padded to it, and a
+/// missing target leaves its row blank, so the box never jumps as files change.
 fn draw_progress(s: &mut screen::Screen, title: &str, p: &Progress) {
-    let bar_width = (s.w as usize).saturating_sub(16).clamp(10, 60);
+    let width = fixed_box_width(s.w);
+    let bar_width = width - 5;
     let percent = if p.bytes_total > 0 {
         (p.bytes_done as u128 * 100 / p.bytes_total as u128).min(100) as usize
     } else if p.items_total > 0 {
@@ -2594,19 +2789,25 @@ fn draw_progress(s: &mut screen::Screen, title: &str, p: &Progress) {
     };
     let filled = percent * bar_width / 100;
     let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
-    let mut lines = vec![p.from.display().to_string()];
-    if !p.to.as_os_str().is_empty() {
-        lines.push(format!("to {}", p.to.display()));
-    }
-    lines.push(format!("{bar} {percent:>3}%"));
-    lines.push(format!(
-        "{} of {} bytes, {} of {} items",
-        util::group_digits(p.bytes_done),
-        util::group_digits(p.bytes_total),
-        p.items_done,
-        p.items_total
-    ));
-    lines.push("Esc cancels".to_string());
+    let target = if p.to.as_os_str().is_empty() {
+        String::new()
+    } else {
+        format!("to {}", p.to.display())
+    };
+    let lines = [
+        p.from.display().to_string(),
+        target,
+        format!("{bar} {percent:>3}%"),
+        format!(
+            "{} of {} bytes, {} of {} items",
+            util::group_digits(p.bytes_done),
+            util::group_digits(p.bytes_total),
+            p.items_done,
+            p.items_total
+        ),
+        "Esc cancels".to_string(),
+    ]
+    .map(|line| fit(&fit_left(&line, width), width));
     dialog::draw_message(s, title, &lines, &[], 0, false);
 }
 
@@ -2743,6 +2944,114 @@ mod tests {
             assert!(!entry.0.is_empty());
             assert!(!entry.1.is_empty());
         }
+    }
+
+    #[test]
+    fn every_key_bar_label_is_a_bound_key() {
+        let cases = [
+            (NONE, &PANEL_KEYS.plain),
+            (SHIFT, &PANEL_KEYS.shift),
+            (ALT, &PANEL_KEYS.alt),
+            (CTRL, &PANEL_KEYS.ctrl),
+        ];
+        for (mods, labels) in cases {
+            for (i, label) in labels.iter().enumerate() {
+                let code = KeyCode::F(i as u8 + 1);
+                // F9 opens the menu directly in `on_key`.
+                let bound =
+                    key_action(Key { code, mods }, false).is_some() || (mods == NONE && i == 8);
+                assert_eq!(!label.is_empty(), bound, "{mods} F{} {label:?}", i + 1);
+            }
+        }
+    }
+
+    /// The rectangle a dialog occupies, found from its frame.
+    fn box_of(s: &screen::Screen) -> (u16, u16, u16, u16) {
+        let mut corners = (0, 0, 0, 0);
+        for y in 0..s.h {
+            for x in 0..s.w {
+                match s.char_at(x, y) {
+                    '╔' => (corners.0, corners.1) = (x, y),
+                    '╝' => (corners.2, corners.3) = (x, y),
+                    _ => {}
+                }
+            }
+        }
+        corners
+    }
+
+    #[test]
+    fn progress_box_keeps_its_size_as_names_change() {
+        let draw = |p: &Progress| {
+            let mut s = screen::Screen::new(100, 30);
+            draw_progress(&mut s, "Copy", p);
+            box_of(&s)
+        };
+        let first = draw(&Progress::default());
+        let long = "/a/very/long/path/".repeat(20);
+        for p in [
+            Progress {
+                from: "a".into(),
+                to: "b".into(),
+                ..Default::default()
+            },
+            Progress {
+                from: long.clone().into(),
+                to: long.clone().into(),
+                bytes_done: u64::MAX / 2,
+                bytes_total: u64::MAX,
+                items_done: 1_000_000,
+                items_total: 2_000_000,
+            },
+            Progress {
+                from: "deleting/without/a/target".into(),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(draw(&p), first, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn progress_box_fits_small_screens() {
+        for w in [20, 30, 40, 80] {
+            let mut s = screen::Screen::new(w, 12);
+            draw_progress(&mut s, "Copy", &Progress::default());
+            let (left, _, right, _) = box_of(&s);
+            assert!(left < right && right < w, "width {w}: {left}..{right}");
+        }
+    }
+
+    #[test]
+    fn only_a_plain_exit_command_ends_the_program() {
+        for yes in ["exit", "  exit  ", "exit 0", "exit 3"] {
+            assert!(is_exit_command(yes), "{yes}");
+        }
+        for no in [
+            "",
+            "exit; ls",
+            "exit now",
+            "exit 1 2",
+            "exit_tool",
+            "(exit 1)",
+            "ls exit",
+        ] {
+            assert!(!is_exit_command(no), "{no}");
+        }
+    }
+
+    #[test]
+    fn choices_are_laid_out_in_columns() {
+        let names: Vec<String> = ["aa", "bb", "cc"].map(String::from).to_vec();
+        assert_eq!(choice_table(&names, 8), "aa  bb\r\ncc\r\n");
+        assert_eq!(choice_table(&names, 1), "aa\r\nbb\r\ncc\r\n");
+    }
+
+    #[test]
+    fn long_choice_lists_are_cut_and_control_characters_replaced() {
+        let many: Vec<String> = (0..500).map(|i| format!("n{i}")).collect();
+        assert!(choice_table(&many, 80).ends_with("…and 300 more\r\n"));
+        assert!(!choice_table(&["a\x1b[2J".to_string()], 80).contains('\x1b'));
     }
 
     #[test]

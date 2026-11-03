@@ -30,6 +30,7 @@ pass trivially if tmux is missing, because they skip themselves.
 | `src/editor.rs` | F4 editor: buffer, undo, blocks, search, saving |
 | `src/shell.rs` | Runs commands in bash and carries cwd and exports between them |
 | `src/screen.rs` | Cell buffer, terminal setup, key normalization, theme |
+| `src/input.rs` | Windows Terminal's input mode, which reports modifier keys alone |
 | `src/dialog.rs` | Message boxes, forms, menus |
 | `src/lineedit.rs` | One-line text editing for the command line and dialogs |
 | `src/encoding.rs` | Encodings cycled with F8 |

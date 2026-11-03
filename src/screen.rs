@@ -1,5 +1,6 @@
 //! Terminal handling: a cell buffer with diff-based output, and key input.
 
+use crate::input::{self, Reader};
 use crossterm::{
     cursor,
     event::{
@@ -14,7 +15,10 @@ use crossterm::{
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use std::io::{self, Write};
-use std::time::Duration;
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthChar;
 
 /// Foreground, background and intensity of a cell.
@@ -35,6 +39,44 @@ impl Style {
     }
 }
 
+/// Key bar labels for each state of the Shift, Alt and Ctrl keys.
+pub struct KeyBars<'a> {
+    pub plain: [&'a str; 12],
+    pub shift: [&'a str; 12],
+    pub alt: [&'a str; 12],
+    pub ctrl: [&'a str; 12],
+}
+
+/// The colour numbers a terminal cannot redefine, nearest to Far's 16 colours.
+/// Numbers 0 to 15 belong to the terminal's colour scheme: Ubuntu's Windows
+/// Terminal profile, for one, can draw bright yellow as brown.
+pub fn fixed_color(color: Color) -> Color {
+    Color::AnsiValue(match color {
+        Color::Black => 16,
+        Color::DarkRed => 88,
+        Color::DarkGreen => 28,
+        Color::DarkYellow => 100,
+        Color::DarkBlue => 18,
+        Color::DarkMagenta => 90,
+        Color::DarkCyan => 30,
+        Color::Grey => 250,
+        Color::DarkGrey => 244,
+        Color::Red => 196,
+        Color::Green => 46,
+        Color::Yellow => 226,
+        Color::Blue => 21,
+        Color::Magenta => 201,
+        Color::Cyan => 51,
+        Color::White => 231,
+        other => return other,
+    })
+}
+
+/// Whether the terminal has the 256 colours `fixed_color` needs.
+pub fn has_fixed_colors(term: Option<&str>, colorterm: bool, windows_terminal: bool) -> bool {
+    colorterm || windows_terminal || term.is_some_and(|t| t.contains("256color"))
+}
+
 /// The classic Far colour scheme.
 pub mod theme {
     use super::Style;
@@ -43,7 +85,10 @@ pub mod theme {
     pub const PANEL: Style = Style::new(Cyan, DarkBlue);
     pub const PANEL_DIR: Style = Style::new(White, DarkBlue);
     pub const PANEL_EXEC: Style = Style::new(Green, DarkBlue);
-    pub const PANEL_LINK: Style = Style::new(Magenta, DarkBlue);
+    pub const PANEL_LINK: Style = Style::new(Grey, DarkBlue);
+    pub const PANEL_HIDDEN: Style = Style::new(DarkCyan, DarkBlue);
+    pub const PANEL_ARCHIVE: Style = Style::new(Magenta, DarkBlue);
+    pub const PANEL_TEMP: Style = Style::new(DarkYellow, DarkBlue);
     pub const PANEL_SELECTED: Style = Style::new(Yellow, DarkBlue);
     pub const PANEL_CURSOR: Style = Style::new(Black, DarkCyan);
     pub const PANEL_CURSOR_SELECTED: Style = Style::new(Yellow, DarkCyan);
@@ -79,6 +124,8 @@ pub struct Screen {
     pub h: u16,
     cells: Vec<Cell>,
     pub cursor: Option<(u16, u16)>,
+    /// Modifier keys held down, which choose the key bar labels.
+    pub held: KeyModifiers,
 }
 
 /// Display width of a character. Controls and zero-width marks count as 0.
@@ -154,6 +201,7 @@ impl Screen {
             h,
             cells: vec![blank; w as usize * h as usize],
             cursor: None,
+            held: KeyModifiers::NONE,
         }
     }
 
@@ -255,7 +303,16 @@ impl Screen {
     }
 
     /// Draws the F1..F12 key bar on row `y`.
-    pub fn keybar(&mut self, y: u16, labels: &[&str; 12]) {
+    pub fn keybar(&mut self, y: u16, bars: &KeyBars) {
+        const NO_LABELS: [&str; 12] = [""; 12];
+        let labels = match self.held {
+            NONE => &bars.plain,
+            SHIFT => &bars.shift,
+            ALT => &bars.alt,
+            CTRL => &bars.ctrl,
+            // Far has further sets for combinations, and none of them are bound here.
+            _ => &NO_LABELS,
+        };
         let cell = (self.w as usize / 12).max(3);
         let mut x = 0u16;
         for (i, label) in labels.iter().enumerate() {
@@ -300,6 +357,8 @@ pub enum Input {
     Key(Key),
     Paste(String),
     Resize,
+    /// The modifier keys held down changed.
+    Held(KeyModifiers),
 }
 
 /// Converts raw terminal key data to the forms the application matches on.
@@ -341,7 +400,16 @@ pub fn normalize_key(code: KeyCode, mods: KeyModifiers, enhanced: bool) -> Key {
 pub struct Tui {
     pub screen: Screen,
     last: Option<Screen>,
+    /// Whether keys arrive unambiguously, so `Ctrl+4` is not `Ctrl+\\`.
     pub enhanced: bool,
+    /// The kitty keyboard protocol is available.
+    kitty: bool,
+    /// Windows Terminal's input mode is available. See `input.rs`.
+    win32: Option<Reader>,
+    /// Use colours the terminal's own scheme cannot change.
+    fixed_colors: bool,
+    /// Modifier keys held down.
+    held: KeyModifiers,
     on_alt: bool,
 }
 
@@ -350,11 +418,21 @@ impl Tui {
     pub fn new() -> io::Result<Self> {
         let (w, h) = terminal::size()?;
         terminal::enable_raw_mode()?;
-        let enhanced = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let kitty = terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let win32 = (!kitty && input::try_enable()).then(Reader::new);
+        let fixed_colors = has_fixed_colors(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var_os("COLORTERM").is_some(),
+            std::env::var_os("WT_SESSION").is_some(),
+        );
         let mut tui = Tui {
             screen: Screen::new(w, h),
             last: None,
-            enhanced,
+            enhanced: kitty || win32.is_some(),
+            kitty,
+            win32,
+            fixed_colors,
+            held: KeyModifiers::NONE,
             on_alt: false,
         };
         tui.enter()?;
@@ -371,11 +449,14 @@ impl Tui {
             EnableBracketedPaste,
             cursor::Hide
         )?;
-        if self.enhanced {
+        if self.kitty {
             execute!(
                 out,
                 PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
             )?;
+        }
+        if self.win32.is_some() {
+            execute!(out, Print(input::ENABLE))?;
         }
         self.on_alt = true;
         self.last = None;
@@ -388,8 +469,14 @@ impl Tui {
     /// read. This is what Ctrl+O shows.
     pub fn show_console(&mut self) -> io::Result<()> {
         let mut out = io::stdout();
-        if self.enhanced {
+        if self.kitty {
             execute!(out, PopKeyboardEnhancementFlags)?;
+        }
+        // Commands and the console read ordinary keys.
+        if self.win32.is_some() {
+            execute!(out, Print(input::DISABLE))?;
+            self.held = KeyModifiers::NONE;
+            self.screen.held = KeyModifiers::NONE;
         }
         execute!(
             out,
@@ -447,11 +534,16 @@ impl Tui {
                     queue!(buf, cursor::MoveTo(x, y))?;
                 }
                 if style != Some(cell.style) {
+                    let (fg, bg) = if self.fixed_colors {
+                        (fixed_color(cell.style.fg), fixed_color(cell.style.bg))
+                    } else {
+                        (cell.style.fg, cell.style.bg)
+                    };
                     queue!(
                         buf,
                         SetAttribute(Attribute::Reset),
-                        SetForegroundColor(cell.style.fg),
-                        SetBackgroundColor(cell.style.bg)
+                        SetForegroundColor(fg),
+                        SetBackgroundColor(bg)
                     )?;
                     if cell.style.bold {
                         queue!(buf, SetAttribute(Attribute::Bold))?;
@@ -475,12 +567,15 @@ impl Tui {
 
     /// Reads input, waiting at most `timeout`.
     pub fn read(&mut self, timeout: Duration) -> io::Result<Option<Input>> {
+        if self.on_alt && self.win32.is_some() {
+            return self.read_win32(timeout);
+        }
         if !event::poll(timeout)? {
             return Ok(None);
         }
         match event::read()? {
             Event::Key(k) if k.kind != KeyEventKind::Release => Ok(Some(Input::Key(
-                normalize_key(k.code, k.modifiers, self.enhanced),
+                normalize_key(k.code, k.modifiers, self.kitty),
             ))),
             Event::Paste(text) => Ok(Some(Input::Paste(text))),
             Event::Resize(w, h) => {
@@ -490,6 +585,42 @@ impl Tui {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Reads input in Windows Terminal's input mode. This reader has no signal
+    /// to wake it for a resize, so it compares the size as it waits.
+    fn read_win32(&mut self, timeout: Duration) -> io::Result<Option<Input>> {
+        let start = Instant::now();
+        loop {
+            let left = timeout.saturating_sub(start.elapsed());
+            let Some(reader) = &mut self.win32 else {
+                return Ok(None);
+            };
+            let input = reader.read(left)?;
+            if let Some(Input::Held(mods)) = input {
+                self.screen.held = mods;
+                self.held = mods;
+            }
+            if input.is_some() {
+                return Ok(input);
+            }
+            let (w, h) = terminal::size()?;
+            if (w, h) != (self.screen.w, self.screen.h) {
+                self.screen = Screen::new(w, h);
+                self.last = None;
+                self.screen.held = self.held;
+                return Ok(Some(Input::Resize));
+            }
+            if start.elapsed() >= timeout {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Copies the held modifiers to the buffer. A dialog puts back the screen
+    /// from before it opened, along with what was held then.
+    pub fn sync_held(&mut self) {
+        self.screen.held = self.held;
     }
 
     /// Sends text to the system clipboard using OSC 52, where supported.
@@ -510,6 +641,49 @@ impl Drop for Tui {
     }
 }
 
+/// Undoes every mode the program sets on the terminal.
+const RESTORE: &str = "\x1b[?1004l\x1b[?9001l\x1b[<1u\x1b[?2004l\x1b[?1049l\x1b[?25h\x1b[0m";
+
+static SAVED_TERMIOS: OnceLock<libc::termios> = OnceLock::new();
+static SIGNAL_SEEN: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn restore_and_die(signal: libc::c_int) {
+    // Only async-signal-safe calls are allowed here.
+    if !SIGNAL_SEEN.swap(true, Ordering::SeqCst) {
+        // SAFETY: write, tcsetattr, signal and raise are async-signal-safe. The
+        // termios value was stored before the handler was installed.
+        unsafe {
+            libc::write(1, RESTORE.as_ptr().cast(), RESTORE.len());
+            if let Some(saved) = SAVED_TERMIOS.get() {
+                libc::tcsetattr(0, libc::TCSANOW, saved);
+            }
+        }
+    }
+    // SAFETY: restoring the default action and raising the signal again ends the
+    // process with the right status.
+    unsafe {
+        libc::signal(signal, libc::SIG_DFL);
+        libc::raise(signal);
+    }
+}
+
+/// Restores the terminal if the program is told to end. Left in Windows
+/// Terminal's input mode, a shell would read every key press as garbage. Call
+/// this before raw mode is turned on.
+pub fn install_signal_restore() {
+    // SAFETY: termios is plain data and tcgetattr fills it on success. The
+    // handler has the signature signal() expects.
+    unsafe {
+        let mut saved: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(io::stdin().as_raw_fd(), &mut saved) == 0 {
+            let _ = SAVED_TERMIOS.set(saved);
+        }
+        let handler = restore_and_die as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+}
+
 /// Restores the terminal after a panic so that the message stays readable.
 pub fn install_panic_hook() {
     let default = std::panic::take_hook();
@@ -517,6 +691,7 @@ pub fn install_panic_hook() {
         let mut out = io::stdout();
         let _ = execute!(
             out,
+            Print(input::DISABLE),
             PopKeyboardEnhancementFlags,
             DisableBracketedPaste,
             LeaveAlternateScreen,
@@ -561,6 +736,64 @@ mod tests {
         assert_eq!(fit_name("abc", 5), "abc  ");
         assert_eq!(fit_name("abcdefgh", 5), "abcd}");
         assert_eq!(fit_left("/very/long/path", 8), ".../path");
+    }
+
+    #[test]
+    fn fixed_colors_avoid_the_terminals_own_scheme() {
+        use Color::*;
+        assert_eq!(fixed_color(Yellow), AnsiValue(226));
+        assert_eq!(fixed_color(Green), AnsiValue(46));
+        for color in [
+            Black,
+            DarkRed,
+            DarkGreen,
+            DarkYellow,
+            DarkBlue,
+            DarkMagenta,
+            DarkCyan,
+            Grey,
+            DarkGrey,
+            Red,
+            Green,
+            Yellow,
+            Blue,
+            Magenta,
+            Cyan,
+            White,
+        ] {
+            let AnsiValue(n) = fixed_color(color) else {
+                panic!("{color:?} has no number");
+            };
+            assert!(n >= 16, "{color:?} is {n}, which a scheme can redefine");
+        }
+        assert!(has_fixed_colors(Some("xterm-256color"), false, false));
+        assert!(has_fixed_colors(Some("xterm"), true, false));
+        assert!(has_fixed_colors(None, false, true));
+        assert!(!has_fixed_colors(Some("linux"), false, false));
+    }
+
+    #[test]
+    fn key_bar_follows_the_held_modifier() {
+        let bars = KeyBars {
+            plain: ["Plain"; 12],
+            shift: ["Shift"; 12],
+            alt: ["Alted"; 12],
+            ctrl: ["Ctrld"; 12],
+        };
+        let mut s = Screen::new(100, 1);
+        for (held, text) in [
+            (NONE, "Plain"),
+            (SHIFT, "Shift"),
+            (ALT, "Alted"),
+            (CTRL, "Ctrld"),
+        ] {
+            s.held = held;
+            s.keybar(0, &bars);
+            assert!(s.row_text(0).contains(text), "{}", s.row_text(0));
+        }
+        s.held = CTRL_SHIFT;
+        s.keybar(0, &bars);
+        assert!(!s.row_text(0).contains("Plain"));
     }
 
     #[test]

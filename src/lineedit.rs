@@ -66,6 +66,21 @@ impl LineEdit {
         self.pos += 1;
     }
 
+    /// Text from the start up to the cursor.
+    pub fn before_cursor(&self) -> String {
+        self.chars[..self.pos].iter().collect()
+    }
+
+    /// Replaces the text from character `start` up to the cursor.
+    pub fn replace_to_cursor(&mut self, start: usize, text: &str) {
+        self.fresh = false;
+        let start = start.min(self.pos);
+        let new: Vec<char> = text.chars().collect();
+        let added = new.len();
+        self.chars.splice(start..self.pos, new);
+        self.pos = start + added;
+    }
+
     pub fn left(&mut self) {
         self.fresh = false;
         self.pos = self.pos.saturating_sub(1);
@@ -180,6 +195,19 @@ mod tests {
         e.home();
         e.word_right();
         assert_eq!(e.cursor(), 4);
+    }
+
+    #[test]
+    fn replacing_to_the_cursor_keeps_what_follows() {
+        let mut e = LineEdit::new();
+        e.set("ls фа tail");
+        for _ in 0..5 {
+            e.left();
+        }
+        assert_eq!(e.before_cursor(), "ls фа");
+        e.replace_to_cursor(3, "файл/");
+        assert_eq!(e.text(), "ls файл/ tail");
+        assert_eq!(e.before_cursor(), "ls файл/");
     }
 
     #[test]

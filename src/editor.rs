@@ -6,8 +6,8 @@ use crate::dialog::{self, Field, Form};
 use crate::encoding;
 use crate::history::{History, Kind};
 use crate::screen::{
-    fit, fit_left, str_width, theme, Input, Key, Screen, Tui, ALT, ALT_SHIFT, CTRL, CTRL_SHIFT,
-    NONE, SHIFT,
+    fit, fit_left, str_width, theme, Input, Key, KeyBars, Screen, Tui, ALT, ALT_SHIFT, CTRL,
+    CTRL_SHIFT, NONE, SHIFT,
 };
 use crate::search::{is_word_char, Hit, Matcher, SearchOptions};
 use crate::util;
@@ -902,9 +902,17 @@ impl Editor {
         if keybar {
             s.keybar(
                 s.h.saturating_sub(1),
-                &[
-                    "Help", "Save", "", "Quit", "", "View", "Search", "Encod", "", "Quit", "", "",
-                ],
+                &KeyBars {
+                    plain: [
+                        "Help", "Save", "", "Quit", "", "View", "Search", "Encod", "", "Quit", "",
+                        "",
+                    ],
+                    shift: [
+                        "", "SaveAs", "", "Edit…", "", "", "Next", "CodePg", "", "SaveQ", "", "",
+                    ],
+                    alt: ["", "", "", "", "", "", "Prev", "Goto", "", "", "ViewHs", ""],
+                    ctrl: ["", "", "", "", "", "", "Replac", "", "", "GoFile", "", ""],
+                },
             );
         }
     }
@@ -1262,6 +1270,7 @@ pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<Ed
     ed.search = ctx.db.load_search();
     let ctrl_alt = CTRL | ALT;
     loop {
+        tui.sync_held();
         ed.draw(&mut tui.screen, *ctx.keybar);
         tui.draw()?;
         let input = tui.read(Duration::from_millis(1000))?;

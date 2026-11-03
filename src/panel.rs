@@ -3,6 +3,7 @@
 use crate::archive::{self, ArcEntry, Format};
 use crate::screen::{fit, fit_left, fit_name, str_width, theme, Screen, Style};
 use crate::util;
+use crossterm::style::Color;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -26,6 +27,9 @@ pub struct Entry {
     pub gid: u32,
     pub exec: bool,
     pub selected: bool,
+    /// Bytes under this folder, once counted with F3. A reload forgets it, so
+    /// that it never shows a stale number.
+    pub scanned: Option<u64>,
 }
 
 /// Panel sort orders, on Ctrl+F3 to Ctrl+F11 as in Far.
@@ -80,6 +84,7 @@ fn up_entry() -> Entry {
         gid: 0,
         exec: false,
         selected: false,
+        scanned: None,
     }
 }
 
@@ -128,7 +133,37 @@ fn entry_from(path: &Path, raw: OsString) -> Option<Entry> {
         gid: meta.gid(),
         exec: !shown.is_dir() && shown.is_file() && shown.mode() & 0o111 != 0,
         selected: false,
+        scanned: None,
     })
+}
+
+/// Far's `<arc>` mask, with its wildcards written out, plus the formats common
+/// on Linux that it does not list.
+const ARCHIVE_EXTENSIONS: &[&str] = &[
+    "zip", "rar", "7z", "bz", "gz", "xz", "lz", "bzip", "gzip", "tar", "taz", "tgz", "tbz", "txz",
+    "tlz", "z", "arc", "arj", "bz2", "cab", "jar", "lha", "lzh", "ha", "acb", "ace", "aci", "pac",
+    "pak", "rk", "cpio", "rpm", "zoo", "hqx", "sit", "ice", "uc2", "ain", "imp", "777", "ufa",
+    "boa", "bs2", "bsa", "sea", "apk", "hpk", "ddi", "x2", "rkv", "lsz", "wsz", "hap", "hyp",
+    "lim", "sqz", "chz", "aab", "aar", "msi", "deb", "zst", "tzst", "lz4", "lzma",
+];
+
+/// Whether a name belongs to Far's `<arc>` group, by its extension alone.
+fn is_archive_name(name: &str) -> bool {
+    let ext = extension(name).to_ascii_lowercase();
+    if ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
+        return true;
+    }
+    // Multi-volume parts: *.r[0-9][0-9] and *.a[0-9][0-9].
+    let bytes = ext.as_bytes();
+    bytes.len() == 3
+        && (bytes[0] == b'r' || bytes[0] == b'a')
+        && bytes[1..].iter().all(u8::is_ascii_digit)
+}
+
+/// Far's `<temp>` group, plus the `name~` backups that Linux editors leave.
+fn is_temp_name(name: &str) -> bool {
+    let ext = extension(name).to_ascii_lowercase();
+    ext == "bak" || ext == "tmp" || name.ends_with('~')
 }
 
 fn extension(name: &str) -> &str {
@@ -242,6 +277,7 @@ impl Panel {
                 gid: 0,
                 exec: false,
                 selected: false,
+                scanned: None,
             });
         }
         self.apply_sort();
@@ -563,27 +599,49 @@ impl Panel {
         })
     }
 
+    /// Far's highlight groups, with the colours from its default settings. The
+    /// first match wins, and a selected name is always yellow.
     fn name_style(entry: &Entry, on_cursor: bool) -> Style {
-        match (on_cursor, entry.selected) {
-            (true, true) => theme::PANEL_CURSOR_SELECTED,
-            (true, false) => theme::PANEL_CURSOR,
-            (false, true) => theme::PANEL_SELECTED,
-            (false, false) => {
-                if entry.is_dir {
-                    theme::PANEL_DIR
-                } else if entry.is_link {
-                    theme::PANEL_LINK
-                } else if entry.exec {
-                    theme::PANEL_EXEC
-                } else {
-                    theme::PANEL
-                }
-            }
+        if entry.selected {
+            return if on_cursor {
+                theme::PANEL_CURSOR_SELECTED
+            } else {
+                theme::PANEL_SELECTED
+            };
+        }
+        let hidden = !entry.is_up && entry.name.starts_with('.');
+        let group = if hidden {
+            theme::PANEL_HIDDEN
+        } else if entry.is_dir {
+            theme::PANEL_DIR
+        } else if entry.is_link {
+            theme::PANEL_LINK
+        } else if is_archive_name(&entry.name) {
+            theme::PANEL_ARCHIVE
+        } else if is_temp_name(&entry.name) {
+            theme::PANEL_TEMP
+        } else if entry.exec {
+            theme::PANEL_EXEC
+        } else {
+            theme::PANEL
+        };
+        if !on_cursor {
+            return group;
+        }
+        if group == theme::PANEL {
+            theme::PANEL_CURSOR
+        } else if hidden {
+            // Dark cyan would vanish on the cursor, so Far changes it here.
+            Style::new(Color::DarkGrey, theme::PANEL_CURSOR.bg)
+        } else {
+            Style::new(group.fg, theme::PANEL_CURSOR.bg)
         }
     }
 
     fn size_text(entry: &Entry, width: usize) -> String {
-        let text = if entry.is_up {
+        let text = if let Some(bytes) = entry.scanned {
+            util::fit_size(bytes, width)
+        } else if entry.is_up {
             "Up".to_string()
         } else if entry.is_dir {
             if entry.is_link { "SymLink" } else { "Folder" }.to_string()
@@ -761,7 +819,9 @@ impl Panel {
         }
 
         if let Some(entry) = self.current().cloned() {
-            let detail = if entry.is_up {
+            let detail = if let Some(bytes) = entry.scanned {
+                format!("{} bytes", util::group_digits(bytes))
+            } else if entry.is_up {
                 String::from("Up")
             } else if entry.is_dir {
                 util::format_date(entry.mtime) + " " + &util::format_time(entry.mtime)
@@ -793,7 +853,10 @@ impl Panel {
         // Selection summary sits on the separator, as in Far.
         let selected: Vec<&Entry> = self.entries.iter().filter(|e| e.selected).collect();
         if !selected.is_empty() {
-            let bytes: u64 = selected.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
+            let bytes: u64 = selected
+                .iter()
+                .map(|e| e.scanned.unwrap_or(if e.is_dir { 0 } else { e.size }))
+                .sum();
             let text = format!(
                 " {} bytes in {} items ",
                 util::group_digits(bytes),
@@ -873,6 +936,65 @@ mod tests {
 
     fn names(p: &Panel) -> Vec<&str> {
         p.entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    fn entry(name: &str) -> Entry {
+        let mut e = up_entry();
+        e.name = name.into();
+        e.raw = name.into();
+        e.is_up = false;
+        e.is_dir = false;
+        e
+    }
+
+    #[test]
+    fn highlight_groups_match_far() {
+        let style = |e: &Entry| Panel::name_style(e, false);
+        assert_eq!(style(&entry("plain.txt")), theme::PANEL);
+        assert_eq!(style(&entry("a.ZIP")), theme::PANEL_ARCHIVE);
+        assert_eq!(style(&entry("a.tar.gz")), theme::PANEL_ARCHIVE);
+        assert_eq!(style(&entry("part.r07")), theme::PANEL_ARCHIVE);
+        assert_eq!(style(&entry("old.bak")), theme::PANEL_TEMP);
+        assert_eq!(style(&entry("notes.txt~")), theme::PANEL_TEMP);
+        assert_eq!(style(&entry(".bashrc")), theme::PANEL_HIDDEN);
+        assert_eq!(style(&up_entry()), theme::PANEL_DIR);
+
+        let mut tool = entry("tool");
+        tool.exec = true;
+        assert_eq!(style(&tool), theme::PANEL_EXEC);
+        // Windows drives under WSL mark everything executable.
+        let mut zip = entry("a.zip");
+        zip.exec = true;
+        assert_eq!(style(&zip), theme::PANEL_ARCHIVE);
+
+        let mut dir = entry(".config");
+        dir.is_dir = true;
+        assert_eq!(style(&dir), theme::PANEL_HIDDEN);
+    }
+
+    #[test]
+    fn selection_and_cursor_colours_override_groups() {
+        let mut tool = entry("tool");
+        tool.exec = true;
+        assert_eq!(
+            Panel::name_style(&tool, true),
+            Style::new(theme::PANEL_EXEC.fg, theme::PANEL_CURSOR.bg)
+        );
+        assert_eq!(
+            Panel::name_style(&entry("a.txt"), true),
+            theme::PANEL_CURSOR
+        );
+        tool.selected = true;
+        assert_eq!(Panel::name_style(&tool, false), theme::PANEL_SELECTED);
+        assert_eq!(Panel::name_style(&tool, true), theme::PANEL_CURSOR_SELECTED);
+    }
+
+    #[test]
+    fn counted_folder_size_replaces_the_size_label() {
+        let mut up = up_entry();
+        assert!(Panel::size_text(&up, 10).ends_with("Up"));
+        up.scanned = Some(1234);
+        assert!(Panel::size_text(&up, 10).ends_with("1234"));
     }
 
     #[test]

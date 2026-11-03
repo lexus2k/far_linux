@@ -49,6 +49,13 @@ system dependency, at the cost of a C compiler at build time. The file is mode
 0600 because commands can contain secrets. Any failure falls back to an in-memory
 database, because history must never stop the file manager.
 
+**Windows Terminal's input mode has its own reader.** Terminals report nothing
+for a modifier pressed alone, so the key bar could not follow it. Windows Terminal
+reports it in win32-input-mode, which crossterm cannot parse, so `input.rs` decodes
+it. The mode is used only after the terminal confirms it, it is off whenever a
+command or the console has the terminal, and SIGTERM and SIGHUP turn it off,
+because a shell left in it reads keys as garbage.
+
 **Search lives in one place.** `Matcher` gives the editor and viewer the same
 options. Both search line by line, so a pattern cannot match across lines. The
 viewer uses a faster byte search for exact and hex text.
@@ -78,8 +85,8 @@ From the first review, not yet fixed:
 - Non-UTF-8 names: a command built from one uses lossy text, `Ctrl+Enter` on a
   name with a newline can name another file, `F5` into a non-UTF-8 folder fails,
   and `cd` into one is lost between commands.
-- SIGTERM and SIGHUP leave the terminal unrestored and the state folder behind,
-  and that folder holds exported variables.
+- SIGTERM and SIGHUP leave the state folder behind, and that folder holds exported
+  variables. The terminal itself is now restored.
 - Saving through a dangling symbolic link replaces the link with a file.
 - Save As changes the file's path before the save has succeeded.
 - `Shift+F6` on a file literally named `~` moves it to the home folder.
@@ -91,6 +98,10 @@ From the first review, not yet fixed:
 
 Other:
 
+- Windows Terminal's input mode is tested through tmux with its events sent by
+  hand, not in Windows Terminal. Paste has the least evidence: the decoder expects
+  the bracketed paste markers as plain bytes.
+- `F3` does not count folders inside an archive.
 - Retry in an archive error dialog repeats the prompt, not the failed step,
   because archive data can be read only once.
 - Keeping a file's group on save and syncing during a move have no test. The first
