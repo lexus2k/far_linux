@@ -116,6 +116,8 @@ pub(crate) struct Ctx<'a, U: OpUi> {
     pub(crate) skipped: u64,
     pub(crate) done: u64,
     follow: bool,
+    /// Folders being copied when following links, to catch a link back to one.
+    follow_stack: Vec<(u64, u64)>,
     durable: bool,
 }
 
@@ -133,6 +135,7 @@ impl<'a, U: OpUi> Ctx<'a, U> {
             skipped: 0,
             done: 0,
             follow,
+            follow_stack: Vec::new(),
             durable: false,
         }
     }
@@ -433,6 +436,28 @@ fn copy_dir<U: OpUi>(
         })?;
         return Ok(());
     }
+    let id = (meta.dev(), meta.ino());
+    if ctx.follow && ctx.follow_stack.contains(&id) {
+        ctx.attempt::<()>(src, || {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this link leads back to a folder being copied",
+            ))
+        })?;
+        return Ok(());
+    }
+    ctx.follow_stack.push(id);
+    let result = copy_dir_contents(ctx, src, dst, meta);
+    ctx.follow_stack.pop();
+    result
+}
+
+fn copy_dir_contents<U: OpUi>(
+    ctx: &mut Ctx<U>,
+    src: &Path,
+    dst: &Path,
+    meta: &Metadata,
+) -> Result<(), Cancelled> {
     let existing = fs::symlink_metadata(dst).ok();
     if let Some(existing) = &existing {
         let _ = existing;
@@ -1407,6 +1432,42 @@ mod tests {
         let meta = fs::symlink_metadata(d.p("copy")).unwrap();
         assert!(meta.is_file());
         assert_eq!(fs::read_to_string(d.p("copy")).unwrap(), "data");
+    }
+
+    #[test]
+    fn following_a_link_back_to_its_own_folder_stops() {
+        let d = TestDir::new("follow_cycle");
+        fs::create_dir(d.p("top")).unwrap();
+        d.write("top/file", "data");
+        symlink(d.p("top"), d.p("top/back")).unwrap();
+        let mut ui = Script::default();
+        let options = CopyOptions {
+            follow_symlinks: true,
+        };
+        let target = d.p("copy").display().to_string();
+        let s = copy_items(&[d.p("top")], &target, &base(), &options, &mut ui);
+        assert_eq!(ui.errors.len(), 1, "{:?}", ui.errors);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(fs::read_to_string(d.p("copy/file")).unwrap(), "data");
+        assert!(!d.p("copy/back").exists());
+    }
+
+    #[test]
+    fn following_the_same_folder_by_two_links_is_not_a_cycle() {
+        let d = TestDir::new("follow_diamond");
+        fs::create_dir(d.p("shared")).unwrap();
+        d.write("shared/file", "data");
+        fs::create_dir(d.p("top")).unwrap();
+        symlink(d.p("shared"), d.p("top/one")).unwrap();
+        symlink(d.p("shared"), d.p("top/two")).unwrap();
+        let mut ui = Script::default();
+        let options = CopyOptions {
+            follow_symlinks: true,
+        };
+        let target = d.p("copy").display().to_string();
+        copy_items(&[d.p("top")], &target, &base(), &options, &mut ui);
+        assert!(ui.errors.is_empty(), "{:?}", ui.errors);
+        assert!(d.p("copy/one/file").exists() && d.p("copy/two/file").exists());
     }
 
     #[test]

@@ -311,12 +311,33 @@ pub fn encode_file(text: &str, format: &FileFormat) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
+/// The file a path finally names, following symbolic links. Unlike
+/// `canonicalize`, this also works when the last link's target does not exist
+/// yet, as a save through a dangling link must not replace the link.
+fn through_links(path: &Path) -> io::Result<PathBuf> {
+    const MOST_LINKS: u32 = 40;
+    let mut current = path.to_path_buf();
+    for _ in 0..MOST_LINKS {
+        match fs::read_link(&current) {
+            Ok(target) => {
+                current = match current.parent() {
+                    Some(parent) => parent.join(target),
+                    None => target,
+                };
+            }
+            // Not a link, or nothing there yet.
+            Err(_) => return Ok(fs::canonicalize(&current).unwrap_or(current)),
+        }
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
+}
+
 /// Writes a file atomically where possible, so a failed save cannot destroy
 /// the original. Links keep working: a symbolic link is written through, and
 /// a file with several hard links, or owned by someone else, is written in
 /// place so that its identity and ownership stay the same.
 pub fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
-    let real = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let real = through_links(path)?;
     let existing = fs::metadata(&real).ok();
     let in_place = existing
         .as_ref()
@@ -797,10 +818,17 @@ impl Editor {
 
     /// Saves to the current path.
     pub fn save(&mut self) -> Result<(), String> {
+        self.save_to(self.path.clone())
+    }
+
+    /// Saves to `target`, which becomes the file's path only if the save worked.
+    /// After a failed Save As, F2 must still go to the original file.
+    pub fn save_to(&mut self, target: PathBuf) -> Result<(), String> {
         let bytes = encode_file(&self.buf.to_text(), &self.format)?;
-        write_file(&self.path, &bytes).map_err(|e| e.to_string())?;
+        write_file(&target, &bytes).map_err(|e| e.to_string())?;
         self.buf.mark_saved();
-        self.mtime = fs::metadata(&self.path).ok().map(|m| stamp(&m));
+        self.mtime = fs::metadata(&target).ok().map(|m| stamp(&m));
+        self.path = target;
         Ok(())
     }
 
@@ -1577,9 +1605,7 @@ fn save_as(tui: &mut Tui, ed: &mut Editor) -> io::Result<()> {
                 return Ok(());
             }
         }
-        ed.path = target;
-        ed.mtime = None;
-        if let Err(text) = ed.save() {
+        if let Err(text) = ed.save_to(target) {
             dialog::alert(tui, "Save failed", &text)?;
         }
     }
@@ -1911,6 +1937,14 @@ mod tests {
             locked: false,
             status_bar: true,
         }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = temp(tag);
+        let _ = fs::remove_file(&dir);
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        dir
     }
 
     fn temp(tag: &str) -> PathBuf {
@@ -2406,6 +2440,76 @@ mod tests {
             bom: false,
         };
         assert!(encode_file("日本語", &format).is_err());
+    }
+
+    #[test]
+    fn saving_through_a_dangling_link_keeps_the_link() {
+        let dir = temp_dir("dangling");
+        let link = dir.join("link");
+        let target = dir.join("not_yet");
+        std::os::unix::fs::symlink("not_yet", &link).unwrap();
+        write_file(&link, b"text").unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::read(&target).unwrap(), b"text");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_through_a_chain_of_links_reaches_the_last_target() {
+        let dir = temp_dir("chain");
+        std::os::unix::fs::symlink("second", dir.join("first")).unwrap();
+        std::os::unix::fs::symlink(dir.join("end"), dir.join("second")).unwrap();
+        write_file(&dir.join("first"), b"x").unwrap();
+        assert_eq!(fs::read(dir.join("end")).unwrap(), b"x");
+        assert!(fs::symlink_metadata(dir.join("second"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn saving_through_a_link_loop_fails_and_leaves_the_links() {
+        let dir = temp_dir("loop");
+        std::os::unix::fs::symlink("b", dir.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", dir.join("b")).unwrap();
+        assert!(write_file(&dir.join("a"), b"x").is_err());
+        assert!(fs::symlink_metadata(dir.join("a"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn failed_save_as_keeps_the_original_path_and_changes() {
+        let dir = temp_dir("saveas");
+        let file = dir.join("file.txt");
+        fs::write(&file, "old").unwrap();
+        let mut ed = Editor::open(&file).unwrap();
+        ed.type_text("new ");
+        assert!(ed.save_to(dir.join("no/such/folder/file.txt")).is_err());
+        assert_eq!(ed.path, file);
+        assert!(ed.buf.is_modified());
+        ed.save().unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "new old");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_as_moves_to_the_new_path_when_it_works() {
+        let dir = temp_dir("saveas_ok");
+        let file = dir.join("file.txt");
+        fs::write(&file, "old").unwrap();
+        let mut ed = Editor::open(&file).unwrap();
+        ed.save_to(dir.join("other.txt")).unwrap();
+        assert_eq!(ed.path, dir.join("other.txt"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "old");
+        assert_eq!(fs::read_to_string(dir.join("other.txt")).unwrap(), "old");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

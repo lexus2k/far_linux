@@ -1473,6 +1473,7 @@ impl App {
             // The box shows a lossy name. Unedited, it would name another file.
             return Ok(());
         }
+        let target = literal_if_unedited(here, target, &default);
         self.db.add(Kind::Target, &target);
         let options = CopyOptions {
             follow_symlinks: form.checked(1),
@@ -1529,6 +1530,7 @@ impl App {
             // The box shows a lossy name. Unedited, it would rename the file.
             return Ok(());
         }
+        let target = literal_if_unedited(here, target, &default);
         let base = self.panels[self.active].path.clone();
         let dest_name = (sources.len() == 1)
             .then(|| fsops::resolve_dest(&sources[0], &target, &base, false))
@@ -2611,6 +2613,16 @@ impl App {
 }
 
 /// True when a prefilled attribute field holds a new value.
+/// A prefilled name left unchanged means that very file, even when it looks like
+/// a path: a file named `~` must not turn into the home folder.
+fn literal_if_unedited(here: bool, target: String, default: &str) -> String {
+    if here && target == default {
+        format!("./{target}")
+    } else {
+        target
+    }
+}
+
 /// `exit` typed as a command ends far, as it does in Far and Midnight Commander.
 /// Each command has its own bash, so passing it on would end only that bash. A
 /// longer line such as `exit; ls` or `(exit 1)` still goes to bash.
@@ -3020,6 +3032,13 @@ mod tests {
             let (left, _, right, _) = box_of(&s);
             assert!(left < right && right < w, "width {w}: {left}..{right}");
         }
+    }
+
+    #[test]
+    fn an_unedited_name_is_taken_literally() {
+        assert_eq!(literal_if_unedited(true, "~".into(), "~"), "./~");
+        assert_eq!(literal_if_unedited(true, "~/x".into(), "~"), "~/x");
+        assert_eq!(literal_if_unedited(false, "~".into(), "~"), "~");
     }
 
     #[test]

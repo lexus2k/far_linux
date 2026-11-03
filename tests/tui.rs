@@ -1084,3 +1084,31 @@ fn exit_command_ends_far_from_panels_and_console() {
         assert!(far.stdout.is_empty(), "far is still running");
     }
 }
+
+#[test]
+fn shift_f6_and_shift_f5_on_a_file_named_tilde_stay_in_the_folder() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/~"), "tilde").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("~");
+    s.keys(&["Down", "S-F6"]);
+    s.wait("Rename or move");
+    s.keys(&["Enter"]);
+    s.wait_gone("Rename or move");
+    s.keys(&["S-F5"]);
+    s.wait(" to:");
+    s.keys(&["Enter"]);
+    std::thread::sleep(Duration::from_millis(300));
+    s.keys(&["Escape", "Escape"]);
+    assert_eq!(fs::read_to_string(s.p("left/~")).unwrap(), "tilde");
+    assert!(!s.p("home/~").exists(), "ended up inside the home folder");
+    let home: Vec<_> = fs::read_dir(s.p("home"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name())
+        .filter(|n| n != "data")
+        .collect();
+    assert!(home.is_empty(), "{home:?}");
+}

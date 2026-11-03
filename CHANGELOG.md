@@ -42,6 +42,16 @@
 - Editor with undo, stream and vertical blocks, search and replace, and
   encoding and line ending preservation.
 
+### Fixed
+
+- Saving through a dangling symbolic link writes to its target instead of replacing
+  the link.
+- A failed Save As keeps the original path, so `F2` still saves to the old file.
+- `Shift+F5` and `Shift+F6` on a file literally named `~` stay in the folder instead
+  of going to the home folder.
+- Copying with "contents of symbolic links" stops at a link back to a folder being
+  copied.
+
 ### Changed
 
 - `F3` on a folder shows its size in the panel instead of a dialog, as in Far. On

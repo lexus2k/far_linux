@@ -87,11 +87,7 @@ From the first review, not yet fixed:
   and `cd` into one is lost between commands.
 - SIGTERM and SIGHUP leave the state folder behind, and that folder holds exported
   variables. The terminal itself is now restored.
-- Saving through a dangling symbolic link replaces the link with a file.
-- Save As changes the file's path before the save has succeeded.
-- `Shift+F6` on a file literally named `~` moves it to the home folder.
 - `is_inside` compares paths, so it can miss on case-insensitive file systems.
-- Copying with "contents of symbolic links" has no cycle detection.
 - Restoring the screen after a resize during some dialogs draws at the old size.
 - Wrapping a very long line is slow, and blocking files like `/proc/kmsg` can
   hang the viewer.
