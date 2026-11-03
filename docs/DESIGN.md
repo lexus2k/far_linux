@@ -56,6 +56,10 @@ it. The mode is used only after the terminal confirms it, it is off whenever a
 command or the console has the terminal, and SIGTERM and SIGHUP turn it off,
 because a shell left in it reads keys as garbage.
 
+**Highlighting groups are a text file.** Far edits them in a dialog. A text file
+opened in the editor gives the same power for far less code, and is easy to copy
+between machines. The defaults are that same text, so they cannot drift apart.
+
 **Search lives in one place.** `Matcher` gives the editor and viewer the same
 options. Both search line by line, so a pattern cannot match across lines. The
 viewer uses a faster byte search for exact and hex text.

@@ -114,11 +114,17 @@ clears everything that is not locked.
   with 0.
 - `Tab` completes file and command names on the console (`Ctrl+O`), as bash does.
   With panels on screen it changes panel, as in Far.
-- Colours are Far's default highlight groups, which are fixed for now: hidden
-  (names starting with a dot), folders, `<arc>`, `<temp>`, then executables. Linux
-  uses the execute permission rather than Far's `<exec>` masks, and archives and
-  temporary files are checked first because Windows drives mark every file
-  executable. Symbolic links to files are grey.
+- Files highlighting is a text file, `~/.config/far_linux/highlight.ini`, not Far's
+  dialog, and `F9`, Commands, Files highlighting opens it. It has Far's masks,
+  including `<name>` and `|` to exclude, and its four colours, but no marking
+  character or "continue processing". Deleting the file restores the defaults.
+- The default groups are Far's: hidden (names starting with a dot), folders, `<arc>`,
+  `<temp>` and executables, plus links, images, media, documents and source. Linux
+  uses the execute permission rather than Far's `<exec>` masks, and it comes after
+  archives, temporary files, images, media and documents, because Windows drives
+  mark every file executable.
+- `Ctrl+C` clears the command line and cancels a running operation, as in a shell.
+  Far's panels have no such key.
 - `F3` on a folder shows the size in the Size column and the panel footer. Any
   re-read of the panel clears it, so that it never shows a stale number. It does
   not work inside an archive yet.

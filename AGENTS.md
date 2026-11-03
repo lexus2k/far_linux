@@ -23,6 +23,7 @@ pass trivially if tmux is missing, because they skip themselves.
 | `src/app.rs` | Main loop, hot keys, `Action` dispatch, file operation dialogs, F9 menu |
 | `src/fsops.rs` | Copy, move, delete, trash, attributes, find. No UI code |
 | `src/archive.rs` | List, extract, create and change archives. No UI code |
+| `src/highlight.rs` | Far's highlighting groups: masks, attributes, colours and their settings file |
 | `src/history.rs` | SQLite history and remembered options |
 | `src/search.rs` | Search engine shared by editor and viewer: regex, whole words, fuzzy, preserve style |
 | `src/panel.rs` | Directory and archive listing, sorting, selection, panel drawing |

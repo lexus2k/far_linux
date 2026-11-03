@@ -9,7 +9,13 @@
 - `Tab` completes file and command names on the `Ctrl+O` console.
 - Typing `exit` on the command line or the console ends far.
 - Far's default highlight groups: hidden files, archives and temporary files have
-  their own colours, also under the cursor.
+  their own colours, also under the cursor. Added groups colour images, media,
+  documents and source code.
+- Highlight groups are kept in `~/.config/far_linux/highlight.ini`, with Far's masks
+  and colours for normal, cursor and selected names. `F9`, Commands, Files
+  highlighting opens it.
+- `Ctrl+C` clears the command line, starts a new prompt on the console, and cancels
+  a running operation.
 - Deleting a folder with something in it asks first, with `Delete`, `All`, `Skip`,
   `Skip all` and `Cancel`, as Far does. A permanent delete asks the same about
   read-only files.
@@ -42,16 +48,6 @@
 - Editor with undo, stream and vertical blocks, search and replace, and
   encoding and line ending preservation.
 
-### Fixed
-
-- Saving through a dangling symbolic link writes to its target instead of replacing
-  the link.
-- A failed Save As keeps the original path, so `F2` still saves to the old file.
-- `Shift+F5` and `Shift+F6` on a file literally named `~` stay in the folder instead
-  of going to the home folder.
-- Copying with "contents of symbolic links" stops at a link back to a folder being
-  copied.
-
 ### Changed
 
 - `F3` on a folder shows its size in the panel instead of a dialog, as in Far. On
@@ -66,6 +62,13 @@
 
 ### Fixed
 
+- Saving through a dangling symbolic link writes to its target instead of replacing
+  the link.
+- A failed Save As keeps the original path, so `F2` still saves to the old file.
+- `Shift+F5` and `Shift+F6` on a file literally named `~` stay in the folder instead
+  of going to the home folder.
+- Copying with "contents of symbolic links" stops at a link back to a folder being
+  copied.
 - A symbolic link copied or moved onto the file it points to destroyed the file.
 - A failed in-place save lost the original. The old contents now go back.
 - Any failure to create the temporary file, such as a full disk, fell through to

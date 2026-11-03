@@ -6,6 +6,7 @@ pub mod dialog;
 pub mod editor;
 pub mod encoding;
 pub mod fsops;
+pub mod highlight;
 pub mod history;
 pub mod input;
 pub mod lineedit;

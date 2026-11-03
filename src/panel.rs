@@ -1,14 +1,15 @@
 //! A file panel: directory contents, sorting, selection and drawing.
 
 use crate::archive::{self, ArcEntry, Format};
+use crate::highlight::{Facts, Highlight};
 use crate::screen::{fit, fit_left, fit_name, str_width, theme, Screen, Style};
 use crate::util;
-use crossterm::style::Color;
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// One line of a panel.
 #[derive(Clone, Debug)]
@@ -106,6 +107,8 @@ pub struct Panel {
     /// Rows and columns from the last draw, used for page movement.
     pub rows: usize,
     pub columns: usize,
+    /// The groups that colour names.
+    pub highlight: Rc<Highlight>,
 }
 
 fn entry_from(path: &Path, raw: OsString) -> Option<Entry> {
@@ -135,35 +138,6 @@ fn entry_from(path: &Path, raw: OsString) -> Option<Entry> {
         selected: false,
         scanned: None,
     })
-}
-
-/// Far's `<arc>` mask, with its wildcards written out, plus the formats common
-/// on Linux that it does not list.
-const ARCHIVE_EXTENSIONS: &[&str] = &[
-    "zip", "rar", "7z", "bz", "gz", "xz", "lz", "bzip", "gzip", "tar", "taz", "tgz", "tbz", "txz",
-    "tlz", "z", "arc", "arj", "bz2", "cab", "jar", "lha", "lzh", "ha", "acb", "ace", "aci", "pac",
-    "pak", "rk", "cpio", "rpm", "zoo", "hqx", "sit", "ice", "uc2", "ain", "imp", "777", "ufa",
-    "boa", "bs2", "bsa", "sea", "apk", "hpk", "ddi", "x2", "rkv", "lsz", "wsz", "hap", "hyp",
-    "lim", "sqz", "chz", "aab", "aar", "msi", "deb", "zst", "tzst", "lz4", "lzma",
-];
-
-/// Whether a name belongs to Far's `<arc>` group, by its extension alone.
-fn is_archive_name(name: &str) -> bool {
-    let ext = extension(name).to_ascii_lowercase();
-    if ARCHIVE_EXTENSIONS.contains(&ext.as_str()) {
-        return true;
-    }
-    // Multi-volume parts: *.r[0-9][0-9] and *.a[0-9][0-9].
-    let bytes = ext.as_bytes();
-    bytes.len() == 3
-        && (bytes[0] == b'r' || bytes[0] == b'a')
-        && bytes[1..].iter().all(u8::is_ascii_digit)
-}
-
-/// Far's `<temp>` group, plus the `name~` backups that Linux editors leave.
-fn is_temp_name(name: &str) -> bool {
-    let ext = extension(name).to_ascii_lowercase();
-    ext == "bak" || ext == "tmp" || name.ends_with('~')
 }
 
 fn extension(name: &str) -> &str {
@@ -205,6 +179,7 @@ impl Panel {
             dir_mtime: 0,
             rows: 20,
             columns: 2,
+            highlight: Rc::new(Highlight::default()),
         };
         panel.reload();
         panel
@@ -599,43 +574,24 @@ impl Panel {
         })
     }
 
-    /// Far's highlight groups, with the colours from its default settings. The
-    /// first match wins, and a selected name is always yellow.
-    fn name_style(entry: &Entry, on_cursor: bool) -> Style {
-        if entry.selected {
-            return if on_cursor {
-                theme::PANEL_CURSOR_SELECTED
-            } else {
-                theme::PANEL_SELECTED
-            };
-        }
-        let hidden = !entry.is_up && entry.name.starts_with('.');
-        let group = if hidden {
-            theme::PANEL_HIDDEN
-        } else if entry.is_dir {
-            theme::PANEL_DIR
-        } else if entry.is_link {
-            theme::PANEL_LINK
-        } else if is_archive_name(&entry.name) {
-            theme::PANEL_ARCHIVE
-        } else if is_temp_name(&entry.name) {
-            theme::PANEL_TEMP
-        } else if entry.exec {
-            theme::PANEL_EXEC
-        } else {
-            theme::PANEL
+    /// The colour of a name, from the highlighting groups. Without a group, a
+    /// name uses the panel's own colours.
+    fn name_style(&self, entry: &Entry, on_cursor: bool) -> Style {
+        let colors = self.highlight.colors(&Facts {
+            name: &entry.name,
+            is_dir: entry.is_dir,
+            is_link: entry.is_link,
+            hidden: !entry.is_up && entry.name.starts_with('.'),
+            exec: entry.exec,
+            read_only: entry.mode & 0o200 == 0,
+        });
+        let (color, base) = match (entry.selected, on_cursor) {
+            (true, true) => (colors.selected_cursor, theme::PANEL_CURSOR_SELECTED),
+            (true, false) => (colors.selected, theme::PANEL_SELECTED),
+            (false, true) => (colors.cursor, theme::PANEL_CURSOR),
+            (false, false) => (colors.normal, theme::PANEL),
         };
-        if !on_cursor {
-            return group;
-        }
-        if group == theme::PANEL {
-            theme::PANEL_CURSOR
-        } else if hidden {
-            // Dark cyan would vanish on the cursor, so Far changes it here.
-            Style::new(Color::DarkGrey, theme::PANEL_CURSOR.bg)
-        } else {
-            Style::new(group.fg, theme::PANEL_CURSOR.bg)
-        }
+        Style::new(color.unwrap_or(base.fg), base.bg)
     }
 
     fn size_text(entry: &Entry, width: usize) -> String {
@@ -751,7 +707,7 @@ impl Panel {
             let row = i % self.rows;
             let (start, width) = edges[column];
             let on_cursor = active && self.top + i == self.cursor;
-            let style = Self::name_style(entry, on_cursor);
+            let style = self.name_style(entry, on_cursor);
             let cx = x + 1 + start as u16;
             let cy = y + 2 + row as u16;
             let name_width = width - extra;
@@ -920,6 +876,7 @@ impl Panel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossterm::style::Color;
 
     fn panel(tag: &str, files: &[&str], dirs: &[&str]) -> (Panel, PathBuf) {
         let root = std::env::temp_dir().join(format!("far_panel_{}_{tag}", std::process::id()));
@@ -947,46 +904,48 @@ mod tests {
         e
     }
 
+    fn bare_panel() -> Panel {
+        Panel::new(std::env::temp_dir().join("far_no_such_folder_for_tests"))
+    }
+
     #[test]
-    fn highlight_groups_match_far() {
-        let style = |e: &Entry| Panel::name_style(e, false);
-        assert_eq!(style(&entry("plain.txt")), theme::PANEL);
-        assert_eq!(style(&entry("a.ZIP")), theme::PANEL_ARCHIVE);
-        assert_eq!(style(&entry("a.tar.gz")), theme::PANEL_ARCHIVE);
-        assert_eq!(style(&entry("part.r07")), theme::PANEL_ARCHIVE);
-        assert_eq!(style(&entry("old.bak")), theme::PANEL_TEMP);
-        assert_eq!(style(&entry("notes.txt~")), theme::PANEL_TEMP);
-        assert_eq!(style(&entry(".bashrc")), theme::PANEL_HIDDEN);
-        assert_eq!(style(&up_entry()), theme::PANEL_DIR);
-
-        let mut tool = entry("tool");
-        tool.exec = true;
-        assert_eq!(style(&tool), theme::PANEL_EXEC);
-        // Windows drives under WSL mark everything executable.
-        let mut zip = entry("a.zip");
-        zip.exec = true;
-        assert_eq!(style(&zip), theme::PANEL_ARCHIVE);
-
+    fn names_take_group_colours_on_the_panel_background() {
+        let p = bare_panel();
+        assert_eq!(p.name_style(&entry("plain.qqq"), false), theme::PANEL);
+        assert_eq!(p.name_style(&entry("plain.qqq"), true), theme::PANEL_CURSOR);
+        let zip = p.name_style(&entry("a.zip"), false);
+        assert_eq!((zip.fg, zip.bg), (Color::Magenta, theme::PANEL.bg));
+        assert_eq!(p.name_style(&entry(".bashrc"), false).fg, Color::DarkCyan);
+        assert_eq!(p.name_style(&up_entry(), false).fg, Color::White);
         let mut dir = entry(".config");
         dir.is_dir = true;
-        assert_eq!(style(&dir), theme::PANEL_HIDDEN);
+        assert_eq!(p.name_style(&dir, false).fg, Color::DarkCyan);
     }
 
     #[test]
     fn selection_and_cursor_colours_override_groups() {
+        let p = bare_panel();
         let mut tool = entry("tool");
         tool.exec = true;
         assert_eq!(
-            Panel::name_style(&tool, true),
-            Style::new(theme::PANEL_EXEC.fg, theme::PANEL_CURSOR.bg)
-        );
-        assert_eq!(
-            Panel::name_style(&entry("a.txt"), true),
-            theme::PANEL_CURSOR
+            p.name_style(&tool, true),
+            Style::new(Color::Green, theme::PANEL_CURSOR.bg)
         );
         tool.selected = true;
-        assert_eq!(Panel::name_style(&tool, false), theme::PANEL_SELECTED);
-        assert_eq!(Panel::name_style(&tool, true), theme::PANEL_CURSOR_SELECTED);
+        assert_eq!(p.name_style(&tool, false), theme::PANEL_SELECTED);
+        assert_eq!(p.name_style(&tool, true), theme::PANEL_CURSOR_SELECTED);
+    }
+
+    #[test]
+    fn a_group_can_set_the_selected_colour() {
+        let mut p = bare_panel();
+        p.highlight = Rc::new(Highlight::parse(
+            "[group]\nmask = *\nselected = red\nselected_cursor = white\n",
+        ));
+        let mut e = entry("x");
+        e.selected = true;
+        assert_eq!(p.name_style(&e, false).fg, Color::Red);
+        assert_eq!(p.name_style(&e, true).fg, Color::White);
     }
 
     #[test]

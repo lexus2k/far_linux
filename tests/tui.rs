@@ -43,7 +43,7 @@ impl Session {
         setup(&root);
         let session = Session { socket, root };
         let launch = format!(
-            "env HOME={home} XDG_DATA_HOME={home}/data PS1= {extra_env} {bin} {left} {right}; sleep 30",
+            "env HOME={home} XDG_DATA_HOME={home}/data XDG_CONFIG_HOME={home}/config PS1= {extra_env} {bin} {left} {right}; sleep 30",
             home = session.root.join("home").display(),
             bin = env!("CARGO_BIN_EXE_far"),
             left = session.root.join("left").display(),
@@ -1111,4 +1111,100 @@ fn shift_f6_and_shift_f5_on_a_file_named_tilde_stay_in_the_folder() {
         .filter(|n| n != "data")
         .collect();
     assert!(home.is_empty(), "{home:?}");
+}
+
+#[test]
+fn ctrl_c_clears_the_command_line_on_panels_and_console() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text("typed_on_panels");
+    s.wait("typed_on_panels");
+    s.keys(&["C-c"]);
+    s.wait_gone("typed_on_panels");
+    // Still running, with the panels working.
+    s.wait("5Copy");
+    s.keys(&["C-o"]);
+    s.wait_gone("5Copy");
+    s.text("typed_on_console");
+    s.wait("typed_on_console");
+    s.keys(&["C-c"]);
+    s.wait("^C");
+    s.keys(&["C-o"]);
+    s.wait("5Copy");
+}
+
+fn has_color(s: &Session, color: &str, name: &str) -> bool {
+    s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+        .contains(&format!("38;5;{color}m{name}"))
+}
+
+#[test]
+fn highlighting_comes_from_the_settings_file() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", |root| {
+        fs::write(root.join("left/a.foo"), "").unwrap();
+        fs::create_dir_all(root.join("home/config/far_linux")).unwrap();
+        fs::write(
+            root.join("home/config/far_linux/highlight.ini"),
+            "[group]\nmask = *.foo\nnormal = 123\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("a.foo");
+    assert!(has_color(&s, "123", "a.foo"), "{}", s.screen());
+}
+
+#[test]
+fn a_broken_settings_file_is_reported_and_far_still_starts() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/a.zip"), "").unwrap();
+        fs::create_dir_all(root.join("home/config/far_linux")).unwrap();
+        fs::write(
+            root.join("home/config/far_linux/highlight.ini"),
+            "nonsense\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("line 1: expected key = value");
+    s.keys(&["Enter"]);
+    s.wait("a.zip");
+    s.wait("5Copy");
+}
+
+#[test]
+fn the_menu_opens_the_settings_as_the_defaults_and_applies_them_on_close() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", |root| {
+        fs::write(root.join("left/a.zip"), "").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("a.zip");
+    let file = s.p("home/config/far_linux/highlight.ini");
+    assert!(!file.exists());
+    s.keys(&["F9"]);
+    s.wait("Left");
+    s.keys(&["Right", "Right"]);
+    s.wait("Files highlighting");
+    for _ in 0..30 {
+        if s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+            .contains("48;5;30m Files highlighting")
+        {
+            break;
+        }
+        s.keys(&["Down"]);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    s.keys(&["Enter"]);
+    s.wait("File highlighting for far");
+    assert!(fs::read_to_string(&file).unwrap().contains("<arc>"));
+    // Change the file as if edited, then leave: the panels must follow it.
+    fs::write(&file, "[group]\nmask = *.zip\nnormal = 123\n").unwrap();
+    s.keys(&["F10"]);
+    s.wait("a.zip");
+    s.wait_for("new colour", |_| has_color(&s, "123", "a.zip"));
 }

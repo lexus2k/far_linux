@@ -7,6 +7,7 @@ use crate::fsops::{
     self, AttrChange, CopyOptions, DeleteAsk, DeleteChoice, ErrorChoice, OpSummary, OpUi,
     OverwriteChoice, Progress, Totals, TrashChoice,
 };
+use crate::highlight::{self, Highlight};
 use crate::history::{History, Kind};
 use crate::input;
 use crate::lineedit::LineEdit;
@@ -29,7 +30,7 @@ use crossterm::{
 };
 use std::ffi::OsString;
 use std::fs;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -69,6 +70,7 @@ pub enum Action {
     UnselectGroup,
     InvertSelection,
     SelectAll,
+    Highlighting,
     ClearSelection,
     FindFiles,
     CommandHistory,
@@ -155,12 +157,15 @@ fn commands_menu() -> Vec<MenuItem> {
         ("Left panel on/off", "Ctrl+F1", Action::ToggleLeft),
         ("Right panel on/off", "Ctrl+F2", Action::ToggleRight),
         ("Key bar on/off", "Ctrl+B", Action::ToggleKeybar),
+        ("Files highlighting", "F9", Action::Highlighting),
         ("Help", "F1", Action::Help),
         ("Quit", "F10", Action::Quit),
     ]
 }
 
 const HELP: &[(&str, &str)] = &[
+    ("F9, Commands", "Files highlighting: edit the colour groups"),
+    ("Ctrl+C", "Clear the command line, or cancel an operation"),
     ("Archives", ""),
     ("Enter, Ctrl+PgDn", "Open the archive under the cursor"),
     ("Ctrl+PgUp", "Go up, leaving the archive at its top"),
@@ -446,6 +451,7 @@ pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
         find_text: db.last(Kind::FindText).unwrap_or_default(),
         db,
     };
+    app.apply_highlighting()?;
     app.main_loop()
 }
 
@@ -672,7 +678,7 @@ impl App {
                 );
                 self.cmd.insert_str(&text);
             }
-            (NONE, KeyCode::Esc) => self.cmd.clear(),
+            (NONE, KeyCode::Esc) | (CTRL, KeyCode::Char('c')) => self.cmd.clear(),
             (CTRL, KeyCode::Char('e')) => self.history_step(-1),
             (CTRL, KeyCode::Char('x')) => self.history_step(1),
             (NONE, KeyCode::Up) => self.panel().move_by(-1),
@@ -1069,6 +1075,11 @@ impl App {
                     }
                 }
                 (NONE, KeyCode::Tab) => self.complete_command()?,
+                // As in a shell: give up on this line and start another.
+                (CTRL, KeyCode::Char('c')) => {
+                    self.cmd.clear();
+                    execute!(out, Print("^C\r\n"))?;
+                }
                 (NONE, KeyCode::Esc) => self.cmd.clear(),
                 (NONE, KeyCode::Up) | (CTRL, KeyCode::Char('e')) => self.history_step(-1),
                 (NONE, KeyCode::Down) | (CTRL, KeyCode::Char('x')) => self.history_step(1),
@@ -1186,6 +1197,7 @@ impl App {
             Action::Info => self.toggle_overlay(Overlay::Info),
             Action::QuickView => self.toggle_overlay(Overlay::QuickView),
             Action::Help => self.help()?,
+            Action::Highlighting => self.edit_highlighting()?,
             Action::Quit => {
                 let lines = vec!["Do you want to quit?".to_string()];
                 if dialog::message(&mut self.tui, "Quit", &lines, &["Yes", "No"], false)? == Some(0)
@@ -1323,6 +1335,53 @@ impl App {
         }
     }
 
+    /// Loads the highlighting groups into both panels and reports any mistakes.
+    fn apply_highlighting(&mut self) -> io::Result<()> {
+        let loaded = highlight::settings_path()
+            .map_or_else(Highlight::default, |path| Highlight::load(&path));
+        let problems = loaded.problems.clone();
+        let loaded = Rc::new(loaded);
+        for panel in &mut self.panels {
+            panel.highlight = loaded.clone();
+        }
+        if !problems.is_empty() {
+            self.draw_main();
+            let mut lines = vec!["Files highlighting:".to_string()];
+            lines.extend(problems.iter().take(10).cloned());
+            if problems.len() > 10 {
+                lines.push(format!("…and {} more", problems.len() - 10));
+            }
+            dialog::message(&mut self.tui, "Files highlighting", &lines, &["OK"], true)?;
+        }
+        Ok(())
+    }
+
+    /// Far edits these groups in a dialog. Here they are a text file, which starts
+    /// as the defaults, so the editor does the work.
+    fn edit_highlighting(&mut self) -> io::Result<()> {
+        let Some(path) = highlight::settings_path() else {
+            return dialog::alert(&mut self.tui, "Files highlighting", "HOME is not set");
+        };
+        let created = path
+            .parent()
+            .map_or(Ok(()), fs::create_dir_all)
+            .and_then(|()| {
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+            })
+            .and_then(|mut file| file.write_all(highlight::DEFAULT_TEXT.as_bytes()));
+        if let Err(e) = created {
+            if e.kind() != io::ErrorKind::AlreadyExists {
+                let text = format!("{}: {e}", path.display());
+                return dialog::alert(&mut self.tui, "Files highlighting", &text);
+            }
+        }
+        self.edit_file(&path)?;
+        self.apply_highlighting()
+    }
+
     fn new_file(&mut self) -> io::Result<()> {
         let Some(name) = dialog::prompt(&mut self.tui, "Edit", "File name:", "")? else {
             return Ok(());
@@ -1407,7 +1466,7 @@ impl App {
             dialog::draw_message(&mut self.tui.screen, "Scanning", &lines, &[], 0, false);
             self.tui.draw()?;
             if let Some(Input::Key(key)) = self.tui.read(OP_TICK)? {
-                if key.code == KeyCode::Esc {
+                if cancels(key) {
                     cancel.store(true, Ordering::Relaxed);
                 }
             }
@@ -2248,7 +2307,7 @@ impl App {
             draw_progress(&mut self.tui.screen, title, &progress);
             self.tui.draw()?;
             if let Some(Input::Key(key)) = self.tui.read(OP_TICK)? {
-                if key.code == KeyCode::Esc {
+                if cancels(key) {
                     cancel.store(true, Ordering::Relaxed);
                 }
             }
@@ -2431,7 +2490,7 @@ impl App {
             dialog::draw_message(&mut self.tui.screen, "Find files", &lines, &[], 0, false);
             self.tui.draw()?;
             if let Some(Input::Key(key)) = self.tui.read(OP_TICK)? {
-                if key.code == KeyCode::Esc {
+                if cancels(key) {
                     cancel.store(true, Ordering::Relaxed);
                     break 'search;
                 }
@@ -2613,6 +2672,11 @@ impl App {
 }
 
 /// True when a prefilled attribute field holds a new value.
+/// The keys that stop a running operation.
+fn cancels(key: Key) -> bool {
+    key.code == KeyCode::Esc || (key.mods == CTRL && key.code == KeyCode::Char('c'))
+}
+
 /// A prefilled name left unchanged means that very file, even when it looks like
 /// a path: a file named `~` must not turn into the home folder.
 fn literal_if_unedited(here: bool, target: String, default: &str) -> String {

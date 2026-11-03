@@ -72,6 +72,16 @@ pub fn fixed_color(color: Color) -> Color {
     })
 }
 
+/// A colour for a terminal with only the basic colours: a highlight group may
+/// name one it cannot show.
+pub fn basic_color(color: Color) -> Color {
+    match color {
+        Color::AnsiValue(n) if n >= 16 => Color::Cyan,
+        Color::Rgb { .. } => Color::Cyan,
+        other => other,
+    }
+}
+
 /// Whether the terminal has the 256 colours `fixed_color` needs.
 pub fn has_fixed_colors(term: Option<&str>, colorterm: bool, windows_terminal: bool) -> bool {
     colorterm || windows_terminal || term.is_some_and(|t| t.contains("256color"))
@@ -83,12 +93,7 @@ pub mod theme {
     use crossterm::style::Color::*;
 
     pub const PANEL: Style = Style::new(Cyan, DarkBlue);
-    pub const PANEL_DIR: Style = Style::new(White, DarkBlue);
-    pub const PANEL_EXEC: Style = Style::new(Green, DarkBlue);
     pub const PANEL_LINK: Style = Style::new(Grey, DarkBlue);
-    pub const PANEL_HIDDEN: Style = Style::new(DarkCyan, DarkBlue);
-    pub const PANEL_ARCHIVE: Style = Style::new(Magenta, DarkBlue);
-    pub const PANEL_TEMP: Style = Style::new(DarkYellow, DarkBlue);
     pub const PANEL_SELECTED: Style = Style::new(Yellow, DarkBlue);
     pub const PANEL_CURSOR: Style = Style::new(Black, DarkCyan);
     pub const PANEL_CURSOR_SELECTED: Style = Style::new(Yellow, DarkCyan);
@@ -537,7 +542,7 @@ impl Tui {
                     let (fg, bg) = if self.fixed_colors {
                         (fixed_color(cell.style.fg), fixed_color(cell.style.bg))
                     } else {
-                        (cell.style.fg, cell.style.bg)
+                        (basic_color(cell.style.fg), basic_color(cell.style.bg))
                     };
                     queue!(
                         buf,
@@ -770,6 +775,14 @@ mod tests {
         assert!(has_fixed_colors(Some("xterm"), true, false));
         assert!(has_fixed_colors(None, false, true));
         assert!(!has_fixed_colors(Some("linux"), false, false));
+    }
+
+    #[test]
+    fn terminals_with_few_colours_get_only_basic_ones() {
+        assert_eq!(basic_color(Color::AnsiValue(215)), Color::Cyan);
+        assert_eq!(basic_color(Color::Rgb { r: 1, g: 2, b: 3 }), Color::Cyan);
+        assert_eq!(basic_color(Color::Magenta), Color::Magenta);
+        assert_eq!(fixed_color(Color::AnsiValue(215)), Color::AnsiValue(215));
     }
 
     #[test]
