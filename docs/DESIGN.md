@@ -92,7 +92,6 @@ From the first review, not yet fixed:
 - SIGTERM and SIGHUP leave the state folder behind, and that folder holds exported
   variables. The terminal itself is now restored.
 - `is_inside` compares paths, so it can miss on case-insensitive file systems.
-- Restoring the screen after a resize during some dialogs draws at the old size.
 - Wrapping a very long line is slow, and blocking files like `/proc/kmsg` can
   hang the viewer.
 
@@ -102,6 +101,9 @@ Other:
   hand, not in Windows Terminal. Paste has the least evidence: the decoder expects
   the bracketed paste markers as plain bytes.
 - `F3` does not count folders inside an archive.
+- A highlighting file of about 1 MB of masks costs some 3 ms per row on each draw.
+- Enter pressed several times quickly after `Shift+Del` answers the prompts that
+  follow, because keys are not discarded before a prompt.
 - Retry in an archive error dialog repeats the prompt, not the failed step,
   because archive data can be read only once.
 - Keeping a file's group on save and syncing during a move have no test. The first

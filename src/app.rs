@@ -1450,13 +1450,13 @@ impl App {
                 }
             }
             if finished {
-                self.tui.screen = backdrop;
+                self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
                 return Ok(());
             }
             while let Ok(path) = from_rx.try_recv() {
                 scanning = path;
             }
-            self.tui.screen = backdrop.clone();
+            self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
             let width = fixed_box_width(self.tui.screen.w);
             let lines = [
                 fit("Scanning the folder", width),
@@ -1589,7 +1589,11 @@ impl App {
             // The box shows a lossy name. Unedited, it would rename the file.
             return Ok(());
         }
-        let target = literal_if_unedited(here, target, &default);
+        // An unedited name renames nothing. It must not be read as a path either:
+        // a file named `~` would go to the home folder.
+        if here && target == default {
+            return Ok(());
+        }
         let base = self.panels[self.active].path.clone();
         let dest_name = (sources.len() == 1)
             .then(|| fsops::resolve_dest(&sources[0], &target, &base, false))
@@ -2271,22 +2275,22 @@ impl App {
                         break;
                     }
                     Ok(ToUi::Overwrite(src, dst)) => {
-                        self.tui.screen = backdrop.clone();
+                        self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
                         let choice = self.ask_overwrite(&src, &dst)?;
                         let _ = to_worker.send(Reply::Overwrite(choice));
                     }
                     Ok(ToUi::Error(path, text)) => {
-                        self.tui.screen = backdrop.clone();
+                        self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
                         let choice = self.ask_error(&path, &text)?;
                         let _ = to_worker.send(Reply::Error(choice));
                     }
                     Ok(ToUi::Trash(path)) => {
-                        self.tui.screen = backdrop.clone();
+                        self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
                         let choice = self.ask_trash(&path)?;
                         let _ = to_worker.send(Reply::Trash(choice));
                     }
                     Ok(ToUi::ConfirmDelete(path, ask)) => {
-                        self.tui.screen = backdrop.clone();
+                        self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
                         let choice = self.ask_delete(&path, ask)?;
                         let _ = to_worker.send(Reply::Delete(choice));
                     }
@@ -2303,7 +2307,7 @@ impl App {
             if let Some(summary) = done {
                 break summary;
             }
-            self.tui.screen = backdrop.clone();
+            self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
             draw_progress(&mut self.tui.screen, title, &progress);
             self.tui.draw()?;
             if let Some(Input::Key(key)) = self.tui.read(OP_TICK)? {
@@ -2485,7 +2489,7 @@ impl App {
                     Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
-            self.tui.screen = backdrop.clone();
+            self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
             let lines = vec![format!("Found: {}. Esc stops the search.", hits.len())];
             dialog::draw_message(&mut self.tui.screen, "Find files", &lines, &[], 0, false);
             self.tui.draw()?;
@@ -2496,13 +2500,18 @@ impl App {
                 }
             }
         }
-        self.tui.screen = backdrop;
+        self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
         if hits.is_empty() {
             let lines = vec!["No files found.".to_string()];
             dialog::message(&mut self.tui, "Find files", &lines, &["OK"], false)?;
             return Ok(());
         }
-        let items: Vec<String> = hits.iter().map(|p| util::tilde(p)).collect();
+        // A menu cuts long text on the right, which would hide the file name.
+        let room = (self.tui.screen.w as usize).saturating_sub(10).max(10);
+        let items: Vec<String> = hits
+            .iter()
+            .map(|p| fit_left(&util::tilde(p), room))
+            .collect();
         let title = format!("Found {}. Enter goes to the file", hits.len());
         if let Some(i) = dialog::menu(&mut self.tui, &title, &items, 0)? {
             self.jump_to(&hits[i])?;
@@ -2628,7 +2637,7 @@ impl App {
                 _ => panel_menu(),
             };
             item = item.min(entries.len() - 1);
-            self.tui.screen = backdrop.clone();
+            self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
             self.tui.screen.cursor = None;
             draw_top_menu(&mut self.tui.screen, &titles, bar, &entries, item);
             self.tui.draw()?;
@@ -2653,7 +2662,7 @@ impl App {
                 _ => {}
             }
         };
-        self.tui.screen = backdrop;
+        self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
         let Some((bar, action)) = chosen else {
             return Ok(());
         };
@@ -2749,7 +2758,7 @@ fn add_then_remove(
             ..summary
         };
     }
-    fsops::delete_items(sources, true, ui)
+    fsops::remove_moved(sources, ui)
 }
 
 /// Maps the remaining hot keys to actions.

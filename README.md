@@ -116,8 +116,8 @@ clears everything that is not locked.
   With panels on screen it changes panel, as in Far.
 - Files highlighting is a text file, `~/.config/far_linux/highlight.ini`, not Far's
   dialog, and `F9`, Commands, Files highlighting opens it. It has Far's masks,
-  including `<name>` and `|` to exclude, and its four colours, but no marking
-  character or "continue processing". Deleting the file restores the defaults.
+  including `<name>` and `|` to exclude, and its four colours, but no regular
+  expression masks, marking character or "continue processing". Deleting the file restores the defaults.
 - The default groups are Far's: hidden (names starting with a dot), folders, `<arc>`,
   `<temp>` and executables, plus links, images, media, documents and source. Linux
   uses the execute permission rather than Far's `<exec>` masks, and it comes after

@@ -835,9 +835,22 @@ fn move_across<U: OpUi>(
 pub fn delete_items<U: OpUi>(sources: &[PathBuf], permanent: bool, ui: &mut U) -> OpSummary {
     let mut ctx = Ctx::new(ui, false);
     ctx.ask_read_only = permanent;
+    delete_with(ctx, sources, permanent)
+}
+
+/// Removes what has been moved elsewhere, such as into an archive. This is not
+/// a delete the user asked for, so it does not ask about each item.
+pub fn remove_moved<U: OpUi>(sources: &[PathBuf], ui: &mut U) -> OpSummary {
+    let mut ctx = Ctx::new(ui, false);
+    ctx.folders_all = Some(true);
+    delete_with(ctx, sources, true)
+}
+
+fn delete_with<U: OpUi>(mut ctx: Ctx<U>, sources: &[PathBuf], permanent: bool) -> OpSummary {
     prepare(&mut ctx, sources);
     let mut run = || -> Result<(), Cancelled> {
         for src in sources {
+            ctx.check()?;
             ctx.progress.from = src.clone();
             ctx.report();
             if is_nonempty_folder(src) {
@@ -1742,6 +1755,33 @@ mod tests {
         let path = d.write(name, "x");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
         path
+    }
+
+    #[test]
+    fn cancel_stops_a_trash_delete_too() {
+        let d = TestDir::new("del_trash_cancel");
+        let items = [d.write("a", "x"), d.write("b", "x")];
+        let mut ui = Script {
+            cancel_after_progress: Some(0),
+            ..Default::default()
+        };
+        let s = delete_items(&items, false, &mut ui);
+        assert!(s.cancelled);
+        assert!(items[0].exists() && items[1].exists());
+    }
+
+    #[test]
+    fn removing_moved_items_does_not_ask() {
+        let d = TestDir::new("del_moved");
+        let items = [folder_with_file(&d, "dir"), read_only_file(&d, "locked")];
+        let mut ui = Script {
+            delete: Some(DeleteChoice::Cancel),
+            ..Default::default()
+        };
+        let s = remove_moved(&items, &mut ui);
+        assert!(ui.confirms.is_empty());
+        assert_eq!(s.skipped, 0);
+        assert!(!items[0].exists() && !items[1].exists());
     }
 
     #[test]

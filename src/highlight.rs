@@ -89,6 +89,9 @@ normal = 215
 
 /// Group references may nest, but not without end.
 const MOST_NESTING: u32 = 8;
+/// Masks looked at for one group. References can multiply at every level, so
+/// without this a small file could take forever or use up all memory.
+const MOST_MASKS: u32 = 20_000;
 const MOST_FILE_BYTES: u64 = 1024 * 1024;
 
 /// What a group can test about a file.
@@ -245,39 +248,105 @@ impl Masks {
     }
 }
 
-/// Splits a comma list into patterns, replacing `<name>` references. An
-/// excluded part inside a reference is ignored.
-fn expand(
-    list: &str,
-    named: &HashMap<String, String>,
-    depth: u32,
-    out: &mut Vec<Vec<Token>>,
-    problems: &mut Vec<String>,
-) {
-    for part in list.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+/// Splits text at a delimiter, keeping quoted masks and `[...]` sets whole.
+fn split_masks(text: &str, is_delimiter: impl Fn(char) -> bool) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quoted, mut in_set, mut in_regex) = (0, false, false, false);
+    for (i, c) in text.char_indices() {
+        match c {
+            // A regular expression holds | and commas of its own.
+            '/' if in_regex => in_regex = false,
+            '/' if text[start..i].trim().is_empty() => in_regex = true,
+            _ if in_regex => {}
+            '"' if !in_set => quoted = !quoted,
+            '[' if !quoted => in_set = true,
+            ']' if !quoted => in_set = false,
+            c if !quoted && !in_set && is_delimiter(c) => {
+                parts.push(&text[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&text[start..]);
+    parts
+}
+
+/// State while masks are expanded.
+struct Expansion<'a> {
+    named: &'a HashMap<String, String>,
+    budget: u32,
+    problems: Vec<String>,
+}
+
+/// Far's list delimiters are commas and semicolons. `<name>` is replaced by the
+/// masks it names, and an excluded part inside a reference is ignored.
+fn expand(list: &str, depth: u32, out: &mut Vec<Vec<Token>>, state: &mut Expansion) {
+    for part in split_masks(list, |c| c == ',' || c == ';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if state.budget == 0 {
+            return;
+        }
+        state.budget -= 1;
+        if state.budget == 0 {
+            state
+                .problems
+                .push("too many masks, so the rest are ignored".into());
+            return;
+        }
+        if part.len() > 1 && part.starts_with('/') && part.ends_with(['/', 'i']) {
+            state.problems.push(format!(
+                "regular expression masks are not supported: {part}"
+            ));
+            continue;
+        }
         let reference = part.strip_prefix('<').and_then(|p| p.strip_suffix('>'));
         let Some(name) = reference else {
-            out.push(parse_pattern(part));
+            let bare = part
+                .strip_prefix('"')
+                .and_then(|p| p.strip_suffix('"'))
+                .unwrap_or(part);
+            out.push(parse_pattern(bare));
             continue;
         };
-        match named.get(&name.to_lowercase()) {
+        match state.named.get(&name.to_lowercase()).cloned() {
             Some(_) if depth >= MOST_NESTING => {
-                problems.push(format!("masks nest too deeply at <{name}>"));
+                state
+                    .problems
+                    .push(format!("masks nest too deeply at <{name}>"));
             }
             Some(inner) => {
-                let inner = inner.split('|').next().unwrap_or("");
-                expand(inner, named, depth + 1, out, problems);
+                let parts = split_masks(&inner, |c| c == '|');
+                expand(parts[0], depth + 1, out, state);
             }
-            None => problems.push(format!("no masks named <{name}>")),
+            None => state.problems.push(format!("no masks named <{name}>")),
         }
     }
 }
 
+/// Far's rules: `|` may appear once, `|*.bak` means `*|*.bak`, and `*.*|` means
+/// `*.*`.
 fn compile(text: &str, named: &HashMap<String, String>, problems: &mut Vec<String>) -> Masks {
-    let (include, exclude) = text.split_once('|').unwrap_or((text, ""));
+    let parts = split_masks(text, |c| c == '|');
+    let include = if parts[0].trim().is_empty() {
+        "*"
+    } else {
+        parts[0]
+    };
+    let exclude = parts.get(1).copied().unwrap_or("");
+    let mut state = Expansion {
+        named,
+        budget: MOST_MASKS,
+        problems: Vec::new(),
+    };
     let mut masks = Masks::default();
-    expand(include, named, 0, &mut masks.include, problems);
-    expand(exclude, named, 0, &mut masks.exclude, problems);
+    expand(include, 0, &mut masks.include, &mut state);
+    expand(exclude, 0, &mut masks.exclude, &mut state);
+    state.problems.dedup();
+    problems.append(&mut state.problems);
     masks
 }
 
@@ -385,10 +454,15 @@ impl Highlight {
     /// Reads settings from a file. A file that does not exist means the
     /// defaults. A broken one must never stop the file manager.
     pub fn load(path: &Path) -> Highlight {
-        let too_big = fs::metadata(path).is_ok_and(|m| m.len() > MOST_FILE_BYTES);
-        if too_big {
+        // Opening a pipe here would wait for a writer and hang the start.
+        let unusable = match fs::metadata(path) {
+            Ok(m) if !m.is_file() => Some("is not a file"),
+            Ok(m) if m.len() > MOST_FILE_BYTES => Some("is too big"),
+            _ => None,
+        };
+        if let Some(why) = unusable {
             let mut h = Highlight::default();
-            h.problems.push(format!("{} is too big", path.display()));
+            h.problems.push(format!("{} {why}", path.display()));
             return h;
         }
         match fs::read(path) {
@@ -652,6 +726,59 @@ mod tests {
         let h = Highlight::parse("[masks]\na = <b>\nb = <a>\n[group]\nmask = <a>\nnormal = red\n");
         assert_eq!(h.problems.len(), 1, "{:?}", h.problems);
         assert_eq!(h.colors(&file("x")).normal, None);
+    }
+
+    #[test]
+    fn masks_that_multiply_at_every_level_stop_quickly() {
+        let mut text = String::from("[masks]\n");
+        for level in 0..6 {
+            let refs = vec![format!("<m{}>", level + 1); 20].join(",");
+            text.push_str(&format!("m{level} = {refs}\n"));
+        }
+        text.push_str("m6 = *.a\n[group]\nmask = <m0>\nnormal = red\n");
+        let start = std::time::Instant::now();
+        let h = Highlight::parse(&text);
+        assert!(start.elapsed().as_secs() < 2, "{:?}", start.elapsed());
+        assert!(h.problems.iter().any(|p| p.contains("too many masks")));
+        assert_eq!(h.colors(&file("x.a")).normal, Some(Color::Red));
+    }
+
+    #[test]
+    fn far_mask_list_syntax() {
+        let normal = |list: &str, name: &str| {
+            let h = Highlight::parse(&format!("[group]\nmask = {list}\nnormal = red\n"));
+            h.colors(&file(name)).normal.is_some()
+        };
+        // From the help: delimiters, quotes and the exclude mask.
+        assert!(normal("*.a;*.b", "x.b"));
+        assert!(normal("*.a,*.b", "x.b"));
+        assert!(normal("\"a,b.txt\",*.c", "a,b.txt"));
+        assert!(normal("[,;]x", ";x"));
+        assert!(normal("|*.bak", "x.txt"));
+        assert!(!normal("|*.bak", "x.bak"));
+        assert!(normal("*.*|", "x"));
+        // A second | is ignored along with what follows it.
+        assert!(!normal("*.*|*.bak|*.tmp", "x.bak"));
+        assert!(normal("*.*|*.bak|*.tmp", "x.tmp"));
+    }
+
+    #[test]
+    fn unsupported_regular_expression_masks_are_reported() {
+        let h = Highlight::parse("[group]\nmask = /(eng|rus)/i\nnormal = red\n");
+        assert!(h.problems.iter().any(|p| p.contains("regular expression")));
+    }
+
+    #[test]
+    fn a_settings_file_that_is_a_pipe_does_not_hang() {
+        let dir = std::env::temp_dir().join(format!("far_hl_fifo_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir(&dir).unwrap();
+        let fifo = dir.join("highlight.ini");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(!Highlight::load(&fifo).problems.is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

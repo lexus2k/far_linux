@@ -339,6 +339,9 @@ fn through_links(path: &Path) -> io::Result<PathBuf> {
 pub fn write_file(path: &Path, data: &[u8]) -> io::Result<()> {
     let real = through_links(path)?;
     let existing = fs::metadata(&real).ok();
+    if existing.as_ref().is_some_and(|m| !m.is_file()) {
+        return Err(io::Error::other("this is not a regular file"));
+    }
     let in_place = existing
         .as_ref()
         // SAFETY: geteuid has no preconditions.
@@ -2440,6 +2443,20 @@ mod tests {
             bom: false,
         };
         assert!(encode_file("日本語", &format).is_err());
+    }
+
+    #[test]
+    fn saving_over_something_that_is_not_a_file_is_refused() {
+        use std::os::unix::fs::FileTypeExt;
+        let dir = temp_dir("not_file");
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: `c` is a valid path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(write_file(&fifo, b"x").is_err());
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+        assert!(write_file(&dir, b"x").is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

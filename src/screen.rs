@@ -461,12 +461,31 @@ impl Tui {
             )?;
         }
         if self.win32.is_some() {
+            self.adopt_queued_input()?;
             execute!(out, Print(input::ENABLE))?;
         }
         self.on_alt = true;
         self.last = None;
         let (w, h) = terminal::size()?;
         self.screen = Screen::new(w, h);
+        Ok(())
+    }
+
+    /// crossterm reads ahead. Anything it holds now would otherwise wait until the
+    /// next console visit and act then, so it moves to the other reader, in order.
+    fn adopt_queued_input(&mut self) -> io::Result<()> {
+        while event::poll(Duration::ZERO)? {
+            let input = match event::read()? {
+                Event::Key(k) if k.kind != KeyEventKind::Release => {
+                    Input::Key(normalize_key(k.code, k.modifiers, self.kitty))
+                }
+                Event::Paste(text) => Input::Paste(text),
+                _ => continue,
+            };
+            if let Some(reader) = &mut self.win32 {
+                reader.queue(input);
+            }
+        }
         Ok(())
     }
 
@@ -684,8 +703,11 @@ pub fn install_signal_restore() {
             let _ = SAVED_TERMIOS.set(saved);
         }
         let handler = restore_and_die as extern "C" fn(libc::c_int) as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGHUP, handler);
+        // While a command runs, `shell.rs` ignores SIGINT and SIGQUIT and then puts
+        // this handler back.
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+            libc::signal(signal, handler);
+        }
     }
 }
 

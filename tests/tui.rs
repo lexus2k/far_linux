@@ -1208,3 +1208,69 @@ fn the_menu_opens_the_settings_as_the_defaults_and_applies_them_on_close() {
     s.wait("a.zip");
     s.wait_for("new colour", |_| has_color(&s, "123", "a.zip"));
 }
+
+#[test]
+fn ctrl_letters_do_not_answer_a_delete_prompt() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/full")).unwrap();
+        fs::write(root.join("left/full/inner"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("full");
+    s.keys(&["Down", "S-DC"]);
+    s.wait("Permanently delete");
+    s.keys(&["Enter"]);
+    s.wait("The following folder will be deleted:");
+    s.keys(&["C-a", "C-d"]);
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(s.p("left/full/inner").exists());
+    assert!(s.screen().contains("will be deleted"), "{}", s.screen());
+    s.keys(&["Escape"]);
+    s.wait_gone("will be deleted");
+    assert!(s.p("left/full/inner").exists());
+}
+
+#[test]
+fn resizing_at_a_prompt_during_an_operation_leaves_a_clean_screen() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/full")).unwrap();
+        fs::write(root.join("left/full/inner"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("full");
+    s.keys(&["Down", "S-DC"]);
+    s.wait("Permanently delete");
+    s.keys(&["Enter"]);
+    s.wait("will be deleted");
+    s.tmux(&["resize-window", "-t", "t", "-x", "70", "-y", "30"]);
+    std::thread::sleep(Duration::from_millis(200));
+    s.keys(&["Escape"]);
+    s.wait_gone("will be deleted");
+    s.wait("5Copy");
+    let screen = s.screen();
+    let top = screen.lines().next().unwrap_or("");
+    assert!(
+        top.chars().count() <= 70 && top.starts_with('╔'),
+        "{screen}"
+    );
+    assert!(
+        screen.lines().any(|l| l.trim_end().ends_with('╝')),
+        "{screen}"
+    );
+}
+
+#[test]
+fn keys_typed_on_the_console_do_not_wait_for_a_later_visit() {
+    let Some(s) = Session::start_with(WIN32, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text(&win32_key(0x4F, 15, LEFT_CTRL));
+    s.wait_gone("5Copy");
+    // One write holding Ctrl+O and more: crossterm reads it all at once.
+    s.text("\x0ftouch typed_ahead\r");
+    s.wait_file(&s.p("left/typed_ahead"), true);
+    s.wait("5Copy");
+}

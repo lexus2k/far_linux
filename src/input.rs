@@ -29,6 +29,9 @@ const SHIFT_PRESSED: u32 = 0x10;
 const PROBE_TIME: Duration = Duration::from_millis(300);
 /// How often `Reader::read` wakes to notice a resized terminal.
 const SLICE: Duration = Duration::from_millis(50);
+/// Silence after which input held back is given up on. Windows Terminal sends
+/// each event whole, but a slow link can split one.
+const GIVE_UP_AFTER: Duration = Duration::from_millis(500);
 
 fn mods_from(state: u32) -> KeyModifiers {
     let mut mods = NONE;
@@ -104,10 +107,14 @@ fn translate(vk: u32, ch: Option<char>, state: u32) -> Option<Key> {
             return Some(normalize_key(KeyCode::Char(c), NONE, true));
         }
     }
+    // Without Ctrl or Alt, no character means nothing was typed, as with the
+    // first press of a dead key.
     let c = if mods.contains(CTRL) {
         key_char(vk).or(text)
-    } else {
+    } else if mods.contains(ALT) {
         text.or_else(|| key_char(vk))
+    } else {
+        text
     }?;
     Some(normalize_key(KeyCode::Char(c), mods, true))
 }
@@ -137,10 +144,15 @@ impl Decoder {
         out
     }
 
-    /// A lone Esc byte is held back in case more of a sequence follows. Called
-    /// when nothing more arrived.
+    /// Called when nothing more arrived for a while. A lone Esc byte was held
+    /// back in case more of a sequence followed. A paste whose end marker never
+    /// came must not swallow every later key, so it ends here.
     pub fn flush(&mut self) -> Vec<Input> {
-        if self.paste.is_none() && self.buf == [0x1b] {
+        if let Some(mut text) = self.paste.take() {
+            text.append(&mut self.buf);
+            return vec![Input::Paste(String::from_utf8_lossy(&text).into_owned())];
+        }
+        if self.buf == [0x1b] {
             self.buf.clear();
             return vec![Input::Key(normalize_key(KeyCode::Esc, NONE, true))];
         }
@@ -190,13 +202,19 @@ impl Decoder {
                 return true;
             }
         }
-        let Some(len) = self.buf[2..]
+        // Parameter bytes end at a final byte. Anything else means this was not
+        // a sequence at all, and must not swallow the real one that follows.
+        let Some(at) = self.buf[2..]
             .iter()
-            .position(|b| (0x40..=0x7e).contains(b))
-            .map(|i| i + 3)
+            .position(|b| !(0x20..=0x3f).contains(b))
         else {
             return false;
         };
+        if !(0x40..=0x7e).contains(&self.buf[2 + at]) {
+            self.buf.drain(..2 + at);
+            return true;
+        }
+        let len = at + 3;
         if self.buf[..len] == *PASTE_START {
             self.buf.drain(..len);
             self.paste = Some(Vec::new());
@@ -240,6 +258,15 @@ impl Decoder {
             0xF0..=0xF7 => 4,
             _ => 1,
         };
+        // A broken character must not eat the sequence after it.
+        let broken = self.buf[1..]
+            .iter()
+            .take(need - 1)
+            .any(|b| b & 0xC0 != 0x80);
+        if broken {
+            self.buf.remove(0);
+            return true;
+        }
         if self.buf.len() < need {
             return false;
         }
@@ -278,8 +305,8 @@ impl Decoder {
                 return;
             }
             0xDC00..=0xDFFF => {
-                let high = self.high.take().unwrap_or(0xD800);
-                char::from_u32(0x10000 + ((high - 0xD800) << 10) + (unit - 0xDC00))
+                let high = self.high.take();
+                high.and_then(|h| char::from_u32(0x10000 + ((h - 0xD800) << 10) + (unit - 0xDC00)))
             }
             0 => None,
             _ => char::from_u32(unit),
@@ -339,6 +366,7 @@ fn read_stdin(buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
 pub struct Reader {
     decoder: Decoder,
     pending: VecDeque<Input>,
+    last_bytes: Option<Instant>,
 }
 
 impl Reader {
@@ -354,13 +382,25 @@ impl Reader {
         }
         let mut buf = [0u8; 4096];
         let got = read_stdin(&mut buf, timeout.min(SLICE))?;
-        let items = if got > 0 {
-            self.decoder.feed(&buf[..got])
-        } else {
-            self.decoder.flush()
-        };
-        self.pending.extend(items);
+        if got > 0 {
+            self.last_bytes = Some(Instant::now());
+            let items = self.decoder.feed(&buf[..got]);
+            self.pending.extend(items);
+        } else if self
+            .last_bytes
+            .is_some_and(|t| t.elapsed() >= GIVE_UP_AFTER)
+        {
+            self.last_bytes = None;
+            let items = self.decoder.flush();
+            self.pending.extend(items);
+        }
         Ok(self.pending.pop_front())
+    }
+
+    /// Queues input that arrived before this reader took over, ahead of newer
+    /// input.
+    pub fn queue(&mut self, input: Input) {
+        self.pending.push_back(input);
     }
 }
 
@@ -430,6 +470,8 @@ pub fn try_enable() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const ALT_BITS: u32 = LEFT_ALT;
 
     fn press(vk: u32, unit: u32, state: u32) -> String {
         format!("\x1b[{vk};0;{unit};1;{state};1_")
@@ -577,6 +619,49 @@ mod tests {
         assert_eq!(d.feed(b"\x1b"), vec![]);
         assert_eq!(d.flush().len(), 1);
         assert_eq!(d.flush().len(), 0);
+    }
+
+    #[test]
+    fn a_broken_start_does_not_swallow_the_key_after_it() {
+        let event = press(0x41, 97, 0);
+        assert_eq!(
+            keys(&format!("\x1b[{event}")),
+            vec![(KeyCode::Char('a'), NONE)]
+        );
+        let mut d = Decoder::new();
+        let mut bytes = vec![0xC3];
+        bytes.extend_from_slice(event.as_bytes());
+        let got = d.feed(&bytes);
+        assert_eq!(got.len(), 1, "{got:?}");
+    }
+
+    #[test]
+    fn a_character_split_across_reads_still_arrives() {
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(&[0xD1]), vec![]);
+        assert_eq!(d.feed(&[0x8F]).len(), 1);
+    }
+
+    #[test]
+    fn a_paste_without_its_end_marker_ends_when_input_stops() {
+        let mut d = Decoder::new();
+        assert_eq!(d.feed(b"\x1b[200~text"), vec![]);
+        assert_eq!(d.flush(), vec![Input::Paste("text".to_string())]);
+        assert_eq!(d.feed(press(0x41, 97, 0).as_bytes()).len(), 1);
+    }
+
+    #[test]
+    fn a_lone_low_surrogate_types_nothing() {
+        assert_eq!(keys(&press(0, 0xDE00, 0)), vec![]);
+    }
+
+    #[test]
+    fn a_dead_key_types_nothing_until_it_makes_a_character() {
+        assert_eq!(keys(&press(0xDE, 0, 0)), vec![]);
+        assert_eq!(
+            keys(&press(0x41, 0, ALT_BITS)),
+            vec![(KeyCode::Char('a'), ALT)]
+        );
     }
 
     #[test]
