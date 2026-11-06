@@ -263,6 +263,37 @@ pub struct Form {
     buttons: Vec<String>,
     db: Option<Rc<History>>,
     on_change: Option<OnChange>,
+    /// Far's AutoComplete: earlier entries matching what is typed in a text
+    /// box with a history, shown as a list under it.
+    suggest: Option<Suggest>,
+}
+
+/// The AutoComplete list of the text box `field`.
+struct Suggest {
+    field: usize,
+    items: Vec<String>,
+    /// The highlighted item. None until Down is pressed, so that Enter still
+    /// confirms the dialog.
+    chosen: Option<usize>,
+}
+
+/// Most entries the AutoComplete list shows.
+const SUGGEST_ROWS: usize = 8;
+
+/// History entries that start with `typed`, ignoring case, newest first, as
+/// Far's AutoComplete lists them. Nothing for empty text, or when the only
+/// match is the text itself.
+pub fn suggestions(history: &[String], typed: &str) -> Vec<String> {
+    if typed.is_empty() {
+        return Vec::new();
+    }
+    let lower = typed.to_lowercase();
+    let found: Vec<String> = history
+        .iter()
+        .filter(|h| h.to_lowercase().starts_with(&lower) && h.as_str() != typed)
+        .cloned()
+        .collect();
+    found
 }
 
 impl Form {
@@ -272,7 +303,87 @@ impl Form {
             buttons: Vec::new(),
             db: None,
             on_change: None,
+            suggest: None,
         }
+    }
+
+    /// Updates the AutoComplete list after the text of `focus` may have
+    /// changed.
+    fn refresh_suggest(&mut self, focus: usize) {
+        let Some(db) = &self.db else {
+            return;
+        };
+        let Some(Field::Text {
+            edit,
+            history: Some(kind),
+            ..
+        }) = self.fields.get(focus)
+        else {
+            self.suggest = None;
+            return;
+        };
+        let items = suggestions(&db.list(*kind), &edit.text());
+        self.suggest = (!items.is_empty()).then_some(Suggest {
+            field: focus,
+            items,
+            chosen: None,
+        });
+    }
+
+    /// Keys for an open AutoComplete list. Returns true when the key was used.
+    fn suggest_key(&mut self, key: Key) -> bool {
+        let Some(list) = &mut self.suggest else {
+            return false;
+        };
+        let last = list.items.len().min(SUGGEST_ROWS).saturating_sub(1);
+        match (key.code, key.mods) {
+            (KeyCode::Down, NONE) => {
+                list.chosen = Some(list.chosen.map_or(0, |c| (c + 1).min(last)));
+            }
+            (KeyCode::Up, NONE) => list.chosen = list.chosen.and_then(|c| c.checked_sub(1)),
+            (KeyCode::Esc, _) => self.suggest = None,
+            (KeyCode::Enter, _) => {
+                let Some(chosen) = list.chosen else {
+                    return false;
+                };
+                let (field, value) = (list.field, list.items[chosen].clone());
+                if let Some(Field::Text { edit, .. }) = self.fields.get_mut(field) {
+                    edit.set(&value);
+                }
+                self.suggest = None;
+            }
+            (KeyCode::Delete, SHIFT) => {
+                let Some(chosen) = list.chosen else {
+                    return false;
+                };
+                let field = list.field;
+                let value = list.items[chosen].clone();
+                if let (
+                    Some(db),
+                    Some(Field::Text {
+                        history: Some(kind),
+                        ..
+                    }),
+                ) = (&self.db, self.fields.get(field))
+                {
+                    db.remove(*kind, &value);
+                }
+                self.refresh_suggest(field);
+            }
+            _ => return false,
+        }
+        true
+    }
+
+    /// Ctrl+End: completes the text with the first match, as Far does when
+    /// AutoComplete is off.
+    fn complete_first(&mut self, focus: usize) {
+        self.refresh_suggest(focus);
+        let first = self.suggest.as_ref().map(|s| s.items[0].clone());
+        if let (Some(value), Some(Field::Text { edit, .. })) = (first, self.fields.get_mut(focus)) {
+            edit.set(&value);
+        }
+        self.suggest = None;
     }
 
     /// Runs `f` after each key, with the fields and the focused index.
@@ -343,10 +454,20 @@ impl Form {
                         edit.insert_str(&text);
                     }
                     self.changed(focus);
+                    self.refresh_suggest(focus);
                     continue;
                 }
                 _ => continue,
             };
+            if self.suggest.as_ref().is_some_and(|s| s.field == focus) && self.suggest_key(key) {
+                continue;
+            }
+            if key.code == KeyCode::End && key.mods == CTRL {
+                self.complete_first(focus);
+                continue;
+            }
+            let before = self.text(focus.min(self.fields.len().saturating_sub(1)));
+            let was = focus;
             let on_button = focus.checked_sub(self.fields.len());
             match (key.code, key.mods) {
                 (KeyCode::Esc, _) | (KeyCode::F(10), _) => {
@@ -429,6 +550,11 @@ impl Form {
                 },
             }
             self.changed(focus);
+            if focus != was {
+                self.suggest = None;
+            } else if focus < self.fields.len() && self.text(focus) != before {
+                self.refresh_suggest(focus);
+            }
         }
     }
 
@@ -468,6 +594,13 @@ impl Form {
     }
 
     fn draw(&self, s: &mut Screen, title: &str, focus: usize) {
+        if let (Some((x, y, w)), Some(list)) = (self.draw_form(s, title, focus), &self.suggest) {
+            draw_suggest(s, x, y, w, list);
+        }
+    }
+
+    /// Draws the form, returning where an open AutoComplete list goes.
+    fn draw_form(&self, s: &mut Screen, title: &str, focus: usize) -> Option<(u16, u16, u16)> {
         let w = s.w.saturating_sub(8).clamp(20, 72);
         let inner = w.saturating_sub(6) as usize;
         let button_rows = self.button_rows(inner);
@@ -479,6 +612,7 @@ impl Form {
         s.title(x + 1, y, w.saturating_sub(2), title, theme::DIALOG);
         let mut row = y + 1;
         s.cursor = None;
+        let mut list_at = None;
         for (i, field) in self.fields.iter().enumerate() {
             match field {
                 Field::Label(text) => {
@@ -493,6 +627,9 @@ impl Form {
                     s.put(x + 3, row, &fit(&visible, inner), theme::INPUT);
                     if i == focus {
                         s.cursor = Some((x + 3 + cursor as u16, row));
+                    }
+                    if self.suggest.as_ref().is_some_and(|l| l.field == i) {
+                        list_at = Some((x + 3, row + 1, inner as u16));
                     }
                     row += 1;
                 }
@@ -544,7 +681,7 @@ impl Form {
             let hint = "[ OK: Enter ]  [ Cancel: Esc ]";
             let bx = x + w.saturating_sub(str_width(hint) as u16) / 2;
             s.put(bx, row, hint, theme::DIALOG);
-            return;
+            return list_at;
         }
         for indexes in button_rows {
             let total: usize = indexes.iter().map(|i| self.button_width(*i) + 1).sum();
@@ -560,6 +697,7 @@ impl Form {
             }
             row += 1;
         }
+        list_at
     }
 
     fn button_width(&self, index: usize) -> usize {
@@ -582,6 +720,37 @@ impl Form {
             used += width;
         }
         rows
+    }
+}
+
+/// Draws the AutoComplete list with its top left at `x`, `y`, as a framed
+/// list over whatever is below the text box.
+fn draw_suggest(s: &mut Screen, x: u16, y: u16, w: u16, list: &Suggest) {
+    let shown = &list.items[..list.items.len().min(SUGGEST_ROWS)];
+    let h = shown.len() as u16 + 2;
+    // Above the box when there is no room below.
+    let y = if y + h > s.h && y > h + 1 {
+        y - h - 1
+    } else {
+        y
+    };
+    s.fill(x, y, w, h, ' ', theme::DIALOG);
+    s.frame(x, y, w, h, false, theme::DIALOG);
+    let inner = w.saturating_sub(2) as usize;
+    for (i, item) in shown.iter().enumerate() {
+        let style = if list.chosen == Some(i) {
+            theme::DIALOG_FOCUS
+        } else {
+            theme::DIALOG
+        };
+        let text = fit_left(item, inner);
+        let fill = inner.saturating_sub(str_width(&text));
+        s.put(
+            x + 1,
+            y + 1 + i as u16,
+            &format!("{text}{}", " ".repeat(fill)),
+            style,
+        );
     }
 }
 
@@ -919,5 +1088,73 @@ mod tests {
                 form.draw(&mut s, "Form title", 3);
             }
         }
+    }
+
+    #[test]
+    fn suggestions_match_the_start_ignoring_case_newest_first() {
+        let history: Vec<String> = ["*.log", "*.LOG.1", "*.txt", "*.l"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(suggestions(&history, "*.l"), ["*.log", "*.LOG.1"]);
+        assert!(suggestions(&history, "").is_empty());
+        assert!(suggestions(&history, "*.txt").is_empty(), "the text itself");
+        assert!(suggestions(&history, "x").is_empty());
+    }
+
+    #[test]
+    fn autocomplete_list_follows_typing_and_enter_takes_an_entry() {
+        let db = Rc::new(History::in_memory());
+        db.add(Kind::FindMask, "*.cpp");
+        db.add(Kind::FindMask, "*.log");
+        let mut form =
+            Form::new(vec![Field::with_history("Mask:", "", Kind::FindMask)]).with_db(&db);
+        let key = |code| Key { code, mods: NONE };
+        if let Field::Text { edit, .. } = &mut form.fields[0] {
+            edit.set("*.");
+        }
+        form.refresh_suggest(0);
+        let list = form.suggest.as_ref().unwrap();
+        assert_eq!(list.items, ["*.log", "*.cpp"]);
+        // Enter with nothing chosen is left to the dialog, to confirm it.
+        assert!(!form.suggest_key(key(KeyCode::Enter)));
+        assert!(form.suggest_key(key(KeyCode::Down)));
+        assert!(form.suggest_key(key(KeyCode::Down)));
+        assert!(form.suggest_key(key(KeyCode::Enter)));
+        assert_eq!(form.text(0), "*.cpp");
+        assert!(form.suggest.is_none());
+        // Shift+Del removes the chosen entry from the history.
+        form.fields[0] = Field::with_history("Mask:", "*.", Kind::FindMask);
+        form.refresh_suggest(0);
+        form.suggest_key(key(KeyCode::Down));
+        form.suggest_key(Key {
+            code: KeyCode::Delete,
+            mods: SHIFT,
+        });
+        assert_eq!(db.list(Kind::FindMask), ["*.cpp"]);
+        assert_eq!(form.suggest.as_ref().unwrap().items, ["*.cpp"]);
+        // Esc closes only the list.
+        assert!(form.suggest_key(key(KeyCode::Esc)));
+        assert!(form.suggest.is_none());
+        // Ctrl+End completes from the first match.
+        form.complete_first(0);
+        assert_eq!(form.text(0), "*.cpp");
+    }
+
+    #[test]
+    fn the_autocomplete_list_is_drawn_under_its_box() {
+        let db = Rc::new(History::in_memory());
+        db.add(Kind::FindMask, "*.log");
+        let mut form =
+            Form::new(vec![Field::with_history("Mask:", "*.", Kind::FindMask)]).with_db(&db);
+        form.refresh_suggest(0);
+        let mut s = Screen::new(80, 20);
+        form.draw(&mut s, "Find", 0);
+        let rows: Vec<String> = (0..s.h).map(|y| s.row_text(y)).collect();
+        let input = rows
+            .iter()
+            .position(|r| r.contains("*.") && !r.contains("*.log"))
+            .unwrap();
+        assert!(rows[input + 2].contains("*.log"), "{rows:#?}");
     }
 }
