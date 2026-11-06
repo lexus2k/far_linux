@@ -111,7 +111,10 @@ jobs:
             out=$(far --version)
           fi
           echo "$out"
-          test "$out" = "far_linux $VERSION"
+          case "$out" in
+            "far_linux $VERSION "*) ;;
+            *) echo "::error::Expected far_linux $VERSION, got: $out"; exit 1 ;;
+          esac
       - uses: actions/upload-artifact@v4
         with:
           name: deb-${{ matrix.arch }}

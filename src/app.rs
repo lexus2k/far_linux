@@ -92,6 +92,7 @@ pub enum Action {
     Info,
     QuickView,
     Help,
+    About,
     DeleteCurrent,
     ArchiveAdd,
     ArchiveExtract,
@@ -159,12 +160,14 @@ fn commands_menu() -> Vec<MenuItem> {
         ("Key bar on/off", "Ctrl+B", Action::ToggleKeybar),
         ("Files highlighting", "F9", Action::Highlighting),
         ("Help", "F1", Action::Help),
+        ("Version information", "far:about", Action::About),
         ("Quit", "F10", Action::Quit),
     ]
 }
 
 const HELP: &[(&str, &str)] = &[
     ("F9, Commands", "Files highlighting: edit the colour groups"),
+    ("far:about", "Version information, typed as a command"),
     ("Ctrl+C", "Clear the command line, or cancel an operation"),
     ("Archives", ""),
     ("Enter, Ctrl+PgDn", "Open the archive under the cursor"),
@@ -409,6 +412,8 @@ pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
     screen::install_panic_hook();
     screen::install_signal_restore();
     let shell = Shell::new()?;
+    // Far greets the console with its version, where Ctrl+O shows it later.
+    println!("{}", version_line());
     let tui = Tui::new()?;
     let db = Rc::new(History::open_default());
     let oldest_first = |kind| -> Vec<String> {
@@ -978,6 +983,16 @@ impl App {
             self.quit = true;
             return Ok(());
         }
+        if is_about_command(command) {
+            dialog::message(
+                &mut self.tui,
+                "Version information",
+                &about_lines(),
+                &["OK"],
+                false,
+            )?;
+            return Ok(());
+        }
         self.tui.show_console()?;
         let result = self.run_on_console(command);
         self.tui.enter()?;
@@ -1078,6 +1093,9 @@ impl App {
                     } else if is_exit_command(&text) {
                         self.quit = true;
                         return Ok(());
+                    } else if is_about_command(&text) {
+                        let lines = about_lines().join("\r\n");
+                        execute!(out, Print(format!("{prompt}{text}\r\n{lines}\r\n")))?;
                     } else {
                         self.run_on_console(&text)?;
                     }
@@ -1205,6 +1223,15 @@ impl App {
             Action::Info => self.toggle_overlay(Overlay::Info),
             Action::QuickView => self.toggle_overlay(Overlay::QuickView),
             Action::Help => self.help()?,
+            Action::About => {
+                dialog::message(
+                    &mut self.tui,
+                    "Version information",
+                    &about_lines(),
+                    &["OK"],
+                    false,
+                )?;
+            }
             Action::Highlighting => self.edit_highlighting()?,
             Action::Quit => {
                 let lines = vec!["Do you want to quit?".to_string()];
@@ -2716,6 +2743,40 @@ fn is_exit_command(command: &str) -> bool {
         && words.next().is_none()
 }
 
+/// `far:about`, Far's command for version information.
+fn is_about_command(command: &str) -> bool {
+    command.trim() == "far:about"
+}
+
+/// The version and architecture, as on Far's start-up banner.
+pub fn version_line() -> String {
+    format!(
+        "far_linux {} {}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::ARCH
+    )
+}
+
+/// What `far:about` shows: as Far does, the version, the platform and the
+/// libraries in use.
+fn about_lines() -> Vec<String> {
+    let mut lines = vec![
+        version_line(),
+        env!("CARGO_PKG_DESCRIPTION").to_string(),
+        String::new(),
+        format!("SQLite {}", rusqlite::version()),
+    ];
+    // A few to a line, so that the box fits a narrow terminal.
+    let libraries: Vec<&str> = env!("FAR_LIBRARIES").split(", ").collect();
+    lines.extend(libraries.chunks(3).map(|c| c.join(", ")));
+    lines.extend([
+        String::new(),
+        "MIT licence. Colours follow the Colorer library.".to_string(),
+        env!("CARGO_PKG_REPOSITORY").to_string(),
+    ]);
+    lines
+}
+
 /// Lays out names in columns for the console, one screen's worth at most.
 fn choice_table(names: &[String], width: usize) -> String {
     const MOST: usize = 200;
@@ -3229,5 +3290,21 @@ mod tests {
         assert!(!cancels(key(KeyCode::Char('c'), NONE)));
         assert!(!cancels(key(KeyCode::Char('c'), ALT)));
         assert!(!cancels(key(KeyCode::Enter, NONE)));
+    }
+
+    #[test]
+    fn far_about_names_the_version_and_libraries() {
+        assert!(is_about_command("far:about"));
+        assert!(is_about_command("  far:about "));
+        assert!(!is_about_command("far:about now"));
+        assert!(!is_about_command("echo far:about"));
+        let lines = about_lines();
+        assert!(lines[0].starts_with(&format!("far_linux {}", env!("CARGO_PKG_VERSION"))));
+        assert!(lines.iter().any(|l| l.starts_with("SQLite 3.")));
+        for lib in ["crossterm", "syntect", "rusqlite", "zip"] {
+            assert!(lines.iter().any(|l| l.contains(lib)), "{lib}");
+        }
+        let all = lines.join(", ");
+        assert_eq!(all.matches("fancy-regex ").count(), 1, "{all}");
     }
 }

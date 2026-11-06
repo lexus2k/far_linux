@@ -27,7 +27,7 @@ pub fn run() -> std::io::Result<()> {
         return Ok(());
     }
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("far_linux {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", app::version_line());
         return Ok(());
     }
     if args.iter().any(|a| a == "--keys") {
