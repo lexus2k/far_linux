@@ -1745,3 +1745,40 @@ fn ctrl_a_checkboxes_change_one_permission() {
         std::thread::sleep(Duration::from_millis(30));
     }
 }
+
+#[test]
+fn alt_f7_in_an_archive_searches_the_archive() {
+    use std::io::Write;
+    let Some(s) = Session::start(|root| {
+        let file = fs::File::create(root.join("left/pack.zip")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("deep/inner/wanted_entry.log", options)
+            .unwrap();
+        zip.write_all(b"needle").unwrap();
+        zip.start_file("other.txt", options).unwrap();
+        zip.write_all(b"hay").unwrap();
+        zip.finish().unwrap();
+        // Beside the archive, and not to be found from inside it.
+        fs::write(root.join("left/outside_entry.log"), "needle").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("pack.zip");
+    // ".." then outside_entry.log then pack.zip: End is the archive.
+    s.keys(&["End"]);
+    s.keys(&["Enter"]);
+    s.wait("pack.zip:/");
+    s.keys(&["M-F7"]);
+    s.wait("File mask");
+    s.text("*.log");
+    s.keys(&["Down"]);
+    s.text("needle");
+    s.keys(&["Enter"]);
+    s.wait("Found 1");
+    s.wait("pack.zip:/deep/inner/wanted_entry.log");
+    assert!(!s.screen().contains("outside_entry"), "{}", s.screen());
+    s.keys(&["Enter"]);
+    s.wait("pack.zip:/deep/inner");
+    s.wait("wanted_entry.log");
+}

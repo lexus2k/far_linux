@@ -961,6 +961,92 @@ fn report_outcome<U: OpUi>(
     }
 }
 
+/// Files a content search extracts at once. The scratch copies are removed
+/// before the next batch, so that a large archive does not fill the disk.
+const FIND_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Alt+F7 in an archive: finds entries from `folder` down whose name matches
+/// `masks`, and with `text`, files that contain it. Calls `found` with each
+/// archive path. Content is read from scratch copies made by `extract`, so the
+/// same safety rules apply as to any extraction.
+#[allow(clippy::too_many_arguments)]
+pub fn find<U: OpUi>(
+    path: &Path,
+    format: Format,
+    folder: &str,
+    masks: &str,
+    text: Option<&[u8]>,
+    ignore_case: bool,
+    ui: &mut U,
+    found: &mut dyn FnMut(String),
+) -> io::Result<()> {
+    let all = list(path, format)?;
+    // Folders that exist only as part of a deeper name are found too, as in a
+    // real folder.
+    let mut items: BTreeMap<String, &ArcEntry> = BTreeMap::new();
+    let mut implied: HashSet<String> = HashSet::new();
+    for entry in &all {
+        if !folder.is_empty() && !entry.path.starts_with(&format!("{folder}/")) {
+            continue;
+        }
+        items.insert(entry.path.clone(), entry);
+        let mut parent = entry.path.as_str();
+        while let Some((up, _)) = parent.rsplit_once('/') {
+            if up == folder || up.len() <= folder.len() {
+                break;
+            }
+            implied.insert(up.to_string());
+            parent = up;
+        }
+    }
+    let name_matches = |p: &str| util::wildcard_list(masks, p.rsplit('/').next().unwrap_or(p));
+    let Some(needle) = text.filter(|t| !t.is_empty()) else {
+        let mut names: Vec<&String> = items.keys().chain(implied.iter()).collect();
+        names.sort();
+        names.dedup();
+        for name in names.into_iter().filter(|n| name_matches(n)) {
+            if ui.cancelled() {
+                break;
+            }
+            found(name.clone());
+        }
+        return Ok(());
+    };
+    let files: Vec<&ArcEntry> = items
+        .values()
+        .copied()
+        .filter(|e| !e.is_dir && !e.is_link && name_matches(&e.path))
+        .collect();
+    let mut start = 0;
+    while start < files.len() && !ui.cancelled() {
+        let mut end = start;
+        let mut bytes = 0;
+        while end < files.len() && (end == start || bytes + files[end].size <= FIND_BATCH_BYTES) {
+            bytes += files[end].size;
+            end += 1;
+        }
+        let batch = &files[start..end];
+        start = end;
+        let scratch = ScratchDir::new()?;
+        let request = ExtractRequest {
+            items: batch.iter().map(|e| e.path.clone()).collect(),
+            base: String::new(),
+            dest: scratch.path().to_path_buf(),
+        };
+        extract(path, format, &request, ui);
+        let stop = || ui.cancelled();
+        for entry in batch {
+            let copy = scratch.path().join(&entry.path);
+            // A file `extract` refused, such as a hostile name, is not there.
+            let is_file = fs::symlink_metadata(&copy).is_ok_and(|m| m.is_file());
+            if is_file && fsops::file_contains(&copy, needle, ignore_case, &stop) {
+                found(entry.path.clone());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Reads the whole archive and returns how many items it holds.
 pub fn test(path: &Path, format: Format) -> io::Result<u64> {
     match format {
@@ -1742,6 +1828,91 @@ mod tests {
             let mode = fs::metadata(dest.join("src/top.txt")).unwrap().mode() & 0o777;
             assert_eq!(mode, 0o750, "{format:?}");
         }
+    }
+
+    fn found(
+        archive: &Path,
+        format: Format,
+        folder: &str,
+        masks: &str,
+        text: Option<&str>,
+    ) -> Vec<String> {
+        let mut hits = Vec::new();
+        let mut ui = Ui::default();
+        find(
+            archive,
+            format,
+            folder,
+            masks,
+            text.map(str::as_bytes),
+            true,
+            &mut ui,
+            &mut |p| hits.push(p),
+        )
+        .unwrap();
+        assert!(ui.errors.is_empty(), "{format:?}: {:?}", ui.errors);
+        hits
+    }
+
+    #[test]
+    fn find_searches_names_and_contents_inside_the_archive() {
+        for format in formats() {
+            let d = TestDir::new("find");
+            d.write("a/b/one.txt", "needle here");
+            d.write("a/b/two.log", "nothing");
+            d.write("a/three.txt", "NEEDLE too");
+            let archive = d.p(&format!("x.{}", format.extension()));
+            add(&archive, format, "", &[d.p("a")], &mut Ui::default());
+            // A file of the same name beside the archive is not found.
+            d.write("one.txt", "needle");
+            let names = found(&archive, format, "", "*.txt", None);
+            assert_eq!(names, ["a/b/one.txt", "a/three.txt"], "{format:?}");
+            assert_eq!(
+                found(&archive, format, "a/b", "*", None),
+                ["a/b/one.txt", "a/b/two.log"],
+                "{format:?}"
+            );
+            assert_eq!(
+                found(&archive, format, "", "b", None),
+                ["a/b"],
+                "{format:?}"
+            );
+            let text = found(&archive, format, "", "*", Some("needle"));
+            assert_eq!(text, ["a/b/one.txt", "a/three.txt"], "{format:?}");
+            assert!(
+                found(&archive, format, "a/b", "*", Some("too")).is_empty(),
+                "{format:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn find_in_a_hostile_archive_reads_nothing_outside_the_scratch_copy() {
+        let d = TestDir::new("findhostile");
+        d.write("secret", "needle");
+        let archive = d.p("evil.tar");
+        hostile_tar(
+            &archive,
+            &[
+                ("link", tar::EntryType::Symlink, "../secret", b""),
+                ("../up", tar::EntryType::Regular, "", b"needle"),
+                ("plain", tar::EntryType::Regular, "", b"needle"),
+            ],
+        );
+        let mut hits = Vec::new();
+        let mut ui = Ui::default();
+        find(
+            &archive,
+            Format::Tar,
+            "",
+            "*",
+            Some(b"needle"),
+            true,
+            &mut ui,
+            &mut |p| hits.push(p),
+        )
+        .unwrap();
+        assert_eq!(hits, ["plain"]);
     }
 
     #[test]

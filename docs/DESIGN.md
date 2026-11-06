@@ -84,6 +84,10 @@ Next:
 
 ## Known issues
 
+- Alt+F7 has no "Search in archives" option for archives met while searching
+  a folder, and no search area choice. In an open archive it searches that
+  archive only, and a text search extracts the files with a matching name to
+  a scratch folder, 64 MiB at a time.
 - Only logcat is known as a log format. Other logs get Colorer's text colours, so
   words such as `ERROR` are not picked out.
 - Syntax colours start at most 1000 lines above the screen after a jump, as a
