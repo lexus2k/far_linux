@@ -165,12 +165,18 @@ fn commands_menu() -> Vec<MenuItem> {
     ]
 }
 
+const NESTED_READ_ONLY: &str =
+    "An archive inside an archive is read-only.\nExtract it to change it.";
+
 const HELP: &[(&str, &str)] = &[
     ("F9, Commands", "Files highlighting: edit the colour groups"),
     ("far:about", "Version information, typed as a command"),
     ("Ctrl+C", "Clear the command line, or cancel an operation"),
     ("Archives", ""),
-    ("Enter, Ctrl+PgDn", "Open the archive under the cursor"),
+    (
+        "Enter, Ctrl+PgDn",
+        "Open the archive under the cursor, also inside an archive",
+    ),
     ("Ctrl+PgUp", "Go up, leaving the archive at its top"),
     ("Shift+F1", "Add the selection to an archive"),
     ("Shift+F2", "Extract the chosen archives"),
@@ -843,6 +849,8 @@ impl App {
         } else if self.panels[self.active].archive.is_some() {
             if entry.is_dir {
                 self.panel().enter_archive_folder(&entry.name);
+            } else if let Some(format) = archive::detect(Path::new(&entry.raw)) {
+                let _ = self.enter_nested_archive(format);
             }
         } else if entry.is_dir {
             let path = self.panels[self.active].entry_path(&entry);
@@ -869,6 +877,46 @@ impl App {
             dialog::alert(&mut self.tui, "Archive", &text)?;
         }
         Ok(())
+    }
+
+    /// Opens the archive under the cursor of the open archive, from a scratch
+    /// copy made by the usual safe extraction. It is read-only.
+    fn enter_nested_archive(&mut self, format: Format) -> io::Result<()> {
+        if !format.is_available() {
+            let text = format!(
+                "{} is needed to open this archive",
+                format.tool().unwrap_or_default()
+            );
+            return dialog::alert(&mut self.tui, "Archive", &text);
+        }
+        let inner = {
+            let panel = &self.panels[self.active];
+            let (Some(view), Some(entry)) = (&panel.archive, panel.current()) else {
+                return Ok(());
+            };
+            archive::join_inner(&view.folder, &entry.name)
+        };
+        let Some((scratch, path)) = self.extract_current_to_scratch()? else {
+            return Ok(());
+        };
+        self.show_wait("Archive", "Reading the archive...")?;
+        if let Err(text) = self.panel().open_nested(&path, format, &inner, scratch) {
+            dialog::alert(&mut self.tui, "Archive", &text)?;
+        }
+        Ok(())
+    }
+
+    /// True, after telling the user, when the active panel shows an archive
+    /// inside another one, which cannot be changed.
+    fn refuse_nested(&mut self, panel: usize, title: &str) -> io::Result<bool> {
+        let nested = self.panels[panel]
+            .archive
+            .as_ref()
+            .is_some_and(|v| v.nested());
+        if nested {
+            dialog::alert(&mut self.tui, title, NESTED_READ_ONLY)?;
+        }
+        Ok(nested)
     }
 
     /// Shows a message while the program does something short.
@@ -928,6 +976,8 @@ impl App {
         } else if self.panels[self.active].archive.is_some() {
             if entry.is_dir {
                 self.panel().enter_archive_folder(&entry.name);
+            } else if let Some(format) = archive::detect(Path::new(&entry.raw)) {
+                self.enter_nested_archive(format)?;
             } else {
                 self.view_in_archive()?;
             }
@@ -1680,6 +1730,9 @@ impl App {
         if name.is_empty() {
             return Ok(());
         }
+        if self.refuse_nested(self.active, "Make folder")? {
+            return Ok(());
+        }
         if let Some(view) = &self.panels[self.active].archive {
             let Some(inner) = archive::safe_name(&archive::join_inner(&view.folder, &name)) else {
                 return dialog::alert(&mut self.tui, "Make folder", "That name is not allowed");
@@ -1908,6 +1961,9 @@ impl App {
 
     /// F4 inside an archive: edits a temporary copy and offers to put it back.
     fn edit_in_archive(&mut self) -> io::Result<()> {
+        if self.refuse_nested(self.active, "Edit")? {
+            return Ok(());
+        }
         let Some((_scratch, path)) = self.extract_current_to_scratch()? else {
             return Ok(());
         };
@@ -1949,6 +2005,9 @@ impl App {
 
     /// F5 and F6 inside an archive.
     fn extract_from_panel(&mut self, moving: bool) -> io::Result<()> {
+        if moving && self.refuse_nested(self.active, "Move")? {
+            return Ok(());
+        }
         let panel = &self.panels[self.active];
         let Some(view) = &panel.archive else {
             return Ok(());
@@ -1978,6 +2037,9 @@ impl App {
             return Ok(());
         };
         if target.is_empty() {
+            return Ok(());
+        }
+        if target == default && self.refuse_nested(1 - self.active, verb)? {
             return Ok(());
         }
         let passive = self.panels[1 - self.active]
@@ -2033,6 +2095,9 @@ impl App {
 
     /// F5 and F6 with an archive on the passive panel.
     fn add_to_passive(&mut self, moving: bool) -> io::Result<()> {
+        if self.refuse_nested(1 - self.active, "Add to archive")? {
+            return Ok(());
+        }
         let sources = self.panels[self.active].targets();
         let Some(view) = &self.panels[1 - self.active].archive else {
             return Ok(());
@@ -2062,6 +2127,9 @@ impl App {
     }
 
     fn delete_in_archive(&mut self) -> io::Result<()> {
+        if self.refuse_nested(self.active, "Delete")? {
+            return Ok(());
+        }
         let panel = &self.panels[self.active];
         let Some(view) = &panel.archive else {
             return Ok(());
@@ -2516,7 +2584,7 @@ impl App {
             .archive
             .as_ref()
             .map(|v| (v.file.clone(), v.format, v.folder.clone()));
-        let archive_file = inside.as_ref().map(|(file, _, _)| file.clone());
+        let archive_label = self.panels[self.active].archive.as_ref().map(|v| v.label());
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
         let (tx, rx) = mpsc::channel::<Option<Hit>>();
@@ -2589,9 +2657,9 @@ impl App {
         let items: Vec<String> = hits
             .iter()
             .map(|hit| {
-                let shown = match (hit, &archive_file) {
+                let shown = match (hit, &archive_label) {
                     (Hit::File(p), _) => util::tilde(p),
-                    (Hit::Inner(inner), Some(file)) => format!("{}:/{inner}", util::tilde(file)),
+                    (Hit::Inner(inner), Some(label)) => format!("{label}:/{inner}"),
                     (Hit::Inner(inner), None) => inner.clone(),
                 };
                 fit_left(&shown, room)

@@ -84,6 +84,8 @@ Next:
 
 ## Known issues
 
+- An archive inside an archive is read-only. Writing a change back would mean
+  repacking it and then changing the outer archive with it.
 - Alt+F7 has no "Search in archives" option for archives met while searching
   a folder, and no search area choice. In an open archive it searches that
   archive only, and a text search extracts the files with a matching name to

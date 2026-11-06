@@ -1782,3 +1782,48 @@ fn alt_f7_in_an_archive_searches_the_archive() {
     s.wait("pack.zip:/deep/inner");
     s.wait("wanted_entry.log");
 }
+
+#[test]
+fn an_archive_inside_an_archive_opens_read_only() {
+    use std::io::Write;
+    let zip_bytes = |name: &str, data: &[u8]| {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file(name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(data).unwrap();
+        zip.finish().unwrap().into_inner()
+    };
+    let Some(s) = Session::start(|root| {
+        let inner = zip_bytes("nested_note.txt", b"from the inner archive");
+        fs::write(root.join("left/outer.zip"), zip_bytes("inner.zip", &inner)).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("outer.zip");
+    s.keys(&["End", "Enter"]);
+    s.wait("outer.zip:/");
+    s.wait("inner.zip");
+    s.keys(&["End", "Enter"]);
+    s.wait("inner.zip:/");
+    s.wait("nested_note.txt");
+    // Changing it is refused, and the outer archive keeps the inner one.
+    s.keys(&["End", "F8"]);
+    s.wait("read-only");
+    s.keys(&["Enter"]);
+    s.wait_gone("read-only");
+    s.keys(&["F3"]);
+    s.wait("from the inner archive");
+    s.keys(&["Escape"]);
+    s.wait_gone("from the inner archive");
+    // `..` goes back to the outer archive, with the cursor on the inner one.
+    s.keys(&["Home", "Enter"]);
+    s.wait_gone("nested_note.txt");
+    s.wait("outer.zip:/");
+    let names: Vec<String> =
+        far_linux::archive::list(&s.p("left/outer.zip"), far_linux::archive::Format::Zip)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.path)
+            .collect();
+    assert_eq!(names, ["inner.zip"]);
+}
