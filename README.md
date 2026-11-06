@@ -18,7 +18,16 @@ written in Rust, not a port, and it does not load Far plugins.
 
 ## Install
 
-Requires a recent stable Rust. `bash` is used to run commands.
+Ubuntu packages for amd64 and arm64 are on the
+[releases page](https://github.com/lexus2k/far_linux/releases). They need
+Ubuntu 22.04 or later, or another system with glibc 2.34 or later.
+
+```bash
+sudo apt install ./far-linux_0.2.0-1_amd64.deb   # the file you downloaded
+```
+
+To build from source instead, you need a recent stable Rust. `bash` is used to
+run commands.
 
 ```bash
 make && make install        # to ~/.local/bin
