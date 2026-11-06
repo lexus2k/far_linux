@@ -1696,3 +1696,21 @@ fn a_stalled_paste_does_not_run_its_rest_as_a_command() {
     assert!(!s.p("left/pwned").exists());
     assert!(s.screen().contains("touch pwned"), "{}", s.screen());
 }
+
+#[test]
+fn far_about_shows_the_version() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text("far:about");
+    s.keys(&["Enter"]);
+    s.wait("Version information");
+    s.wait(&format!("far_linux {}", env!("CARGO_PKG_VERSION")));
+    s.wait("SQLite 3.");
+    s.keys(&["Enter"]);
+    s.wait_gone("Version information");
+    // The banner is on the console, as in Far.
+    s.keys(&["C-o"]);
+    s.wait(&format!("far_linux {}", env!("CARGO_PKG_VERSION")));
+}

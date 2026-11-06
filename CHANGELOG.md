@@ -4,6 +4,9 @@
 
 ### Added
 
+- `far:about` and F9, Commands, Version information show the version, the
+  architecture and the libraries in use, as Far's `far:about` does. The version
+  is also printed on the console at start, where `Ctrl+O` shows it.
 - Ubuntu packages for amd64 and arm64, built and published as a GitHub release
   by a workflow started by hand.
 - The editor colours source code by the file's name or `#!` line, using the

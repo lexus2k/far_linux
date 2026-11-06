@@ -39,6 +39,7 @@ removes the program, using the same rules. If the folder is not in your `PATH`,
 `make install` says what to add.
 
 ```bash
+far --version      # also far:about on the command line
 far                # both panels in the current folder
 far left_dir right_dir
 ```
