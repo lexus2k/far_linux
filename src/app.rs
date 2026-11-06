@@ -1977,7 +1977,25 @@ impl App {
         if self.refuse_nested(self.active, "Edit")? {
             return Ok(());
         }
-        let Some((_scratch, path)) = self.extract_current_to_scratch()? else {
+        let panel = &self.panels[self.active];
+        let (Some(view), Some(entry)) = (&panel.archive, panel.current()) else {
+            return Ok(());
+        };
+        let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
+        let name = entry.name.clone();
+        self.edit_archive_entry(&file, format, &folder, &name)
+    }
+
+    /// Edits the entry `name` of `folder` in an archive from a temporary copy,
+    /// and offers to put it back when the editor closes with it changed.
+    fn edit_archive_entry(
+        &mut self,
+        file: &Path,
+        format: Format,
+        folder: &str,
+        name: &str,
+    ) -> io::Result<()> {
+        let Some((_scratch, path)) = self.extract_to_scratch(file, format, folder, name)? else {
             return Ok(());
         };
         let before = fs::read(&path).ok();
@@ -2005,10 +2023,7 @@ impl App {
         if answer != Some(0) {
             return Ok(());
         }
-        let Some(view) = &self.panels[self.active].archive else {
-            return Ok(());
-        };
-        let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
+        let (file, folder) = (file.to_path_buf(), folder.to_string());
         let summary = self.run_op("Update archive", move |ui| {
             archive::update_file(&file, format, &folder, &path, ui)
         })?;
@@ -2689,8 +2704,9 @@ impl App {
         }
     }
 
-    /// F3 or F4 on a found item. One in an archive is viewed from a scratch
-    /// copy; editing it is done from the archive panel, which can put it back.
+    /// F3 or F4 on a found item. One in an archive is opened from a temporary
+    /// copy, and an edited one is offered back to the archive, as the panel's
+    /// F4 does. The results window shows again afterwards.
     fn open_found(
         &mut self,
         target: &HitTarget,
@@ -2700,9 +2716,14 @@ impl App {
         match (target, inside) {
             (HitTarget::File(path), _) if edit => self.edit_file(&path.clone()),
             (HitTarget::File(path), _) => self.view_file(&path.clone()),
-            (HitTarget::Inner(_), _) if edit => {
-                let text = "Go to the file, then press F4, to edit it in the archive";
-                dialog::alert(&mut self.tui, "Find file", text)
+            (HitTarget::Inner(inner), Some((file, format, _))) if edit => {
+                // As the panel's F4 does: a nested archive is a scratch copy,
+                // so a change could not be kept.
+                if self.refuse_nested(self.active, "Edit")? {
+                    return Ok(());
+                }
+                let (folder, name) = inner.rsplit_once('/').unwrap_or(("", inner));
+                self.edit_archive_entry(file, *format, folder, name)
             }
             (HitTarget::Inner(inner), Some((file, format, _))) => {
                 let (folder, name) = inner.rsplit_once('/').unwrap_or(("", inner));
