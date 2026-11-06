@@ -54,7 +54,7 @@ Press F1 in the program for the full list.
 | Console | `Ctrl+O` show or hide panels, `Ctrl+P` hide inactive panel, `Ctrl+F1` / `Ctrl+F2` hide left / right |
 | File operations | `F5` copy, `F6` rename or move, `Shift+F5` / `Shift+F6` on the file under the cursor, `F7` make folder, `F8` delete to trash, `Shift+F8` delete the item under the cursor to trash, `Shift+Del` delete permanently, `Alt+F6` link, `Ctrl+A` permissions, with octal or checkboxes, and owner |
 | Selection | `Ins`, `Shift+arrows`, `+` / `-` by mask, `*` invert |
-| Finding | `Alt+letter` quick search, `Alt+F7` find files |
+| Finding | `Alt+letter` quick search, `Alt+F7` find files, inside the archive when one is open |
 | Display | `Ctrl+F3`..`Ctrl+F11` sort, `Ctrl+F12` sort menu, `Ctrl+1`..`Ctrl+4` columns, `Ctrl+H` hidden files, `Ctrl+L` info, `Ctrl+Q` quick view, `F9` menu |
 | Viewer (`F3`) | `F2` wrap, `Shift+F2` word wrap, `F4` hex, `Shift+F4` mode, `F6` edit, `F7` search, `Shift+F7` or `Space` next, `Alt+F7` previous, `F8` encoding, `Alt+F8` go to, `+` / `-` next or previous file. `F1` lists all keys |
 | Editor (`F4`) | `F2` save, `Shift+arrows` block, `Alt+arrows` vertical block, `Ctrl+C/X/V`, `Ctrl+Z`, `F7` search, `Ctrl+F7` replace, `Shift+F7` next, `Alt+F7` previous, `Alt+F8` go to, `F8` encoding, `Ctrl+Shift+0..9` / `Ctrl+0..9` bookmarks. `F1` lists all keys. Source code is coloured by file type |

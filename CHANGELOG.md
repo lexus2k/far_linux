@@ -79,6 +79,10 @@
 - A recursive permission change that takes away a folder's own read or
   execute bit no longer stops at that folder: bits are added before its
   contents are changed and removed after.
+- `Alt+F7` in an open archive searches the archive, from the folder shown down,
+  as Far does in plugin panels, rather than the folder holding the archive. A
+  found entry opens in the archive panel. Text is searched in scratch copies
+  made by the usual safe extraction.
 - Pasting in Windows Terminal keeps line ends. A paste can arrive as key events,
   with a line feed as Ctrl+Enter, or as plain text with its line ends as key
   events. Both lost them, and the second put the key events in the text.

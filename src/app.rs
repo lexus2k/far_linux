@@ -2510,31 +2510,55 @@ impl App {
         let text = self.find_text.clone();
         let ignore_case = form.checked(2);
         let root = self.panels[self.active].path.clone();
+        // In an open archive, as in Far's plugin panels, the search is of the
+        // archive from the folder shown, not of the folder holding it.
+        let inside = self.panels[self.active]
+            .archive
+            .as_ref()
+            .map(|v| (v.file.clone(), v.format, v.folder.clone()));
+        let archive_file = inside.as_ref().map(|(file, _, _)| file.clone());
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = cancel.clone();
-        let (tx, rx) = mpsc::channel::<Option<PathBuf>>();
+        let (tx, rx) = mpsc::channel::<Option<Hit>>();
         let worker_tx = tx.clone();
         std::thread::spawn(move || {
-            let stop = || flag.load(Ordering::Relaxed);
             let needle = (!text.is_empty()).then(|| text.into_bytes());
-            let mut sink = |path: PathBuf| {
-                let _ = worker_tx.send(Some(path));
-            };
-            fsops::find_files(
-                &root,
-                &masks,
-                needle.as_deref(),
-                ignore_case,
-                &stop,
-                &mut sink,
-                &mut |_| {},
-            );
+            if let Some((file, format, folder)) = inside {
+                let mut ui = QuietUi(flag);
+                let mut sink = |inner: String| {
+                    let _ = worker_tx.send(Some(Hit::Inner(inner)));
+                };
+                let _ = archive::find(
+                    &file,
+                    format,
+                    &folder,
+                    &masks,
+                    needle.as_deref(),
+                    ignore_case,
+                    &mut ui,
+                    &mut sink,
+                );
+            } else {
+                let stop = || flag.load(Ordering::Relaxed);
+                let mut sink = |path: PathBuf| {
+                    let _ = worker_tx.send(Some(Hit::File(path)));
+                };
+                fsops::find_files(
+                    &root,
+                    &masks,
+                    needle.as_deref(),
+                    ignore_case,
+                    &stop,
+                    &mut sink,
+                    &mut |_| {},
+                );
+            }
             let _ = worker_tx.send(None);
         });
         drop(tx);
         self.draw_main();
         let backdrop = self.tui.screen.clone();
-        let mut hits: Vec<PathBuf> = Vec::new();
+        let mut hits: Vec<Hit> = Vec::new();
         'search: loop {
             loop {
                 match rx.try_recv() {
@@ -2564,11 +2588,21 @@ impl App {
         let room = (self.tui.screen.w as usize).saturating_sub(10).max(10);
         let items: Vec<String> = hits
             .iter()
-            .map(|p| fit_left(&util::tilde(p), room))
+            .map(|hit| {
+                let shown = match (hit, &archive_file) {
+                    (Hit::File(p), _) => util::tilde(p),
+                    (Hit::Inner(inner), Some(file)) => format!("{}:/{inner}", util::tilde(file)),
+                    (Hit::Inner(inner), None) => inner.clone(),
+                };
+                fit_left(&shown, room)
+            })
             .collect();
         let title = format!("Found {}. Enter goes to the file", hits.len());
         if let Some(i) = dialog::menu(&mut self.tui, &title, &items, 0)? {
-            self.jump_to(&hits[i])?;
+            match &hits[i] {
+                Hit::File(path) => self.jump_to(path)?,
+                Hit::Inner(inner) => self.panel().goto_archive_path(inner),
+            }
         }
         Ok(())
     }
@@ -2877,6 +2911,35 @@ fn mode_change(
         }
     }
     (change != fsops::ModeChange::default()).then_some(change)
+}
+
+/// A file found by Alt+F7: on disk, or inside the archive the panel shows.
+enum Hit {
+    File(PathBuf),
+    Inner(String),
+}
+
+/// The `OpUi` of a search in an archive, which extracts to a scratch folder
+/// nobody else uses: nothing to ask, and a file that fails is left out.
+struct QuietUi(Arc<AtomicBool>);
+
+impl OpUi for QuietUi {
+    fn cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+    fn progress(&mut self, _: &fsops::Progress) {}
+    fn overwrite(&mut self, _: &Path, _: &Path) -> fsops::OverwriteChoice {
+        fsops::OverwriteChoice::SkipAll
+    }
+    fn error(&mut self, _: &Path, _: &str) -> fsops::ErrorChoice {
+        fsops::ErrorChoice::SkipAll
+    }
+    fn trash_fallback(&mut self, _: &Path) -> fsops::TrashChoice {
+        fsops::TrashChoice::Cancel
+    }
+    fn confirm_delete(&mut self, _: &Path, _: fsops::DeleteAsk) -> fsops::DeleteChoice {
+        fsops::DeleteChoice::Cancel
+    }
 }
 
 /// `far:about`, Far's command for version information.

@@ -489,6 +489,20 @@ impl Panel {
         self.chdir(&parent, name.as_ref())
     }
 
+    /// In an open archive, goes to the folder holding `inner` with the cursor
+    /// on it, as Alt+F7 does with a file it found.
+    pub fn goto_archive_path(&mut self, inner: &str) {
+        let Some(view) = &mut self.archive else {
+            return;
+        };
+        let (folder, name) = inner.rsplit_once('/').unwrap_or(("", inner));
+        view.folder = folder.to_string();
+        self.read_dir();
+        self.top = 0;
+        self.cursor = 0;
+        self.goto_name(&OsString::from(name));
+    }
+
     /// Moves the cursor to a name, if present.
     pub fn goto_name(&mut self, raw: &OsString) {
         if let Some(i) = self.entries.iter().position(|e| &e.raw == raw) {
