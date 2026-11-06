@@ -1,6 +1,6 @@
 //! A file panel: directory contents, sorting, selection and drawing.
 
-use crate::archive::{self, ArcEntry, Format};
+use crate::archive::{self, ArcEntry, Format, ScratchDir};
 use crate::highlight::{Facts, Highlight};
 use crate::screen::{fit, fit_left, fit_name, str_width, theme, Screen, Style};
 use crate::util;
@@ -63,6 +63,35 @@ pub struct ArchiveView {
     pub folder: String,
     items: Vec<ArcEntry>,
     stamp: (i64, u64),
+    /// For an archive opened from inside another: that archive's view, which
+    /// `..` at the top returns to. `file` is then a scratch copy.
+    pub outer: Option<Box<Outer>>,
+}
+
+/// The archive a nested archive was opened from.
+pub struct Outer {
+    pub view: ArchiveView,
+    /// Where the nested archive lies in `view`.
+    pub inner: String,
+    /// Holds the scratch copy that `file` of the nested view points to.
+    _scratch: ScratchDir,
+}
+
+impl ArchiveView {
+    /// True for an archive opened from inside another. Such an archive is a
+    /// scratch copy, so changes to it would be lost: it is read-only.
+    pub fn nested(&self) -> bool {
+        self.outer.is_some()
+    }
+
+    /// The archive as the user knows it: `outer.tar:/lib/inner.zip` for a
+    /// nested one, rather than the scratch copy.
+    pub fn label(&self) -> String {
+        match &self.outer {
+            Some(outer) => format!("{}:/{}", outer.view.label(), outer.inner),
+            None => util::tilde(&self.file),
+        }
+    }
 }
 
 fn file_stamp(path: &Path) -> (i64, u64) {
@@ -267,6 +296,38 @@ impl Panel {
             folder: String::new(),
             items,
             stamp: file_stamp(file),
+            outer: None,
+        });
+        self.read_dir();
+        self.top = 0;
+        self.cursor = 0;
+        Ok(())
+    }
+
+    /// Opens `file`, a scratch copy of the entry `inner` of the open archive,
+    /// as a nested archive. `scratch` is kept until the panel leaves it.
+    pub fn open_nested(
+        &mut self,
+        file: &Path,
+        format: Format,
+        inner: &str,
+        scratch: ScratchDir,
+    ) -> Result<(), String> {
+        let items = archive::list(file, format).map_err(|e| format!("{inner}: {e}"))?;
+        let Some(outer) = self.archive.take() else {
+            return Err("No archive is open".to_string());
+        };
+        self.archive = Some(ArchiveView {
+            file: file.to_path_buf(),
+            format,
+            folder: String::new(),
+            items,
+            stamp: file_stamp(file),
+            outer: Some(Box::new(Outer {
+                view: outer,
+                inner: inner.to_string(),
+                _scratch: scratch,
+            })),
         });
         self.read_dir();
         self.top = 0;
@@ -287,7 +348,7 @@ impl Panel {
     /// Where the panel is, as shown in its title.
     pub fn location(&self) -> String {
         match &self.archive {
-            Some(view) => format!("{}:/{}", util::tilde(&view.file), view.folder),
+            Some(view) => format!("{}:/{}", view.label(), view.folder),
             None => util::tilde(&self.path),
         }
     }
@@ -467,9 +528,18 @@ impl Panel {
                     leaf
                 }
                 None if view.folder.is_empty() => {
-                    let name = view.file.file_name().unwrap_or_default().to_os_string();
-                    self.archive = None;
-                    name
+                    let leaving = self.archive.take().expect("archive is open");
+                    match leaving.outer {
+                        // Back to the archive it was opened from, which also
+                        // removes the scratch copy.
+                        Some(outer) => {
+                            let outer = *outer;
+                            let leaf = outer.inner.rsplit('/').next().unwrap_or_default().into();
+                            self.archive = Some(outer.view);
+                            leaf
+                        }
+                        None => leaving.file.file_name().unwrap_or_default().to_os_string(),
+                    }
                 }
                 None => std::mem::take(&mut view.folder).into(),
             };
@@ -1230,5 +1300,61 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_nested_archive_opens_and_dot_dot_returns_to_the_outer_one() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("far-nested-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let zip_file = |path: &Path, name: &str, data: &[u8]| {
+            let mut zip = zip::ZipWriter::new(fs::File::create(path).unwrap());
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(data).unwrap();
+            zip.finish().unwrap();
+        };
+        let inner_file = dir.join("inner.zip");
+        zip_file(&inner_file, "deep/file.txt", b"x");
+        let inner_bytes = fs::read(&inner_file).unwrap();
+        let outer_file = dir.join("outer.zip");
+        zip_file(&outer_file, "lib/inner.zip", &inner_bytes);
+
+        let mut p = Panel::new(dir.clone());
+        p.open_archive(&outer_file, Format::Zip).unwrap();
+        p.enter_archive_folder("lib");
+        let scratch = ScratchDir::new().unwrap();
+        let copy = scratch.path().join("inner.zip");
+        fs::write(&copy, &inner_bytes).unwrap();
+        let held = scratch.path().to_path_buf();
+        p.open_nested(&copy, Format::Zip, "lib/inner.zip", scratch)
+            .unwrap();
+        let view = p.archive.as_ref().unwrap();
+        assert!(view.nested());
+        assert!(
+            p.location().ends_with("outer.zip:/lib/inner.zip:/"),
+            "{}",
+            p.location()
+        );
+        assert!(p.entries.iter().any(|e| e.name == "deep"));
+        p.enter_archive_folder("deep");
+        assert!(
+            p.location().ends_with("inner.zip:/deep"),
+            "{}",
+            p.location()
+        );
+        p.go_up().unwrap();
+        p.go_up().unwrap();
+        // Back in the outer archive's folder, on the nested archive, and the
+        // scratch copy is gone.
+        assert!(p.location().ends_with("outer.zip:/lib"), "{}", p.location());
+        assert_eq!(p.current().unwrap().name, "inner.zip");
+        assert!(!p.archive.as_ref().unwrap().nested());
+        assert!(!held.exists());
+        p.go_up().unwrap();
+        p.go_up().unwrap();
+        assert!(p.archive.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

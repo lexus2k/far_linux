@@ -66,7 +66,7 @@ and `xz` programs, and 7z uses `7z`. Zip, tar and tar.gz need nothing installed.
 
 | Key | Action |
 |---|---|
-| `Enter`, `Ctrl+PgDn` | Open the archive under the cursor |
+| `Enter`, `Ctrl+PgDn` | Open the archive under the cursor, also one inside an open archive |
 | `Ctrl+PgUp` | Go up, leaving the archive from its top folder |
 | `Shift+F1` | Add the selection to a new or existing archive |
 | `Shift+F2` | Extract the chosen archives |
@@ -80,6 +80,10 @@ The format comes from the name's extension, or from the Format button in
 `Shift+F1`. Changing an archive writes a new file and renames it into place, so a
 failure leaves the original intact. Names that would leave the destination are
 refused, and extraction does not follow links or create setuid files.
+
+An archive inside an archive opens from a temporary copy, shown as
+`outer.tar:/lib/inner.zip:/`, and `..` at its top returns to the outer one. It is
+read-only: view, extract and search it, or extract it to change it.
 
 Limits: password protected archives, rar and renaming inside an archive are not
 supported. Listing and testing run in the foreground and cannot be cancelled, so
