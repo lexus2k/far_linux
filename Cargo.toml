@@ -27,6 +27,26 @@ tar = "0.4"
 flate2 = "1"
 syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "regex-fancy", "parsing"] }
 
+# Ubuntu packages, built with `cargo deb`. See .github/workflows/release.yml.
+[package.metadata.deb]
+name = "far-linux"
+maintainer = "Alexey Dynda <alexey.dynda@gmail.com>"
+copyright = "2026, Alexey Dynda"
+section = "utils"
+priority = "optional"
+# Written out rather than found by dpkg-shlibdeps, which names the architecture
+# when cross-building. The binary needs glibc 2.34 or later.
+depends = "libc6 (>= 2.34), libgcc-s1"
+recommends = "bash"
+extended-description = """\
+A two-panel file manager for Linux terminals that follows Far Manager 3's keys:
+panels, viewer, editor with syntax colours, archives, search and history."""
+assets = [
+    ["target/release/far", "usr/bin/", "755"],
+    ["README.md", "usr/share/doc/far-linux/README.md", "644"],
+    ["CHANGELOG.md", "usr/share/doc/far-linux/CHANGELOG.md", "644"],
+]
+
 [profile.release]
 opt-level = 3
 lto = "thin"

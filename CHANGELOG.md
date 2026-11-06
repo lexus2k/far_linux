@@ -4,6 +4,8 @@
 
 ### Added
 
+- Ubuntu packages for amd64 and arm64, built and published as a GitHub release
+  by a workflow started by hand.
 - The editor colours source code by the file's name or `#!` line, using the
   `syntect` grammars and the colours of Colorer's default console scheme.
 - Text files and logs get the colours of Colorer's text type: numbers, dates,

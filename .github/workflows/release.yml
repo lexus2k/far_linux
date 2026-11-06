@@ -1,0 +1,148 @@
+# Builds Ubuntu packages for amd64 and arm64 and publishes them as a GitHub
+# release. It runs only when started by hand: Actions, Release, Run workflow.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version, such as 0.2.0. Empty uses the version in Cargo.toml."
+        required: false
+        default: ""
+      publish:
+        description: "Publish a release. Off builds and checks the packages only."
+        type: boolean
+        default: true
+      prerelease:
+        description: "Mark the release as a prerelease"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_DEB_VERSION: "3.8.0"
+
+jobs:
+  version:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: pick
+        env:
+          WANTED: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${WANTED#v}"
+          if [ -z "$version" ]; then
+            version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          fi
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+            echo "::error::'$version' is not a version such as 0.2.0"
+            exit 1
+          fi
+          if [ "${{ inputs.publish }}" = "true" ] && gh release view "v$version" >/dev/null 2>&1; then
+            echo "::error::Release v$version already exists. Choose another version."
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Version: $version"
+
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux for the end-to-end tests
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+
+  package:
+    needs: [version, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    # Ubuntu 22.04 keeps the glibc requirement low enough for 22.04 and later.
+    runs-on: ubuntu-22.04
+    env:
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+      CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the arm64 cross compiler and emulator
+        if: matrix.arch == 'arm64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
+      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked --version "$CARGO_DEB_VERSION"
+      - name: Set the version
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: sed -i "0,/^version = \".*\"/s//version = \"$VERSION\"/" Cargo.toml
+      - name: Build the package
+        run: cargo deb --target ${{ matrix.target }} --output dist/
+      - name: Check the package
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          deb=$(ls dist/*.deb)
+          dpkg-deb --info "$deb"
+          dpkg-deb --contents "$deb"
+          test "$(dpkg-deb --field "$deb" Architecture)" = "${{ matrix.arch }}"
+          mkdir unpacked
+          dpkg-deb --extract "$deb" unpacked
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            out=$(qemu-aarch64 -L /usr/aarch64-linux-gnu unpacked/usr/bin/far --version)
+          else
+            sudo dpkg --install "$deb"
+            out=$(far --version)
+          fi
+          echo "$out"
+          test "$out" = "far_linux $VERSION"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.arch }}
+          path: dist/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: [version, package]
+    if: inputs.publish
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: deb-*
+          path: dist
+          merge-multiple: true
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          cd dist
+          sha256sum *.deb > SHA256SUMS
+          cat SHA256SUMS
+          flags=""
+          if [ "$PRERELEASE" = "true" ]; then flags="--prerelease"; fi
+          gh release create "v$VERSION" *.deb SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "far_linux $VERSION" \
+            --generate-notes $flags
