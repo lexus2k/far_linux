@@ -159,6 +159,40 @@ pub enum Field {
         label: String,
         on: bool,
     },
+    /// A row of checkboxes after a label, as in Far's attributes dialog. A box
+    /// can be undecided, `None`, shown as `[?]`, when the items it describes
+    /// differ. Left and Right move between the boxes.
+    Boxes {
+        label: String,
+        names: Vec<String>,
+        states: Vec<Option<bool>>,
+        three: Vec<bool>,
+        col: usize,
+    },
+}
+
+/// Width of the label column of `Field::Boxes` rows.
+const BOXES_LABEL: usize = 8;
+
+/// Width given to each checkbox name in a `Field::Boxes` row, so that the
+/// boxes of rows below each other line up.
+const BOX_NAME: usize = 7;
+
+/// `text` cut or padded with spaces to `width` columns.
+fn pad(text: &str, width: usize) -> String {
+    let shown = fit_left(text, width);
+    let fill = width.saturating_sub(str_width(&shown));
+    format!("{shown}{}", " ".repeat(fill))
+}
+
+/// Next state of a checkbox. One that may be undecided goes through `[?]`.
+fn next_state(state: Option<bool>, three: bool) -> Option<bool> {
+    match state {
+        Some(false) => Some(true),
+        Some(true) if three => None,
+        Some(true) => Some(false),
+        None => Some(false),
+    }
 }
 
 impl Field {
@@ -188,6 +222,18 @@ impl Field {
         }
     }
 
+    /// A row of checkboxes. A box whose state is `None` can always return to
+    /// it; with `three`, every box can be made undecided.
+    pub fn boxes(label: &str, names: &[&str], states: &[Option<bool>], three: bool) -> Field {
+        Field::Boxes {
+            label: label.to_string(),
+            names: names.iter().map(|n| n.to_string()).collect(),
+            states: states.to_vec(),
+            three: states.iter().map(|s| three || s.is_none()).collect(),
+            col: 0,
+        }
+    }
+
     fn focusable(&self) -> bool {
         !matches!(self, Field::Label(_))
     }
@@ -202,16 +248,21 @@ impl Field {
     fn hotkey(&self) -> Option<char> {
         match self {
             Field::Text { label, .. } | Field::Check { label, .. } => parse_label(label).1,
-            Field::Label(_) => None,
+            Field::Label(_) | Field::Boxes { .. } => None,
         }
     }
 }
 
 /// A dialog of text boxes, checkboxes and optional buttons.
+/// Called after each key with the fields and the index of the focused one, so
+/// that fields can be kept in step with each other.
+type OnChange = Box<dyn FnMut(&mut [Field], usize)>;
+
 pub struct Form {
     pub fields: Vec<Field>,
     buttons: Vec<String>,
     db: Option<Rc<History>>,
+    on_change: Option<OnChange>,
 }
 
 impl Form {
@@ -220,6 +271,21 @@ impl Form {
             fields,
             buttons: Vec::new(),
             db: None,
+            on_change: None,
+        }
+    }
+
+    /// Runs `f` after each key, with the fields and the focused index.
+    pub fn on_change(mut self, f: impl FnMut(&mut [Field], usize) + 'static) -> Self {
+        self.on_change = Some(Box::new(f));
+        self
+    }
+
+    /// States of a row of checkboxes.
+    pub fn boxes(&self, index: usize) -> Vec<Option<bool>> {
+        match &self.fields[index] {
+            Field::Boxes { states, .. } => states.clone(),
+            _ => Vec::new(),
         }
     }
 
@@ -276,6 +342,7 @@ impl Form {
                     if let Some(Field::Text { edit, .. }) = self.fields.get_mut(focus) {
                         edit.insert_str(&text);
                     }
+                    self.changed(focus);
                     continue;
                 }
                 _ => continue,
@@ -320,8 +387,12 @@ impl Form {
                         }
                     }
                 }
-                (KeyCode::Down, _) | (KeyCode::Tab, NONE) => focus = self.step(focus, 1),
-                (KeyCode::Up, _) | (KeyCode::Tab, SHIFT) => focus = self.step(focus, -1),
+                (KeyCode::Down, _) | (KeyCode::Tab, NONE) => {
+                    focus = self.step_keeping_column(focus, 1)
+                }
+                (KeyCode::Up, _) | (KeyCode::Tab, SHIFT) => {
+                    focus = self.step_keeping_column(focus, -1)
+                }
                 (KeyCode::Right, _) if on_button.is_some() => focus = self.step(focus, 1),
                 (KeyCode::Left, _) if on_button.is_some() => focus = self.step(focus, -1),
                 _ => match self.fields.get_mut(focus) {
@@ -333,6 +404,20 @@ impl Form {
                             *on = !*on;
                         }
                     }
+                    Some(Field::Boxes {
+                        names,
+                        states,
+                        three,
+                        col,
+                        ..
+                    }) => match key.code {
+                        KeyCode::Char(' ') => states[*col] = next_state(states[*col], three[*col]),
+                        KeyCode::Left => *col = col.saturating_sub(1),
+                        KeyCode::Right => *col = (*col + 1).min(names.len().saturating_sub(1)),
+                        KeyCode::Home => *col = 0,
+                        KeyCode::End => *col = names.len().saturating_sub(1),
+                        _ => {}
+                    },
                     _ => {
                         if key.code == KeyCode::Char(' ') {
                             if let Some(index) = on_button {
@@ -343,7 +428,30 @@ impl Form {
                     }
                 },
             }
+            self.changed(focus);
         }
+    }
+
+    fn changed(&mut self, focus: usize) {
+        if let Some(f) = &mut self.on_change {
+            f(&mut self.fields, focus);
+        }
+    }
+
+    /// Moves focus, and from one row of checkboxes to the next keeps the column,
+    /// so that Up and Down move through a grid.
+    fn step_keeping_column(&mut self, focus: usize, dir: isize) -> usize {
+        let to = self.step(focus, dir);
+        let from_col = match self.fields.get(focus) {
+            Some(Field::Boxes { col, .. }) => Some(*col),
+            _ => None,
+        };
+        if let (Some(c), Some(Field::Boxes { col, names, .. })) =
+            (from_col, self.fields.get_mut(to))
+        {
+            *col = c.min(names.len().saturating_sub(1));
+        }
+        to
     }
 
     fn step(&self, focus: usize, dir: isize) -> usize {
@@ -399,6 +507,34 @@ impl Form {
                     s.put(x + 3, row, &format!("[{mark}] {shown}"), style);
                     if i == focus {
                         s.cursor = Some((x + 4, row));
+                    }
+                    row += 1;
+                }
+                Field::Boxes {
+                    label,
+                    names,
+                    states,
+                    col,
+                    ..
+                } => {
+                    let mut bx = s.put(x + 3, row, &pad(label, BOXES_LABEL), theme::DIALOG);
+                    for (b, (name, state)) in names.iter().zip(states).enumerate() {
+                        let mark = match state {
+                            Some(true) => 'x',
+                            Some(false) => ' ',
+                            None => '?',
+                        };
+                        let here = i == focus && b == *col;
+                        let style = if here {
+                            theme::DIALOG_FOCUS
+                        } else {
+                            theme::DIALOG
+                        };
+                        if here {
+                            s.cursor = Some((bx + 2, row));
+                        }
+                        let shown = pad(name, BOX_NAME);
+                        bx = s.put(bx + 1, row, &format!("[{mark}] {shown}"), style) + 1;
                     }
                     row += 1;
                 }

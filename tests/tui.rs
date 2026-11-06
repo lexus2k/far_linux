@@ -1714,3 +1714,34 @@ fn far_about_shows_the_version() {
     s.keys(&["C-o"]);
     s.wait(&format!("far_linux {}", env!("CARGO_PKG_VERSION")));
 }
+
+#[test]
+fn ctrl_a_checkboxes_change_one_permission() {
+    use std::os::unix::fs::PermissionsExt;
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/a.sh"), "x").unwrap();
+        fs::set_permissions(root.join("left/a.sh"), fs::Permissions::from_mode(0o644)).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("a.sh");
+    s.keys(&["Down", "C-a"]);
+    s.wait("Set UID");
+    s.wait("0644");
+    // Down to the owner row, Right twice to Execute, and tick it.
+    s.keys(&["Down", "Right", "Right", "Space"]);
+    s.wait("0744");
+    s.keys(&["Enter"]);
+    s.wait_gone("Set UID");
+    let start = Instant::now();
+    let mode = || fs::metadata(s.p("left/a.sh")).unwrap().permissions().mode() & 0o7777;
+    while mode() != 0o744 {
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "mode {:o}\n{}",
+            mode(),
+            s.screen()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}

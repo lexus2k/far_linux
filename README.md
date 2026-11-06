@@ -52,7 +52,7 @@ Press F1 in the program for the full list.
 |---|---|
 | Panels | `Tab` other panel, `Enter` open or run, `Ctrl+PgUp` parent, `Ctrl+\` root, `Ctrl+U` swap |
 | Console | `Ctrl+O` show or hide panels, `Ctrl+P` hide inactive panel, `Ctrl+F1` / `Ctrl+F2` hide left / right |
-| File operations | `F5` copy, `F6` rename or move, `Shift+F5` / `Shift+F6` on the file under the cursor, `F7` make folder, `F8` delete to trash, `Shift+F8` delete the item under the cursor to trash, `Shift+Del` delete permanently, `Alt+F6` link, `Ctrl+A` permissions and owner |
+| File operations | `F5` copy, `F6` rename or move, `Shift+F5` / `Shift+F6` on the file under the cursor, `F7` make folder, `F8` delete to trash, `Shift+F8` delete the item under the cursor to trash, `Shift+Del` delete permanently, `Alt+F6` link, `Ctrl+A` permissions, with octal or checkboxes, and owner |
 | Selection | `Ins`, `Shift+arrows`, `+` / `-` by mask, `*` invert |
 | Finding | `Alt+letter` quick search, `Alt+F7` find files |
 | Display | `Ctrl+F3`..`Ctrl+F11` sort, `Ctrl+F12` sort menu, `Ctrl+1`..`Ctrl+4` columns, `Ctrl+H` hidden files, `Ctrl+L` info, `Ctrl+Q` quick view, `F9` menu |
@@ -117,6 +117,9 @@ clears everything that is not locked.
   console colours, so some details differ. Code in a Markdown fence keeps its
   language's colours, and logcat levels and tags are coloured, neither of which
   Colorer does.
+- `Ctrl+A` shows Unix permission bits rather than Far's Windows attributes,
+  and has no file times. Its checkboxes work as Far's do: `[?]` where the
+  items differ, and only the changed bits are applied.
 - `Ctrl+Enter` and `Ctrl+J` start a new line in the editor, where Far does nothing. Windows'
   ConPTY can deliver a line feed in pasted text as that key.
 - `Ctrl+O` shows the terminal's normal screen and scrollback. With `Ctrl+P`, the
