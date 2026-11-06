@@ -1915,3 +1915,34 @@ fn f4_in_find_results_edits_an_archive_entry_and_returns() {
     s.keys(&["Escape"]);
     s.wait_gone("Search done");
 }
+
+#[test]
+fn find_file_mask_shows_matching_history_while_typing() {
+    let Some(s) = Session::start(|root| {
+        fs::write(root.join("left/app.log"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("app.log");
+    s.keys(&["M-F7"]);
+    s.wait("File mask");
+    s.text("*.log");
+    s.keys(&["Enter"]);
+    // "Found" is in both the old results menu and Far's results window.
+    s.wait("Found");
+    s.keys(&["Escape"]);
+    s.wait_gone("Found");
+    // The mask is prefilled; typing replaces it and lists the earlier mask.
+    s.keys(&["M-F7"]);
+    s.wait("File mask");
+    s.keys(&["C-y"]);
+    s.text("*.l");
+    s.wait("│*.log");
+    s.keys(&["Down", "Enter"]);
+    // Enter took the entry and left the dialog open.
+    s.wait_gone("│*.log");
+    s.wait("File mask");
+    assert!(s.screen().contains("*.log"), "{}", s.screen());
+    s.keys(&["Enter"]);
+    s.wait("Found");
+}

@@ -8,6 +8,11 @@
   copy made by the usual safe extraction, to any depth. `..` at the top goes
   back to the outer archive. They are read-only: `F4`, `F6`, `F7`, `F8` and
   copying into them say so, as a change to the copy would be lost.
+- Text boxes with a history, such as Find file's mask and text, the copy target
+  and the archive name, show matching earlier entries under the box while
+  typing, as Far's AutoComplete does. `Down` and `Up` choose, `Enter` takes
+  one without closing the dialog, `Esc` closes the list, `Shift+Del` removes
+  an entry, and `Ctrl+End` completes from the first match.
 
 ### Changed
 

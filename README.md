@@ -102,6 +102,11 @@ In search, find, mask and copy target boxes, `Ctrl+Up` or `Ctrl+Down` opens the
 list. `Enter` picks an item, `Ins` locks it, `Shift+Del` removes it and `Del`
 clears everything that is not locked.
 
+While you type in such a box, earlier entries that start with the typed text
+are listed under it, as Far's AutoComplete does. `Down` and `Up` choose one,
+`Enter` puts it in the box, `Esc` closes the list, `Shift+Del` removes the
+entry from the history and `Ctrl+End` completes from the first match.
+
 ## How file operations behave
 
 - **Copying** writes to a temporary file and renames it into place, so
