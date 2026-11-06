@@ -1045,10 +1045,43 @@ fn remove_tree<U: OpUi>(ctx: &mut Ctx<U>, path: &Path) -> Result<(), Cancelled> 
     Ok(())
 }
 
+/// Permission bits to add and to remove. Bits in neither keep the value each
+/// item has, so a change made for several items, or for a folder's contents,
+/// spreads only what the user changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModeChange {
+    pub set: u32,
+    pub clear: u32,
+}
+
+impl ModeChange {
+    /// Sets exactly `mode`, as `chmod 644` does.
+    pub fn exact(mode: u32) -> Self {
+        ModeChange {
+            set: mode & 0o7777,
+            clear: !mode & 0o7777,
+        }
+    }
+
+    /// The mode an item with `old` permissions gets.
+    pub fn apply(&self, old: u32) -> u32 {
+        (old & 0o7777 & !self.clear) | self.set
+    }
+
+    /// Only the bits this change adds, for a folder that is entered before its
+    /// own change is complete.
+    fn additions(&self) -> ModeChange {
+        ModeChange {
+            set: self.set,
+            clear: 0,
+        }
+    }
+}
+
 /// Requested attribute changes.
 #[derive(Clone, Debug, Default)]
 pub struct AttrChange {
-    pub mode: Option<u32>,
+    pub mode: Option<ModeChange>,
     pub uid: Option<u32>,
     pub gid: Option<u32>,
     pub recursive: bool,
@@ -1077,14 +1110,41 @@ fn apply_attrs<U: OpUi>(
     };
     ctx.progress.from = path.to_path_buf();
     ctx.report();
-    let applied = ctx.attempt(path, || apply_attrs_one(path, &meta, change))?;
-    if applied.is_some() {
-        ctx.done += 1;
+    let into = change.recursive && meta.is_dir();
+    if !into {
+        if ctx
+            .attempt(path, || apply_attrs_one(path, &meta, change))?
+            .is_some()
+        {
+            ctx.done += 1;
+        }
+        return Ok(());
     }
-    if change.recursive && meta.is_dir() {
-        if let Some(names) = ctx.attempt(path, || read_names(path))? {
-            for name in names {
-                apply_attrs(ctx, &path.join(name), change)?;
+    // A folder gets the added bits before it is entered and the removed ones
+    // after, so that taking away its owner's read or execute bit does not stop
+    // its contents from being changed.
+    let first = AttrChange {
+        mode: change.mode.map(|m| m.additions()),
+        ..change.clone()
+    };
+    let started = ctx.attempt(path, || apply_attrs_one(path, &meta, &first))?;
+    if let Some(names) = ctx.attempt(path, || read_names(path))? {
+        for name in names {
+            apply_attrs(ctx, &path.join(name), change)?;
+        }
+    }
+    if started.is_some() {
+        let only_mode = AttrChange {
+            mode: change.mode,
+            ..Default::default()
+        };
+        let now = ctx.attempt(path, || fs::symlink_metadata(path))?;
+        if let Some(now) = now {
+            if ctx
+                .attempt(path, || apply_attrs_one(path, &now, &only_mode))?
+                .is_some()
+            {
+                ctx.done += 1;
             }
         }
     }
@@ -1103,7 +1163,10 @@ fn apply_attrs_one(path: &Path, meta: &Metadata, change: &AttrChange) -> io::Res
     }
     // Permissions on a symbolic link itself do not exist on Linux.
     if let (Some(mode), false) = (change.mode, meta.file_type().is_symlink()) {
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        let new = mode.apply(meta.mode());
+        if new != meta.mode() & 0o7777 {
+            fs::set_permissions(path, fs::Permissions::from_mode(new))?;
+        }
     }
     Ok(())
 }
@@ -1968,7 +2031,7 @@ mod tests {
         fs::set_permissions(&outside, fs::Permissions::from_mode(0o644)).unwrap();
         symlink(&outside, d.p("dir/link")).unwrap();
         let change = AttrChange {
-            mode: Some(0o700),
+            mode: Some(ModeChange::exact(0o700)),
             recursive: true,
             ..Default::default()
         };
@@ -2319,6 +2382,54 @@ mod tests {
         info_name.push(".trashinfo");
         let info = fs::read_to_string(d.p("trash/info").join(info_name)).unwrap();
         assert!(info.contains("bad%FFname"), "{info}");
+    }
+
+    #[test]
+    fn a_mode_change_keeps_the_bits_it_does_not_name() {
+        let d = TestDir::new("modebits");
+        let a = d.write("a", "x");
+        let b = d.write("b", "x");
+        fs::set_permissions(&a, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(&b, fs::Permissions::from_mode(0o644)).unwrap();
+        let change = AttrChange {
+            mode: Some(ModeChange {
+                set: 0o100,
+                clear: 0o004,
+            }),
+            ..Default::default()
+        };
+        let mut ui = Script::default();
+        set_attributes(&[a.clone(), b.clone()], &change, &mut ui);
+        assert_eq!(fs::metadata(&a).unwrap().mode() & 0o7777, 0o700);
+        assert_eq!(fs::metadata(&b).unwrap().mode() & 0o7777, 0o740);
+        assert_eq!(ModeChange::exact(0o4755).apply(0o2600), 0o4755);
+    }
+
+    #[test]
+    fn removing_a_folders_own_access_still_changes_its_contents() {
+        if is_root() {
+            return;
+        }
+        let d = TestDir::new("modedir");
+        let f = d.write("dir/sub/f", "x");
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        let change = AttrChange {
+            mode: Some(ModeChange {
+                set: 0o001,
+                clear: 0o500,
+            }),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut ui = Script::default();
+        let s = set_attributes(&[d.p("dir")], &change, &mut ui);
+        let dir_mode = fs::metadata(d.p("dir")).unwrap().mode() & 0o777;
+        // Give access back so the result can be read and the folder removed.
+        fs::set_permissions(d.p("dir"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(d.p("dir/sub"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!((s.skipped, ui.errors.len()), (0, 0), "{:?}", ui.errors);
+        assert_eq!(dir_mode, 0o255);
+        assert_eq!(fs::metadata(&f).unwrap().mode() & 0o777, 0o245);
     }
 
     #[test]

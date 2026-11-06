@@ -1770,42 +1770,61 @@ impl App {
         let single = (sources.len() == 1)
             .then(|| panel.current().cloned())
             .flatten();
-        let (mode, owner, group): (String, String, String) =
-            match (&single, fs::symlink_metadata(&sources[0])) {
-                (Some(_), Ok(meta)) => (
-                    format!("{:04o}", meta.mode() & 0o7777),
-                    fsops::user_name(meta.uid()),
-                    fsops::group_name(meta.gid()),
-                ),
-                _ => Default::default(),
-            };
+        let (owner, group): (String, String) = match (&single, fs::symlink_metadata(&sources[0])) {
+            (Some(_), Ok(meta)) => (fsops::user_name(meta.uid()), fsops::group_name(meta.gid())),
+            _ => Default::default(),
+        };
+        // As in Far, a box shows [?] where the items differ, and with folders
+        // every box can be made [?], which leaves that bit alone.
+        let metas: Vec<fs::Metadata> = sources
+            .iter()
+            .filter_map(|p| fs::symlink_metadata(p).ok())
+            .filter(|m| !m.file_type().is_symlink())
+            .collect();
+        let initial = mode_states(metas.iter().map(|m| m.mode()));
+        let folders = metas.iter().any(|m| m.is_dir());
+        let row = |i: usize| -> Vec<Option<bool>> { initial[i * 3..i * 3 + 3].to_vec() };
         let mut form = Form::new(vec![
             Field::Label(Self::describe(&sources)),
-            Field::text("Permissions (octal, empty keeps them):", &mode),
-            Field::text("Owner (empty keeps it):", &owner),
-            Field::text("Group (empty keeps it):", &group),
-            Field::check("Apply to folder contents", false),
-        ]);
+            Field::text(
+                "&Permissions (octal, ? keeps a digit):",
+                &mode_text(&initial),
+            ),
+            Field::boxes("Owner", &["Read", "Write", "Execute"], &row(1), folders),
+            Field::boxes("Group", &["Read", "Write", "Execute"], &row(2), folders),
+            Field::boxes("Others", &["Read", "Write", "Execute"], &row(3), folders),
+            Field::boxes(
+                "Special",
+                &["Set UID", "Set GID", "Sticky"],
+                &row(0),
+                folders,
+            ),
+            Field::text("&Owner (empty keeps it):", &owner),
+            Field::text("&Group (empty keeps it):", &group),
+            Field::check("Apply to folder &contents", false),
+        ])
+        .on_change(move |fields, focus| sync_mode_fields(fields, focus, &initial));
         if !form.run(&mut self.tui, "Attributes")? {
             return Ok(());
         }
         let mut change = AttrChange {
-            recursive: form.checked(4),
+            recursive: form.checked(8),
             ..Default::default()
         };
-        let (mode_text, owner_text, group_text) = (form.text(1), form.text(2), form.text(3));
-        // Only what the user changed is applied, recursively or not. Prefilled
-        // values describe the first item and must not spread to the others.
-        if field_changed(&mode_text, &mode) {
-            let Some(value) = fsops::parse_mode(&mode_text) else {
+        let (mode_text_now, owner_text, group_text) = (form.text(1), form.text(6), form.text(7));
+        let mut states = boxes_states(&form.fields);
+        if mode_text_now != mode_text(&states) {
+            // Typed and confirmed with Enter before the boxes followed it.
+            let Some(typed) = parse_mode_states(&mode_text_now, &initial) else {
                 return dialog::alert(
                     &mut self.tui,
                     "Attributes",
-                    "Permissions must be octal, like 644",
+                    "Permissions must be octal, like 644 or 0755",
                 );
             };
-            change.mode = Some(value);
+            states = typed;
         }
+        change.mode = mode_change(&initial, &states);
         if field_changed(&owner_text, &owner) {
             let Some(value) = fsops::lookup_user(owner_text.trim()) else {
                 return dialog::alert(
@@ -2743,6 +2762,123 @@ fn is_exit_command(command: &str) -> bool {
         && words.next().is_none()
 }
 
+/// Permission bits in the order of the octal digits: special, owner, group,
+/// others, each as read, write, execute (or set UID, set GID, sticky).
+const MODE_BITS: [u32; 12] = [
+    0o4000, 0o2000, 0o1000, 0o400, 0o200, 0o100, 0o40, 0o20, 0o10, 0o4, 0o2, 0o1,
+];
+
+/// The state of each bit across `modes`: set in all, in none, or mixed.
+fn mode_states(modes: impl Iterator<Item = u32>) -> [Option<bool>; 12] {
+    let (mut all, mut any, mut seen) = (0o7777, 0, false);
+    for mode in modes {
+        all &= mode;
+        any |= mode;
+        seen = true;
+    }
+    if !seen {
+        return [None; 12];
+    }
+    MODE_BITS.map(|bit| match (all & bit != 0, any & bit != 0) {
+        (true, _) => Some(true),
+        (false, false) => Some(false),
+        (false, true) => None,
+    })
+}
+
+/// Octal text for the states, with `?` for a digit that is not known.
+fn mode_text(states: &[Option<bool>; 12]) -> String {
+    states
+        .chunks(3)
+        .map(|digit| {
+            digit
+                .iter()
+                .zip([4, 2, 1])
+                .try_fold(0, |n, (s, v)| s.map(|on| n + if on { v } else { 0 }))
+                .map_or('?', |n| char::from(b'0' + n))
+        })
+        .collect()
+}
+
+/// Reads octal text such as `644`, `0755` or `07?4`. `?` keeps that digit as
+/// it was, and empty text keeps everything.
+fn parse_mode_states(text: &str, initial: &[Option<bool>; 12]) -> Option<[Option<bool>; 12]> {
+    let text = text.trim();
+    if text.is_empty() {
+        return Some(*initial);
+    }
+    let digits: Vec<char> = match text.chars().count() {
+        3 => std::iter::once('0').chain(text.chars()).collect(),
+        4 => text.chars().collect(),
+        _ => return None,
+    };
+    let mut states = *initial;
+    for (d, c) in digits.into_iter().enumerate() {
+        if c == '?' {
+            continue;
+        }
+        let n = c.to_digit(8)?;
+        for (b, v) in [4, 2, 1].into_iter().enumerate() {
+            states[d * 3 + b] = Some(n & v != 0);
+        }
+    }
+    Some(states)
+}
+
+/// The states of the four rows of boxes in the attributes dialog.
+fn boxes_states(fields: &[Field]) -> [Option<bool>; 12] {
+    let mut states = [None; 12];
+    // Fields 2 to 4 are owner, group and others, and 5 is the special bits.
+    for (digit, field) in [(1, 2), (2, 3), (3, 4), (0, 5)] {
+        if let Some(Field::Boxes { states: row, .. }) = fields.get(field) {
+            states[digit * 3..digit * 3 + 3].copy_from_slice(&row[..3]);
+        }
+    }
+    states
+}
+
+/// Keeps the octal text and the boxes showing the same mode: typing updates
+/// the boxes once the text reads as a mode, and a box updates the text.
+fn sync_mode_fields(fields: &mut [Field], focus: usize, initial: &[Option<bool>; 12]) {
+    if focus == 1 {
+        let Some(Field::Text { edit, .. }) = fields.get(1) else {
+            return;
+        };
+        let Some(states) = parse_mode_states(&edit.text(), initial) else {
+            return;
+        };
+        for (digit, field) in [(1, 2), (2, 3), (3, 4), (0, 5)] {
+            if let Some(Field::Boxes { states: row, .. }) = fields.get_mut(field) {
+                row.copy_from_slice(&states[digit * 3..digit * 3 + 3]);
+            }
+        }
+    } else if (2..=5).contains(&focus) {
+        let text = mode_text(&boxes_states(fields));
+        if let Some(Field::Text { edit, .. }) = fields.get_mut(1) {
+            if edit.text() != text {
+                edit.set(&text);
+            }
+        }
+    }
+}
+
+/// What to apply: only the bits whose state was changed, as Far does.
+fn mode_change(
+    initial: &[Option<bool>; 12],
+    states: &[Option<bool>; 12],
+) -> Option<fsops::ModeChange> {
+    let mut change = fsops::ModeChange::default();
+    for ((bit, before), after) in MODE_BITS.iter().zip(initial).zip(states) {
+        match (before, after) {
+            (a, b) if a == b => {}
+            (_, Some(true)) => change.set |= bit,
+            (_, Some(false)) => change.clear |= bit,
+            (_, None) => {}
+        }
+    }
+    (change != fsops::ModeChange::default()).then_some(change)
+}
+
 /// `far:about`, Far's command for version information.
 fn is_about_command(command: &str) -> bool {
     command.trim() == "far:about"
@@ -3306,5 +3442,83 @@ mod tests {
         }
         let all = lines.join(", ");
         assert_eq!(all.matches("fancy-regex ").count(), 1, "{all}");
+    }
+
+    #[test]
+    fn attribute_boxes_follow_the_selected_modes() {
+        let one = mode_states([0o4755].into_iter());
+        assert_eq!(mode_text(&one), "4755");
+        let mixed = mode_states([0o644, 0o600].into_iter());
+        assert_eq!(mode_text(&mixed), "06??");
+        assert_eq!(mixed[6], None, "group read differs");
+        assert_eq!(mixed[7], Some(false), "group write is clear in both");
+        assert_eq!(mode_text(&mode_states(std::iter::empty())), "????");
+    }
+
+    #[test]
+    fn octal_text_reads_as_boxes() {
+        let initial = mode_states([0o644, 0o600].into_iter());
+        assert_eq!(parse_mode_states("", &initial), Some(initial));
+        let typed = parse_mode_states("755", &initial).unwrap();
+        assert_eq!(mode_text(&typed), "0755");
+        let kept = parse_mode_states("07??", &initial).unwrap();
+        assert_eq!(mode_text(&kept), "07??");
+        for bad in ["8", "75", "07555", "x44"] {
+            assert_eq!(parse_mode_states(bad, &initial), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn only_changed_boxes_are_applied() {
+        let initial = mode_states([0o644, 0o600].into_iter());
+        assert_eq!(mode_change(&initial, &initial), None);
+        let mut states = initial;
+        states[5] = Some(true); // owner execute
+        states[6] = Some(false); // group read, which differed
+        let change = mode_change(&initial, &states).unwrap();
+        assert_eq!((change.set, change.clear), (0o100, 0o040));
+        assert_eq!(change.apply(0o644), 0o704);
+        assert_eq!(change.apply(0o600), 0o700);
+        // Back to [?] is no change.
+        let mut back = states;
+        back[6] = None;
+        assert_eq!(mode_change(&initial, &back).unwrap().clear, 0);
+    }
+
+    #[test]
+    fn typing_a_mode_ticks_the_boxes_and_ticking_rewrites_it() {
+        let initial = mode_states([0o644].into_iter());
+        let row = |i: usize| initial[i * 3..i * 3 + 3].to_vec();
+        let names = ["Read", "Write", "Execute"];
+        let mut fields = vec![
+            Field::Label(String::new()),
+            Field::text("", &mode_text(&initial)),
+            Field::boxes("Owner", &names, &row(1), false),
+            Field::boxes("Group", &names, &row(2), false),
+            Field::boxes("Others", &names, &row(3), false),
+            Field::boxes("Special", &names, &row(0), false),
+        ];
+        if let Field::Text { edit, .. } = &mut fields[1] {
+            edit.set("75");
+        }
+        sync_mode_fields(&mut fields, 1, &initial);
+        assert_eq!(mode_text(&boxes_states(&fields)), "0644", "not yet a mode");
+        if let Field::Text { edit, .. } = &mut fields[1] {
+            edit.set("751");
+        }
+        sync_mode_fields(&mut fields, 1, &initial);
+        assert_eq!(mode_text(&boxes_states(&fields)), "0751");
+        if let Field::Boxes { states, .. } = &mut fields[4] {
+            states[1] = Some(true);
+        }
+        sync_mode_fields(&mut fields, 4, &initial);
+        assert_eq!(form_text(&fields), "0753");
+    }
+
+    fn form_text(fields: &[Field]) -> String {
+        match &fields[1] {
+            Field::Text { edit, .. } => edit.text(),
+            _ => String::new(),
+        }
     }
 }

@@ -4,6 +4,10 @@
 
 ### Added
 
+- `Ctrl+A` has checkboxes for each permission bit next to the octal box, as in
+  Midnight Commander, kept in step with it. As in Far, a box shows `[?]` where
+  the selected items differ, and only the bits changed are applied to each item,
+  also for a folder's contents. The octal box takes `?` for a digit to keep.
 - `far:about` and F9, Commands, Version information show the version, the
   architecture and the libraries in use, as Far's `far:about` does. The version
   is also printed on the console at start, where `Ctrl+O` shows it.
@@ -72,6 +76,9 @@
 
 ### Fixed
 
+- A recursive permission change that takes away a folder's own read or
+  execute bit no longer stops at that folder: bits are added before its
+  contents are changed and removed after.
 - Pasting in Windows Terminal keeps line ends. A paste can arrive as key events,
   with a line feed as Ctrl+Enter, or as plain text with its line ends as key
   events. Both lost them, and the second put the key events in the text.
