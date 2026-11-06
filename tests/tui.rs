@@ -1775,8 +1775,12 @@ fn alt_f7_in_an_archive_searches_the_archive() {
     s.keys(&["Down"]);
     s.text("needle");
     s.keys(&["Enter"]);
-    s.wait("Found 1");
-    s.wait("pack.zip:/deep/inner/wanted_entry.log");
+    // Far's results window: a header line for the folder, then the file.
+    s.wait("Search done. Found files: 1, folders: 0");
+    s.wait("Find file: *.log");
+    s.wait("pack.zip:/deep/inner");
+    s.wait("│wanted_entry.log");
+    s.wait("{ New search } [ Go to ] [ View ] [ Cancel ]");
     assert!(!s.screen().contains("outside_entry"), "{}", s.screen());
     s.keys(&["Enter"]);
     s.wait("pack.zip:/deep/inner");
@@ -1826,4 +1830,88 @@ fn an_archive_inside_an_archive_opens_read_only() {
             .map(|e| e.path)
             .collect();
     assert_eq!(names, ["inner.zip"]);
+}
+
+#[test]
+fn alt_f7_results_window_views_and_starts_a_new_search() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/logs")).unwrap();
+        fs::write(root.join("left/logs/first.log"), "first log text").unwrap();
+        fs::write(root.join("left/logs/second.log"), "second log text").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("logs");
+    s.keys(&["M-F7"]);
+    s.wait("File mask");
+    s.text("*.log");
+    s.keys(&["Enter"]);
+    s.wait("Search done. Found files: 2, folders: 0");
+    s.wait("│first.log");
+    s.wait("│second.log");
+    // F3 views the file under the cursor and comes back to the results.
+    s.keys(&["Down", "F3"]);
+    s.wait("second log text");
+    s.keys(&["Escape"]);
+    s.wait_gone("second log text");
+    s.wait("Search done. Found files: 2, folders: 0");
+    // New search goes back to the form.
+    s.keys(&["M-n"]);
+    s.wait("File mask");
+    s.keys(&["Escape"]);
+    s.wait_gone("File mask");
+}
+
+#[test]
+fn f4_in_find_results_edits_an_archive_entry_and_returns() {
+    use std::io::{Read, Write};
+    let Some(s) = Session::start(|root| {
+        let file = fs::File::create(root.join("left/notes.zip")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("docs/todo.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"buy milk").unwrap();
+        zip.finish().unwrap();
+    }) else {
+        return;
+    };
+    s.wait("notes.zip");
+    s.keys(&["End", "Enter"]);
+    s.wait("notes.zip:/");
+    s.keys(&["M-F7"]);
+    s.wait("File mask");
+    s.text("*.txt");
+    s.keys(&["Enter"]);
+    s.wait("Search done. Found files: 1, folders: 0");
+    s.keys(&["F4"]);
+    s.wait("buy milk");
+    s.keys(&["End"]);
+    s.text(" now");
+    s.keys(&["F2"]);
+    s.keys(&["Escape"]);
+    s.wait("Update it in the archive?");
+    s.keys(&["Enter"]);
+    // Back in the results window, with the archive changed.
+    s.wait("Search done. Found files: 1, folders: 0");
+    let start = Instant::now();
+    let read = || -> String {
+        let mut zip = zip::ZipArchive::new(fs::File::open(s.p("left/notes.zip")).unwrap()).unwrap();
+        let mut text = String::new();
+        zip.by_name("docs/todo.txt")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    };
+    while read() != "buy milk now" {
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "{:?}\n{}",
+            read(),
+            s.screen()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    s.keys(&["Escape"]);
+    s.wait_gone("Search done");
 }
