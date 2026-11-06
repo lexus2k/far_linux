@@ -3,6 +3,7 @@
 use crate::archive::{self, ExtractRequest, Format, ScratchDir, FORMATS};
 use crate::dialog::{self, Field, Form};
 use crate::editor::{self, Clipboard, EditorContext, EditorExit};
+use crate::findlist::{Command, FindList, Found};
 use crate::fsops::{
     self, AttrChange, CopyOptions, DeleteAsk, DeleteChoice, ErrorChoice, OpSummary, OpUi,
     OverwriteChoice, Progress, Totals, TrashChoice,
@@ -1914,6 +1915,18 @@ impl App {
         };
         let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
         let name = entry.name.clone();
+        self.extract_to_scratch(&file, format, &folder, &name)
+    }
+
+    /// Extracts the entry `name` of `folder` in an archive to a private folder.
+    fn extract_to_scratch(
+        &mut self,
+        file: &Path,
+        format: Format,
+        folder: &str,
+        name: &str,
+    ) -> io::Result<Option<(ScratchDir, PathBuf)>> {
+        let (file, folder) = (file.to_path_buf(), folder.to_string());
         let scratch = match ScratchDir::new() {
             Ok(scratch) => scratch,
             Err(e) => {
@@ -1923,14 +1936,14 @@ impl App {
             }
         };
         let request = ExtractRequest {
-            items: vec![archive::join_inner(&folder, &name)],
+            items: vec![archive::join_inner(&folder, name)],
             base: folder,
             dest: scratch.path().to_path_buf(),
         };
         let summary = self.run_op("Extract", move |ui| {
             archive::extract(&file, format, &request, ui)
         })?;
-        let path = scratch.path().join(&name);
+        let path = scratch.path().join(name);
         if summary.cancelled || fs::symlink_metadata(&path).is_err() {
             return Ok(None);
         }
@@ -2548,7 +2561,19 @@ impl App {
         })
     }
 
+    /// Alt+F7: asks what to find, then shows the results window, which can
+    /// start a new search.
     fn find_dialog(&mut self) -> io::Result<()> {
+        while let Some(query) = self.find_form()? {
+            if !self.find_results(query)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// The Find file form. `None` when it is cancelled.
+    fn find_form(&mut self) -> io::Result<Option<FindQuery>> {
         let mut form = Form::new(vec![
             Field::with_history(
                 "File mask (several: comma separated):",
@@ -2564,7 +2589,7 @@ impl App {
         ])
         .with_db(&self.db);
         if !form.run(&mut self.tui, "Find files")? {
-            return Ok(());
+            return Ok(None);
         }
         self.find_mask = form.text(0);
         self.find_text = form.text(1);
@@ -2575,104 +2600,132 @@ impl App {
         } else {
             self.find_mask.clone()
         };
-        let text = self.find_text.clone();
-        let ignore_case = form.checked(2);
+        Ok(Some(FindQuery {
+            masks,
+            text: self.find_text.clone(),
+            ignore_case: form.checked(2),
+        }))
+    }
+
+    /// Runs a search and shows its results as Far's Find file window does,
+    /// filling while the search runs. Returns true for New search.
+    fn find_results(&mut self, query: FindQuery) -> io::Result<bool> {
         let root = self.panels[self.active].path.clone();
         // In an open archive, as in Far's plugin panels, the search is of the
         // archive from the folder shown, not of the folder holding it.
-        let inside = self.panels[self.active]
-            .archive
-            .as_ref()
-            .map(|v| (v.file.clone(), v.format, v.folder.clone()));
-        let archive_label = self.panels[self.active].archive.as_ref().map(|v| v.label());
+        let view = self.panels[self.active].archive.as_ref();
+        let inside = view.map(|v| (v.file.clone(), v.format, v.folder.clone()));
+        let label = view.map(|v| v.label());
         let cancel = Arc::new(AtomicBool::new(false));
-        let flag = cancel.clone();
-        let (tx, rx) = mpsc::channel::<Option<Hit>>();
-        let worker_tx = tx.clone();
-        std::thread::spawn(move || {
-            let needle = (!text.is_empty()).then(|| text.into_bytes());
-            if let Some((file, format, folder)) = inside {
-                let mut ui = QuietUi(flag);
-                let mut sink = |inner: String| {
-                    let _ = worker_tx.send(Some(Hit::Inner(inner)));
-                };
-                let _ = archive::find(
-                    &file,
-                    format,
-                    &folder,
-                    &masks,
-                    needle.as_deref(),
-                    ignore_case,
-                    &mut ui,
-                    &mut sink,
-                );
-            } else {
-                let stop = || flag.load(Ordering::Relaxed);
-                let mut sink = |path: PathBuf| {
-                    let _ = worker_tx.send(Some(Hit::File(path)));
-                };
-                fsops::find_files(
-                    &root,
-                    &masks,
-                    needle.as_deref(),
-                    ignore_case,
-                    &stop,
-                    &mut sink,
-                    &mut |_| {},
-                );
-            }
-            let _ = worker_tx.send(None);
-        });
-        drop(tx);
+        let rx = spawn_search(
+            &query,
+            root.clone(),
+            inside.clone(),
+            label.clone(),
+            cancel.clone(),
+        );
+        let stop = || cancel.store(true, Ordering::Relaxed);
+        let title = format!("Find file: {}", query.masks);
+        let mut list = FindList::new();
+        let mut targets: Vec<HitTarget> = Vec::new();
+        let mut searching_in = label.clone().unwrap_or_else(|| util::tilde(&root));
         self.draw_main();
-        let backdrop = self.tui.screen.clone();
-        let mut hits: Vec<Hit> = Vec::new();
-        'search: loop {
+        let mut backdrop = self.tui.screen.clone();
+        loop {
             loop {
                 match rx.try_recv() {
-                    Ok(Some(path)) => hits.push(path),
-                    Ok(None) | Err(mpsc::TryRecvError::Disconnected) => break 'search,
+                    Ok(SearchMsg::Hit(found, target)) => {
+                        list.push(found);
+                        targets.push(target);
+                    }
+                    Ok(SearchMsg::In(folder)) => searching_in = folder,
+                    Ok(SearchMsg::Done) | Err(mpsc::TryRecvError::Disconnected) => {
+                        list.finish();
+                        break;
+                    }
                     Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
+            let (files, folders) = list.counts();
+            let status = if list.done {
+                format!("Search done. Found files: {files}, folders: {folders}")
+            } else {
+                format!("Searching in {searching_in}. Files: {files}, folders: {folders}")
+            };
             self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
-            let lines = vec![format!("Found: {}. Esc stops the search.", hits.len())];
-            dialog::draw_message(&mut self.tui.screen, "Find files", &lines, &[], 0, false);
+            list.draw(&mut self.tui.screen, &title, &status);
             self.tui.draw()?;
-            if let Some(Input::Key(key)) = self.tui.read(OP_TICK)? {
-                if cancels(key) {
-                    cancel.store(true, Ordering::Relaxed);
-                    break 'search;
+            let Some(Input::Key(key)) = self.tui.read(OP_TICK)? else {
+                continue;
+            };
+            let list_command = list.handle(key);
+            match list_command {
+                Command::None => {}
+                Command::Stop => stop(),
+                Command::Cancel => {
+                    stop();
+                    return Ok(false);
+                }
+                Command::NewSearch => {
+                    stop();
+                    return Ok(true);
+                }
+                Command::GoTo(i) => {
+                    stop();
+                    match &targets[i] {
+                        HitTarget::File(path) => self.jump_to(path)?,
+                        HitTarget::Inner(inner) => self.panel().goto_archive_path(inner),
+                    }
+                    return Ok(false);
+                }
+                Command::View(i) | Command::Edit(i) => {
+                    // The search goes on meanwhile, as in Far.
+                    let edit = matches!(list_command, Command::Edit(_));
+                    self.open_found(&targets[i], inside.as_ref(), edit)?;
+                    self.draw_main();
+                    backdrop = self.tui.screen.clone();
                 }
             }
         }
-        self.tui.screen = dialog::resized(&backdrop, &self.tui.screen);
-        if hits.is_empty() {
-            let lines = vec!["No files found.".to_string()];
-            dialog::message(&mut self.tui, "Find files", &lines, &["OK"], false)?;
-            return Ok(());
-        }
-        // A menu cuts long text on the right, which would hide the file name.
-        let room = (self.tui.screen.w as usize).saturating_sub(10).max(10);
-        let items: Vec<String> = hits
-            .iter()
-            .map(|hit| {
-                let shown = match (hit, &archive_label) {
-                    (Hit::File(p), _) => util::tilde(p),
-                    (Hit::Inner(inner), Some(label)) => format!("{label}:/{inner}"),
-                    (Hit::Inner(inner), None) => inner.clone(),
-                };
-                fit_left(&shown, room)
-            })
-            .collect();
-        let title = format!("Found {}. Enter goes to the file", hits.len());
-        if let Some(i) = dialog::menu(&mut self.tui, &title, &items, 0)? {
-            match &hits[i] {
-                Hit::File(path) => self.jump_to(path)?,
-                Hit::Inner(inner) => self.panel().goto_archive_path(inner),
+    }
+
+    /// F3 or F4 on a found item. One in an archive is viewed from a scratch
+    /// copy; editing it is done from the archive panel, which can put it back.
+    fn open_found(
+        &mut self,
+        target: &HitTarget,
+        inside: Option<&(PathBuf, Format, String)>,
+        edit: bool,
+    ) -> io::Result<()> {
+        match (target, inside) {
+            (HitTarget::File(path), _) if edit => self.edit_file(&path.clone()),
+            (HitTarget::File(path), _) => self.view_file(&path.clone()),
+            (HitTarget::Inner(_), _) if edit => {
+                let text = "Go to the file, then press F4, to edit it in the archive";
+                dialog::alert(&mut self.tui, "Find file", text)
             }
+            (HitTarget::Inner(inner), Some((file, format, _))) => {
+                let (folder, name) = inner.rsplit_once('/').unwrap_or(("", inner));
+                let Some((scratch, path)) = self.extract_to_scratch(file, *format, folder, name)?
+                else {
+                    return Ok(());
+                };
+                let db = self.db.clone();
+                let exit = viewer::run(
+                    &mut self.tui,
+                    &path,
+                    &mut self.keybar,
+                    &mut self.clipboard,
+                    &db,
+                );
+                drop(scratch);
+                match exit {
+                    Err(e) => dialog::alert(&mut self.tui, "Viewer", &e.to_string()),
+                    Ok(_) => Ok(()),
+                }
+            }
+            (HitTarget::Inner(_), None) => Ok(()),
         }
-        Ok(())
     }
 
     /// Opens the folder containing a path with the cursor on it.
@@ -2981,10 +3034,104 @@ fn mode_change(
     (change != fsops::ModeChange::default()).then_some(change)
 }
 
-/// A file found by Alt+F7: on disk, or inside the archive the panel shows.
-enum Hit {
+/// What Alt+F7 looks for.
+struct FindQuery {
+    masks: String,
+    text: String,
+    ignore_case: bool,
+}
+
+/// Where a found item is: on disk, or inside the archive the panel shows.
+enum HitTarget {
     File(PathBuf),
     Inner(String),
+}
+
+/// What the search thread reports.
+enum SearchMsg {
+    Hit(Found, HitTarget),
+    /// The folder being searched, for the status line.
+    In(String),
+    Done,
+}
+
+/// Starts a search on another thread. `inside` is the open archive, with
+/// `label` its name as shown to the user.
+fn spawn_search(
+    query: &FindQuery,
+    root: PathBuf,
+    inside: Option<(PathBuf, Format, String)>,
+    label: Option<String>,
+    cancel: Arc<AtomicBool>,
+) -> mpsc::Receiver<SearchMsg> {
+    let (tx, rx) = mpsc::channel::<SearchMsg>();
+    let masks = query.masks.clone();
+    let needle = (!query.text.is_empty()).then(|| query.text.clone().into_bytes());
+    let ignore_case = query.ignore_case;
+    std::thread::spawn(move || {
+        if let Some((file, format, folder)) = inside {
+            let label = label.unwrap_or_default();
+            let mut ui = QuietUi(cancel);
+            let mut sink = |entry: archive::ArcEntry| {
+                let (parent, name) = entry.path.rsplit_once('/').unwrap_or(("", &entry.path));
+                let found = Found {
+                    folder: format!("{label}:/{parent}"),
+                    name: name.to_string(),
+                    size: entry.size,
+                    mtime: entry.mtime,
+                    mode: entry.mode,
+                    is_dir: entry.is_dir,
+                    is_link: entry.is_link,
+                };
+                let _ = tx.send(SearchMsg::Hit(found, HitTarget::Inner(entry.path.clone())));
+            };
+            let _ = archive::find(
+                &file,
+                format,
+                &folder,
+                &masks,
+                needle.as_deref(),
+                ignore_case,
+                &mut ui,
+                &mut sink,
+            );
+        } else {
+            let stop = || cancel.load(Ordering::Relaxed);
+            let hit_tx = tx.clone();
+            let mut sink = |path: PathBuf| {
+                let meta = fs::symlink_metadata(&path).ok();
+                let folder = path.parent().map(util::tilde).unwrap_or_default();
+                let found = Found {
+                    folder,
+                    name: path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default(),
+                    size: meta.as_ref().map_or(0, |m| m.len()),
+                    mtime: meta.as_ref().map_or(0, |m| m.mtime()),
+                    mode: meta.as_ref().map_or(0, |m| m.mode()),
+                    is_dir: meta.as_ref().is_some_and(|m| m.is_dir()),
+                    is_link: meta.as_ref().is_some_and(|m| m.file_type().is_symlink()),
+                };
+                let _ = hit_tx.send(SearchMsg::Hit(found, HitTarget::File(path)));
+            };
+            let in_tx = tx.clone();
+            let mut visited = |dir: &Path| {
+                let _ = in_tx.send(SearchMsg::In(util::tilde(dir)));
+            };
+            fsops::find_files(
+                &root,
+                &masks,
+                needle.as_deref(),
+                ignore_case,
+                &stop,
+                &mut sink,
+                &mut visited,
+            );
+        }
+        let _ = tx.send(SearchMsg::Done);
+    });
+    rx
 }
 
 /// The `OpUi` of a search in an archive, which extracts to a scratch folder

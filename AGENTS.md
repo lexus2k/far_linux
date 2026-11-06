@@ -25,6 +25,7 @@ pass trivially if tmux is missing, because they skip themselves.
 | `src/archive.rs` | List, extract, create and change archives. No UI code |
 | `src/highlight.rs` | Far's highlighting groups: masks, attributes, colours and their settings file |
 | `src/history.rs` | SQLite history and remembered options |
+| `src/findlist.rs` | Alt+F7 results window: grouped list, status line, buttons |
 | `src/search.rs` | Search engine shared by editor and viewer: regex, whole words, fuzzy, preserve style |
 | `src/panel.rs` | Directory and archive listing, sorting, selection, panel drawing |
 | `src/viewer.rs` | F3 viewer. Reads on demand and never loads the whole file |

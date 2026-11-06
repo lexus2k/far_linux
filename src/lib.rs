@@ -5,6 +5,7 @@ pub mod archive;
 pub mod dialog;
 pub mod editor;
 pub mod encoding;
+pub mod findlist;
 pub mod fsops;
 pub mod highlight;
 pub mod history;

@@ -967,7 +967,7 @@ const FIND_BATCH_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Alt+F7 in an archive: finds entries from `folder` down whose name matches
 /// `masks`, and with `text`, files that contain it. Calls `found` with each
-/// archive path. Content is read from scratch copies made by `extract`, so the
+/// entry; a folder that exists only in deeper names has just its path set. Content is read from scratch copies made by `extract`, so the
 /// same safety rules apply as to any extraction.
 #[allow(clippy::too_many_arguments)]
 pub fn find<U: OpUi>(
@@ -978,7 +978,7 @@ pub fn find<U: OpUi>(
     text: Option<&[u8]>,
     ignore_case: bool,
     ui: &mut U,
-    found: &mut dyn FnMut(String),
+    found: &mut dyn FnMut(ArcEntry),
 ) -> io::Result<()> {
     let all = list(path, format)?;
     // Folders that exist only as part of a deeper name are found too, as in a
@@ -1008,7 +1008,15 @@ pub fn find<U: OpUi>(
             if ui.cancelled() {
                 break;
             }
-            found(name.clone());
+            let entry = items.get(name).map_or_else(
+                || ArcEntry {
+                    path: name.clone(),
+                    is_dir: true,
+                    ..Default::default()
+                },
+                |e| (*e).clone(),
+            );
+            found(entry);
         }
         return Ok(());
     };
@@ -1040,7 +1048,7 @@ pub fn find<U: OpUi>(
             // A file `extract` refused, such as a hostile name, is not there.
             let is_file = fs::symlink_metadata(&copy).is_ok_and(|m| m.is_file());
             if is_file && fsops::file_contains(&copy, needle, ignore_case, &stop) {
-                found(entry.path.clone());
+                found((*entry).clone());
             }
         }
     }
@@ -1847,7 +1855,7 @@ mod tests {
             text.map(str::as_bytes),
             true,
             &mut ui,
-            &mut |p| hits.push(p),
+            &mut |e| hits.push(e.path),
         )
         .unwrap();
         assert!(ui.errors.is_empty(), "{format:?}: {:?}", ui.errors);
@@ -1909,7 +1917,7 @@ mod tests {
             Some(b"needle"),
             true,
             &mut ui,
-            &mut |p| hits.push(p),
+            &mut |e| hits.push(e.path),
         )
         .unwrap();
         assert_eq!(hits, ["plain"]);

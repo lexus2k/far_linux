@@ -9,6 +9,13 @@
   back to the outer archive. They are read-only: `F4`, `F6`, `F7`, `F8` and
   copying into them say so, as a change to the copy would be lost.
 
+### Changed
+
+- `Alt+F7` shows its results as Far's Find file window does, filling while the
+  search runs: files under a line for their folder, with date, size and mode,
+  a status line, and New search, Go to, View, Stop and Cancel. `F3` and `F4`
+  view or edit a found file while the search goes on.
+
 ## 0.3.0 - 2026-11-06
 
 ### Added
