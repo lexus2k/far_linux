@@ -755,4 +755,33 @@ mod tests {
         assert!(all.contains("[ Yes ]"));
         assert!(all.contains("[ No ]"));
     }
+
+    #[test]
+    fn messages_are_safe_at_every_size() {
+        let lines = vec!["x".repeat(300), "short".to_string()];
+        for w in 1..50 {
+            for h in 1..12 {
+                let mut s = Screen::new(w, h);
+                draw_message(&mut s, "Title", &lines, &["Yes", "No", "Cancel"], 1, true);
+                draw_message(&mut s, "", &[], &[], 0, false);
+            }
+        }
+    }
+
+    #[test]
+    fn forms_are_safe_at_every_size() {
+        let form = Form::new(vec![
+            Field::Label("A label".into()),
+            Field::text("&Name:", &"x".repeat(200)),
+            Field::check("&Option", true),
+        ])
+        .with_buttons(&["&OK", "&Cancel"]);
+        for w in 1..50 {
+            for h in 1..14 {
+                let mut s = Screen::new(w, h);
+                form.draw(&mut s, "Form title", 1);
+                form.draw(&mut s, "Form title", 3);
+            }
+        }
+    }
 }

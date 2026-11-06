@@ -14,6 +14,7 @@ pub mod panel;
 pub mod screen;
 pub mod search;
 pub mod shell;
+pub mod syntax;
 pub mod util;
 pub mod viewer;
 

@@ -1084,4 +1084,137 @@ mod tests {
         assert!(p.top <= 80 && 80 < p.top + p.capacity());
         fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn every_sort_order_puts_files_where_far_does() {
+        let (mut p, root) = panel("sorts", &["b.aaa", "a.zzz", "c.mmm"], &[]);
+        fs::write(root.join("c.mmm"), "longer").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(root.join("a.zzz"))
+            .unwrap()
+            .set_modified(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap();
+        p.reload();
+        p.set_sort(Sort::Ext);
+        assert_eq!(names(&p), ["..", "b.aaa", "c.mmm", "a.zzz"]);
+        p.set_sort(Sort::Size);
+        assert_eq!(names(&p)[1], "c.mmm");
+        p.set_sort(Sort::Mtime);
+        assert_eq!(names(&p)[3], "a.zzz");
+        for sort in [
+            Sort::Ctime,
+            Sort::Atime,
+            Sort::Owner,
+            Sort::Unsorted,
+            Sort::Name,
+        ] {
+            p.set_sort(sort);
+            assert_eq!(names(&p)[0], "..", "{sort:?}");
+            assert_eq!(names(&p).len(), 4, "{sort:?}");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn extension_of_a_name() {
+        assert_eq!(extension("a.tar.gz"), "gz");
+        assert_eq!(extension(".bashrc"), "");
+        assert_eq!(extension("none"), "");
+        assert_eq!(extension("end."), "");
+    }
+
+    #[test]
+    fn shift_movement_marks_what_it_crosses_and_skips_up() {
+        let (mut p, root) = panel("shift", &["a", "b", "c"], &[]);
+        p.select_move(2);
+        assert_eq!(p.cursor, 2);
+        let marked = |p: &Panel| -> Vec<String> {
+            p.entries
+                .iter()
+                .filter(|e| e.selected)
+                .map(|e| e.name.clone())
+                .collect()
+        };
+        assert_eq!(marked(&p), ["a"]);
+        p.select_move(isize::MAX / 2);
+        assert_eq!(p.cursor, 3);
+        assert_eq!(marked(&p), ["a", "b", "c"]);
+        // Starting on a marked item unmarks on the way back.
+        p.select_move(isize::MIN / 2);
+        assert_eq!(p.cursor, 0);
+        assert!(marked(&p).is_empty());
+        p.clear_selection();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn inverting_and_clearing_leave_up_alone() {
+        let (mut p, root) = panel("invert", &["a"], &["dir"]);
+        p.invert_selection();
+        assert!(!p.entries[0].selected);
+        p.clear_selection();
+        assert!(p.entries.iter().all(|e| !e.selected));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_change_on_disk_is_noticed() {
+        let (mut p, root) = panel("changed", &["a"], &[]);
+        assert!(!p.changed_on_disk());
+        p.dir_mtime -= 10;
+        assert!(p.changed_on_disk());
+        p.reload();
+        assert!(!p.changed_on_disk());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_reload_forgets_counted_sizes() {
+        let (mut p, root) = panel("forget", &["a"], &["dir"]);
+        p.entries[1].scanned = Some(5);
+        p.reload();
+        assert!(p.entries.iter().all(|e| e.scanned.is_none()));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_broken_link_is_listed_as_a_file() {
+        let (mut p, root) = panel("broken", &[], &[]);
+        std::os::unix::fs::symlink("missing", root.join("dead")).unwrap();
+        p.reload();
+        let dead = p.entries.iter().find(|e| e.name == "dead").unwrap();
+        assert!(dead.is_link && !dead.is_dir && !dead.exec);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_folder_that_cannot_be_read_shows_an_error() {
+        let mut p = Panel::new(std::env::temp_dir().join("far_no_such_folder_at_all"));
+        p.reload();
+        assert!(p.error.is_some());
+    }
+
+    #[test]
+    fn drawing_is_safe_at_every_size_and_in_every_view() {
+        let (mut p, root) = panel("sizes", &["a.zip", ".hidden", "日本語の名前.txt"], &["dir"]);
+        fs::write(root.join("x".repeat(200)), "").unwrap();
+        std::os::unix::fs::symlink("missing", root.join("dead")).unwrap();
+        p.reload();
+        p.entries[1].selected = true;
+        p.entries[0].scanned = Some(u64::MAX);
+        for view in [View::Brief, View::Medium, View::Full, View::Wide] {
+            p.view = view;
+            for w in 1..70u16 {
+                for h in 1..14u16 {
+                    for cursor in [0, p.entries.len() - 1] {
+                        p.cursor = cursor;
+                        let mut s = Screen::new(w, h);
+                        p.draw(&mut s, 0, 0, w, h, true);
+                    }
+                }
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -278,4 +278,17 @@ mod tests {
         assert_eq!(resolve_path(Path::new("/x"), "/y"), Path::new("/y"));
         assert_eq!(mode_string(0o755, true, false), "drwxr-xr-x");
     }
+
+    #[test]
+    fn full_timestamps_have_a_fixed_shape() {
+        let text = format_datetime(1_000_000_000);
+        assert_eq!(text.len(), 19, "{text}");
+        assert!(text.starts_with("2001-09-"), "{text}");
+    }
+
+    #[test]
+    fn dots_in_a_path_are_removed() {
+        assert_eq!(normalize(Path::new("/a/./b/../c")), Path::new("/a/c"));
+        assert_eq!(normalize(Path::new("/../..")), Path::new("/"));
+    }
 }

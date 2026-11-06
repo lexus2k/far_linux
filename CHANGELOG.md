@@ -4,6 +4,11 @@
 
 ### Added
 
+- The editor colours source code by the file's name or `#!` line, using the
+  `syntect` grammars and the colours of Colorer's default console scheme.
+- Text files and logs get the colours of Colorer's text type: numbers, dates,
+  times, addresses, strings and symbols. Android logcat lines also show their
+  level and tag in a colour for the level.
 - The key bar shows Far's Shift, Alt and Ctrl labels while the key is held, in
   panels, the viewer and the editor. This needs Windows Terminal's input mode.
 - `Tab` completes file and command names on the `Ctrl+O` console.
@@ -62,6 +67,15 @@
 
 ### Fixed
 
+- Pasting in Windows Terminal keeps line ends. A paste can arrive as key events,
+  with a line feed as Ctrl+Enter, or as plain text with its line ends as key
+  events. Both lost them, and the second put the key events in the text.
+- `far --keys` shows pasted text, as it now turns on bracketed paste.
+- `Ctrl+Enter` and `Ctrl+J` start a new line in the editor, as ConPTY can deliver
+  a pasted line feed as these keys.
+- A paste that stalls is waited for longer, and its late rest is still taken as
+  pasted text rather than keys, so its line ends cannot run commands. Control
+  characters such as Esc pressed during a paste are left out of it.
 - Saving through a dangling symbolic link writes to its target instead of replacing
   the link.
 - A failed Save As keeps the original path, so `F2` still saves to the old file.

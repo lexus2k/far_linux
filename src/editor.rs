@@ -6,10 +6,11 @@ use crate::dialog::{self, Field, Form};
 use crate::encoding;
 use crate::history::{History, Kind};
 use crate::screen::{
-    fit, fit_left, str_width, theme, Input, Key, KeyBars, Screen, Tui, ALT, ALT_SHIFT, CTRL,
+    fit, fit_left, str_width, theme, Input, Key, KeyBars, Screen, Style, Tui, ALT, ALT_SHIFT, CTRL,
     CTRL_SHIFT, NONE, SHIFT,
 };
 use crate::search::{is_word_char, Hit, Matcher, SearchOptions};
+use crate::syntax;
 use crate::util;
 use crate::viewer::{cell_width, visible_char};
 use crossterm::event::KeyCode;
@@ -56,6 +57,8 @@ pub struct Buffer {
     next_group: u64,
     open_group: Option<u64>,
     saved_id: u64,
+    /// The first line changed since the last `take_changed`.
+    changed_from: Option<usize>,
 }
 
 fn byte_at(line: &str, col: usize) -> usize {
@@ -78,7 +81,14 @@ impl Buffer {
             next_group: 1,
             open_group: None,
             saved_id: 0,
+            // Nothing has read this text yet.
+            changed_from: Some(0),
         }
+    }
+
+    /// Reports the first line changed since the last call, for the colours.
+    pub fn take_changed(&mut self) -> Option<usize> {
+        self.changed_from.take()
     }
 
     pub fn to_text(&self) -> String {
@@ -121,6 +131,7 @@ impl Buffer {
     }
 
     fn raw_replace(&mut self, start: Pos, end: Pos, text: &str) -> (String, Pos) {
+        self.changed_from = Some(self.changed_from.map_or(start.line, |l| l.min(start.line)));
         let removed = self.text_between(start, end);
         let first = &self.lines[start.line];
         let head = first[..byte_at(first, start.col)].to_owned();
@@ -467,6 +478,8 @@ struct Selection {
 
 /// Editor state, independent of the terminal.
 pub struct Editor {
+    /// Made on the first draw, and again if the file gets a new name.
+    colors: Option<syntax::Colors>,
     pub path: PathBuf,
     pub buf: Buffer,
     pub format: FileFormat,
@@ -538,6 +551,7 @@ impl Editor {
             }
         };
         Ok(Editor {
+            colors: None,
             path: path.to_path_buf(),
             buf: Buffer::from_text(&text),
             format,
@@ -758,6 +772,31 @@ impl Editor {
         self.sync_vis();
     }
 
+    /// Text the terminal pasted, as Ctrl+V reaches the terminal first in Windows
+    /// Terminal. If it is what was copied here, the copy also knows whether it
+    /// was a vertical block. Control characters other than tabs are left out.
+    pub fn paste_from_terminal(&mut self, text: &str, clip: &Clipboard) {
+        let text: String = text
+            .replace("\r\n", "\n")
+            .replace('\r', "\n")
+            .chars()
+            .filter(|c| !c.is_control() || matches!(c, '\n' | '\t'))
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        if clip.vertical
+            && clip.text.replace("\r\n", "\n").trim_end_matches('\n') == text.trim_end_matches('\n')
+        {
+            self.paste(clip);
+            return;
+        }
+        let start = self.cursor;
+        self.selection = None;
+        self.cursor = self.buf.replace(start, start, &text, start);
+        self.sync_vis();
+    }
+
     /// Pastes text. A vertical clipboard goes in as a column.
     pub fn paste(&mut self, clip: &Clipboard) {
         if clip.text.is_empty() {
@@ -831,6 +870,10 @@ impl Editor {
         write_file(&target, &bytes).map_err(|e| e.to_string())?;
         self.buf.mark_saved();
         self.mtime = fs::metadata(&target).ok().map(|m| stamp(&m));
+        if self.path != target {
+            // A new name can mean another language.
+            self.colors = None;
+        }
         self.path = target;
         Ok(())
     }
@@ -895,6 +938,14 @@ impl Editor {
         let stream = self.stream_range();
         let block = self.block_range();
         let mut buf = [0u8; 4];
+        let changed = self.buf.take_changed();
+        let colors = self
+            .colors
+            .get_or_insert_with(|| {
+                let first_line = self.buf.lines.first().map_or("", String::as_str);
+                syntax::Colors::for_file(&self.path, first_line)
+            })
+            .line_colors(&self.buf.lines, changed, self.top, rows);
         for y in 0..rows {
             let line_no = self.top + y;
             let Some(line) = self.buf.lines.get(line_no) else {
@@ -902,6 +953,7 @@ impl Editor {
             };
             let row = y as u16 + first;
             let mut vis = 0;
+            let line_colors = colors.get(y).map_or(&[][..], Vec::as_slice);
             for (i, c) in line.chars().enumerate() {
                 let cells = cell_width(c, vis);
                 let here = pos(line_no, i);
@@ -912,7 +964,10 @@ impl Editor {
                 let style = if chosen {
                     theme::EDITOR_SELECT
                 } else {
-                    theme::EDITOR
+                    match line_colors.get(i) {
+                        Some(fg) => Style::new(*fg, theme::EDITOR.bg),
+                        None => theme::EDITOR,
+                    }
                 };
                 if vis >= self.left {
                     let x = vis - self.left;
@@ -1265,6 +1320,10 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl+Q", "Insert the next key as a character"),
     ("Shift+Enter", "Insert file name from the active panel"),
     (
+        "Ctrl+Enter, Ctrl+J",
+        "New line. Windows Terminal can paste line ends as these",
+    ),
+    (
         "Ctrl+Shift+Enter",
         "Insert file name from the passive panel",
     ),
@@ -1278,7 +1337,7 @@ fn changes_text(key: Key) -> bool {
         (NONE, KeyCode::Char(_) | KeyCode::Enter | KeyCode::Tab) => true,
         (NONE, KeyCode::Backspace | KeyCode::Delete) => true,
         (SHIFT, KeyCode::Enter | KeyCode::Delete | KeyCode::Insert) => true,
-        (CTRL_SHIFT, KeyCode::Enter | KeyCode::Char('z')) => true,
+        (CTRL, KeyCode::Enter) | (CTRL_SHIFT, KeyCode::Enter | KeyCode::Char('z')) => true,
         (CTRL, KeyCode::Backspace | KeyCode::Delete | KeyCode::Insert) => {
             key.code != KeyCode::Insert
         }
@@ -1308,11 +1367,7 @@ pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<Ed
         let key = match input {
             Some(Input::Key(key)) => key,
             Some(Input::Paste(text)) if !ed.locked => {
-                let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                let start = ed.cursor;
-                ed.selection = None;
-                ed.cursor = ed.buf.replace(start, start, &text, start);
-                ed.sync_vis();
+                ed.paste_from_terminal(&text, ctx.clipboard);
                 continue;
             }
             _ => continue,
@@ -1400,7 +1455,9 @@ pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<Ed
             }
             (CTRL, KeyCode::Up) => ed.top = ed.top.saturating_sub(1),
             (CTRL, KeyCode::Down) => ed.top = (ed.top + 1).min(ed.buf.lines.len() - 1),
-            (NONE, KeyCode::Enter) => ed.type_text("\n"),
+            // ConPTY turns a line feed in pasted text into Ctrl+Enter, which has no
+            // other use in Far's editor.
+            (NONE | CTRL, KeyCode::Enter) => ed.type_text("\n"),
             (NONE, KeyCode::Tab) => ed.type_text("\t"),
             (SHIFT, KeyCode::Enter) => {
                 let name = ctx.active_name.clone();
@@ -1919,6 +1976,7 @@ mod tests {
 
     fn editor_with(text: &str) -> Editor {
         Editor {
+            colors: None,
             path: PathBuf::from("/nonexistent/x"),
             buf: Buffer::from_text(text),
             format: FileFormat {
@@ -2590,5 +2648,94 @@ mod tests {
         let mut s = Screen::new(20, 4);
         ed.draw(&mut s, true);
         assert_eq!(s.cursor, Some((0, 1)));
+    }
+
+    #[test]
+    fn drawing_is_safe_at_every_size() {
+        let long = "x".repeat(300);
+        let mut ed = editor_with(&format!("one\n\ttabbed\n{long}\nмного 日本語 /* x\n\n"));
+        // A name with colours, so that their drawing is covered too.
+        ed.path = PathBuf::from("/nonexistent/x.c");
+        for w in 1..50u16 {
+            for h in 1..8u16 {
+                let mut s = Screen::new(w, h);
+                ed.draw(&mut s, true);
+                ed.draw(&mut s, false);
+            }
+        }
+    }
+
+    use crossterm::style::Color;
+
+    fn colour_test_editor(name: &str, text: &str) -> (Editor, PathBuf) {
+        let dir = temp_dir(&format!("colours_{name}"));
+        let mut ed = editor_with(text);
+        ed.path = dir.join(name);
+        (ed, dir)
+    }
+
+    fn fg_at(ed: &mut Editor, line: u16) -> Color {
+        let mut s = Screen::new(40, 10);
+        ed.draw(&mut s, true);
+        // The status bar is the first row.
+        s.style_at(0, line + 1).fg
+    }
+
+    #[test]
+    fn an_edit_recolours_the_lines_below_it() {
+        let (mut ed, _dir) = colour_test_editor("a.c", "int a;\nint b;\nint c;\n");
+        assert_eq!(fg_at(&mut ed, 2), Color::Yellow);
+        ed.type_text("/*");
+        assert_eq!(fg_at(&mut ed, 2), Color::DarkCyan);
+    }
+
+    #[test]
+    fn the_highest_of_several_edits_decides_what_is_recoloured() {
+        let (mut ed, _dir) = colour_test_editor("a.c", "int a;\nint b;\nint c;\nint d;\n");
+        assert_eq!(fg_at(&mut ed, 3), Color::Yellow);
+        ed.cursor = pos(2, 0);
+        ed.type_text("x");
+        ed.cursor = pos(0, 0);
+        ed.type_text("/*");
+        assert_eq!(fg_at(&mut ed, 1), Color::DarkCyan);
+    }
+
+    #[test]
+    fn a_new_name_can_bring_new_colours() {
+        let (mut ed, dir) = colour_test_editor("a.qqq", "int a;\n");
+        assert_eq!(fg_at(&mut ed, 0), theme::EDITOR.fg);
+        ed.save_to(dir.join("a.c")).unwrap();
+        assert_eq!(fg_at(&mut ed, 0), Color::Yellow);
+    }
+
+    #[test]
+    fn a_vertical_block_pasted_through_the_terminal_stays_a_column() {
+        let mut ed = editor_with("ab\ncd\n");
+        let clip = Clipboard {
+            text: "1\n2".into(),
+            vertical: true,
+        };
+        ed.cursor = pos(0, 1);
+        ed.paste_from_terminal("1\r2\r", &clip);
+        assert_eq!(ed.buf.to_text(), "a1b\nc2d\n");
+    }
+
+    #[test]
+    fn a_paste_drops_control_characters_and_an_empty_one_changes_nothing() {
+        let mut ed = editor_with("x");
+        let clip = Clipboard::default();
+        ed.paste_from_terminal("\x1b\x03", &clip);
+        assert!(!ed.buf.is_modified());
+        ed.paste_from_terminal("a\x1b[2J\tb\x07", &clip);
+        assert_eq!(ed.buf.to_text(), "a[2J\tbx");
+    }
+
+    #[test]
+    fn ctrl_enter_and_ctrl_j_start_a_new_line_only_in_the_help_and_bindings() {
+        assert!(HELP.iter().any(|(k, _)| k.contains("Ctrl+Enter")));
+        assert!(changes_text(Key {
+            code: KeyCode::Enter,
+            mods: CTRL
+        }));
     }
 }

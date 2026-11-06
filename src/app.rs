@@ -472,6 +472,8 @@ pub fn show_keys() -> io::Result<()> {
     if win32 {
         execute!(out, Print(input::ENABLE))?;
     }
+    // Without this a terminal types a paste out as keys.
+    execute!(out, event::EnableBracketedPaste)?;
     let protocol = if enhanced { "yes" } else { "no" };
     let modifiers = if win32 { "yes" } else { "no" };
     execute!(
@@ -489,6 +491,7 @@ pub fn show_keys() -> io::Result<()> {
             Event::Key(raw) if raw.kind != KeyEventKind::Release => Some(Input::Key(
                 screen::normalize_key(raw.code, raw.modifiers, enhanced),
             )),
+            Event::Paste(text) => Some(Input::Paste(text)),
             _ => None,
         })
     };
@@ -504,10 +507,15 @@ pub fn show_keys() -> io::Result<()> {
                 Some(Input::Held(mods)) => {
                     execute!(out, Print(format!("Held: {mods}\r\n")))?;
                 }
+                Some(Input::Paste(text)) => {
+                    // Debug format, so that control characters show as text.
+                    execute!(out, Print(format!("Paste: {text:?}\r\n")))?;
+                }
                 _ => {}
             }
         }
     })();
+    execute!(out, event::DisableBracketedPaste)?;
     if win32 {
         execute!(out, Print(input::DISABLE))?;
     }
@@ -3150,5 +3158,76 @@ mod tests {
     fn progress_handles_zero_totals() {
         let mut s = screen::Screen::new(80, 24);
         draw_progress(&mut s, "Copy", &Progress::default());
+    }
+
+    #[test]
+    fn side_panels_and_progress_are_safe_at_every_size() {
+        let source = Panel::new(std::env::temp_dir());
+        for w in 1..50u16 {
+            for h in 1..14u16 {
+                let mut s = screen::Screen::new(w, h);
+                draw_info(&mut s, &source, 0, w, h);
+                draw_quick_view(&mut s, &source, 0, w, h);
+                draw_progress(&mut s, "Copy", &Progress::default());
+            }
+        }
+    }
+
+    #[test]
+    fn top_menu_is_safe_at_every_size() {
+        let entries = commands_menu();
+        for w in 1..50u16 {
+            for h in 1..14u16 {
+                let mut s = screen::Screen::new(w, h);
+                draw_top_menu(
+                    &mut s,
+                    &["Left", "Files", "Commands", "Right"],
+                    2,
+                    &entries,
+                    3,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_key_action_in_the_menus_has_its_key() {
+        // A menu entry that names one F key or Ctrl key must be bound to it.
+        for (name, key, action) in panel_menu()
+            .into_iter()
+            .chain(files_menu())
+            .chain(commands_menu())
+        {
+            let parsed = match key {
+                "F1" => Some((NONE, KeyCode::F(1))),
+                "F3" => Some((NONE, KeyCode::F(3))),
+                "F5" => Some((NONE, KeyCode::F(5))),
+                "F6" => Some((NONE, KeyCode::F(6))),
+                "F7" => Some((NONE, KeyCode::F(7))),
+                "F10" => Some((NONE, KeyCode::F(10))),
+                "Alt+F7" => Some((ALT, KeyCode::F(7))),
+                "Alt+F8" => Some((ALT, KeyCode::F(8))),
+                "Ctrl+O" => Some((CTRL, KeyCode::Char('o'))),
+                "Ctrl+U" => Some((CTRL, KeyCode::Char('u'))),
+                _ => None,
+            };
+            if let Some((mods, code)) = parsed {
+                assert_eq!(
+                    key_action(Key { code, mods }, false),
+                    Some(action),
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cancelling_keys() {
+        let key = |code, mods| Key { code, mods };
+        assert!(cancels(key(KeyCode::Esc, NONE)));
+        assert!(cancels(key(KeyCode::Char('c'), CTRL)));
+        assert!(!cancels(key(KeyCode::Char('c'), NONE)));
+        assert!(!cancels(key(KeyCode::Char('c'), ALT)));
+        assert!(!cancels(key(KeyCode::Enter, NONE)));
     }
 }
