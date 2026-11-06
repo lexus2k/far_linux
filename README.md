@@ -171,3 +171,10 @@ cargo clippy --all-targets
 The end-to-end tests in `tests/tui.rs` run the real binary in tmux. They are
 skipped if tmux is not installed. See [AGENTS.md](AGENTS.md) for the code layout
 and project rules.
+
+## Licence
+
+MIT, see [LICENSE](LICENSE). The syntax colours follow the default console
+scheme and text rules of the [Colorer](https://github.com/colorer/Colorer-library)
+library, which Far's Colorer plugin uses, and the grammars come from
+[syntect](https://github.com/trishume/syntect).

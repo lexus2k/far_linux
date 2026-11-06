@@ -1,5 +1,10 @@
 //! Syntax colours for the editor, which Far gets from its Colorer plugin. The
 //! grammars come from the `syntect` crate. No terminal code here.
+//!
+//! The colours, the text type's file names and its patterns follow Colorer's
+//! `hrd/console/default.hrd`, `hrc/proto.hrc`, `misc/text.hrc`, `lib/default.hrc`
+//! and `misc/markdown.hrc`, from the Colorer library by Cail Lomecb and others,
+//! available under MPL 1.1, GPL 2.0 or LGPL 2.1.
 
 use crossterm::style::Color;
 use fancy_regex::Regex;
