@@ -31,7 +31,7 @@ jobs:
     outputs:
       version: ${{ steps.pick.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - id: pick
         env:
           WANTED: ${{ inputs.version }}
@@ -55,7 +55,7 @@ jobs:
   test:
     runs-on: ubuntu-22.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install tmux for the end-to-end tests
         run: sudo apt-get update && sudo apt-get install -y tmux
       - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
@@ -79,7 +79,7 @@ jobs:
       CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
       CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Install the arm64 cross compiler and emulator
         if: matrix.arch == 'arm64'
         run: |
@@ -115,7 +115,7 @@ jobs:
             "far_linux $VERSION "*) ;;
             *) echo "::error::Expected far_linux $VERSION, got: $out"; exit 1 ;;
           esac
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: deb-${{ matrix.arch }}
           path: dist/*.deb
@@ -128,7 +128,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: deb-*
           path: dist
