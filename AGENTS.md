@@ -29,6 +29,7 @@ pass trivially if tmux is missing, because they skip themselves.
 | `src/panel.rs` | Directory and archive listing, sorting, selection, panel drawing |
 | `src/viewer.rs` | F3 viewer. Reads on demand and never loads the whole file |
 | `src/editor.rs` | F4 editor: buffer, undo, blocks, search, saving |
+| `src/syntax.rs` | Syntax colours for the editor, from `syntect` grammars with Colorer's default colours |
 | `src/shell.rs` | Runs commands in bash and carries cwd and exports between them |
 | `src/screen.rs` | Cell buffer, terminal setup, key normalization, theme |
 | `src/input.rs` | Windows Terminal's input mode, which reports modifier keys alone |

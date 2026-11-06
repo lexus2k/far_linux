@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.85"
 description = "A Far Manager 3 style file manager for Linux terminals"
+license = "MIT"
 repository = "https://github.com/lexus2k/far_linux"
 
 [lib]
@@ -24,6 +25,7 @@ rusqlite = { version = "0.41", features = ["bundled"] }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 tar = "0.4"
 flate2 = "1"
+syntect = { version = "5.3.0", default-features = false, features = ["default-syntaxes", "regex-fancy", "parsing"] }
 
 [profile.release]
 opt-level = 3

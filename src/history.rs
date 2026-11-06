@@ -372,4 +372,13 @@ mod tests {
         assert!(History::open(&path).is_err());
         fs::remove_file(path).unwrap();
     }
+
+    #[test]
+    fn text_settings_are_kept_and_replaced() {
+        let h = History::in_memory();
+        assert_eq!(h.setting("key"), None);
+        h.set_setting("key", "one");
+        h.set_setting("key", "two");
+        assert_eq!(h.setting("key").as_deref(), Some("two"));
+    }
 }

@@ -219,6 +219,11 @@ impl Screen {
         self.cells[self.idx(x, y)].ch
     }
 
+    /// Reads the style at a position. Used by tests.
+    pub fn style_at(&self, x: u16, y: u16) -> Style {
+        self.cells[self.idx(x, y)].style
+    }
+
     /// Returns the text of a row. Used by tests.
     pub fn row_text(&self, y: u16) -> String {
         (0..self.w)
@@ -845,5 +850,52 @@ mod tests {
         assert_eq!((k.code, k.mods), (KeyCode::Enter, CTRL));
         let k = normalize_key(KeyCode::BackTab, SHIFT, false);
         assert_eq!((k.code, k.mods), (KeyCode::Tab, SHIFT));
+    }
+
+    #[test]
+    fn the_key_bar_is_safe_at_every_width() {
+        let bars = KeyBars {
+            plain: ["Label"; 12],
+            shift: ["Label"; 12],
+            alt: ["Label"; 12],
+            ctrl: ["Label"; 12],
+        };
+        for w in 1..40 {
+            let mut s = Screen::new(w, 1);
+            s.keybar(0, &bars);
+        }
+    }
+
+    #[test]
+    fn frames_and_titles_are_safe_when_they_do_not_fit() {
+        for w in 1..12 {
+            for h in 1..6 {
+                let mut s = Screen::new(w, h);
+                s.frame(0, 0, w, h, true, theme::PANEL);
+                s.frame(2, 2, 20, 20, false, theme::PANEL);
+                s.title(0, 0, w, "a title longer than the screen", theme::PANEL);
+                s.fill(1, 1, 50, 50, 'x', theme::PANEL);
+                s.put(w + 3, h + 3, "off screen", theme::PANEL);
+            }
+        }
+    }
+
+    #[test]
+    fn fitting_text_with_wide_characters() {
+        assert_eq!(fit("日本", 3), "日 ");
+        assert_eq!(fit_name("日本語", 4), "日 }");
+        assert_eq!(fit_left("abc", 2), "..");
+        assert_eq!(fit_left("abcdef", 3), "...");
+        assert_eq!(fit_name("abc", 0), "");
+    }
+
+    #[test]
+    fn a_shifted_letter_is_just_the_letter_and_ctrl_j_is_enter() {
+        let k = normalize_key(KeyCode::Char('я'), SHIFT, false);
+        assert_eq!((k.code, k.mods), (KeyCode::Char('я'), NONE));
+        let k = normalize_key(KeyCode::F(3), SHIFT | KeyModifiers::SUPER, false);
+        assert_eq!((k.code, k.mods), (KeyCode::F(3), SHIFT));
+        let k = normalize_key(KeyCode::Char('Ф'), ALT, false);
+        assert_eq!((k.code, k.mods), (KeyCode::Char('ф'), ALT));
     }
 }

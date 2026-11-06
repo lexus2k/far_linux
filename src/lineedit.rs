@@ -217,4 +217,86 @@ mod tests {
         e.backspace();
         assert_eq!(e.text(), "фай");
     }
+
+    fn key(e: &mut LineEdit, code: KeyCode, mods: KeyModifiers) -> bool {
+        e.handle(code, mods)
+    }
+
+    #[test]
+    fn standard_keys_edit_the_line() {
+        use KeyCode::*;
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        let mut e = LineEdit::new();
+        e.set("one two");
+        assert!(key(&mut e, Home, none));
+        assert_eq!(e.cursor(), 0);
+        assert!(key(&mut e, Right, none));
+        assert_eq!(e.cursor(), 1);
+        assert!(key(&mut e, Left, none));
+        assert!(key(&mut e, Delete, none));
+        assert_eq!(e.text(), "ne two");
+        assert!(key(&mut e, Right, ctrl));
+        assert_eq!(e.cursor(), 3);
+        assert!(key(&mut e, Left, ctrl));
+        assert_eq!(e.cursor(), 0);
+        assert!(key(&mut e, End, none));
+        assert!(key(&mut e, Backspace, none));
+        assert_eq!(e.text(), "ne tw");
+        assert!(key(&mut e, Backspace, ctrl));
+        assert_eq!(e.text(), "ne ");
+        assert!(key(&mut e, Char('s'), ctrl));
+        assert_eq!(e.cursor(), 2);
+        assert!(key(&mut e, Char('d'), ctrl));
+        assert_eq!(e.cursor(), 3);
+        assert!(key(&mut e, Char('x'), none));
+        assert_eq!(e.text(), "ne x");
+        assert!(key(&mut e, Char('y'), ctrl));
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn keys_it_does_not_know_are_left_for_the_caller() {
+        let mut e = LineEdit::new();
+        assert!(!key(&mut e, KeyCode::F(1), KeyModifiers::NONE));
+        assert!(!key(&mut e, KeyCode::Char('a'), KeyModifiers::ALT));
+        assert!(!key(&mut e, KeyCode::Char('q'), KeyModifiers::CONTROL));
+        assert!(e.is_empty());
+    }
+
+    #[test]
+    fn edges_are_safe() {
+        let mut e = LineEdit::new();
+        e.left();
+        e.right();
+        e.backspace();
+        e.delete();
+        e.delete_word_left();
+        e.word_left();
+        e.word_right();
+        assert_eq!((e.text().as_str(), e.cursor()), ("", 0));
+    }
+
+    #[test]
+    fn inserted_text_loses_control_characters() {
+        let mut e = LineEdit::new();
+        e.insert_str("a\x1b[2J\nb");
+        assert_eq!(e.text(), "a[2Jb");
+    }
+
+    #[test]
+    fn moving_keys_keep_prefilled_text_and_backspace_too() {
+        for step in [
+            LineEdit::home,
+            LineEdit::end,
+            LineEdit::right,
+            LineEdit::backspace,
+        ] {
+            let mut e = LineEdit::prefilled("old");
+            step(&mut e);
+            e.insert('x');
+            assert!(e.text().contains('x') && e.text().len() > 1, "{}", e.text());
+        }
+        assert_eq!(LineEdit::prefilled("").text(), "");
+    }
 }

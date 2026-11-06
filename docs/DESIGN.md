@@ -84,6 +84,23 @@ Next:
 
 ## Known issues
 
+- Only logcat is known as a log format. Other logs get Colorer's text colours, so
+  words such as `ERROR` are not picked out.
+- Syntax colours start at most 1000 lines above the screen after a jump, as a
+  full parse takes seconds. A jump into the middle of a long comment or string
+  can colour it as code, until scrolling up to it parses the text above. The
+  colours are fixed, with no settings or scheme choice, and the viewer has none.
+- Pasting is tested against input recorded from Windows' own ConPTY (conhost
+  10.0.26200), and against the form seen in Windows Terminal 1.24, which differs.
+  The copy of ConPTY bundled with the terminal cannot be run from WSL. Without paste markers,
+  a line feed is indistinguishable from Ctrl+Enter. The editor treats it as a new
+  line, but on the command line it would insert the file name, and a pasted CR
+  would be Enter and run the line.
+- A paste with no end marker is given up on after 5 seconds of silence. Input in
+  the next 5 seconds is taken as its rest, so keys typed then become text.
+- Lines over 1000 characters are not coloured, and parsing goes back at most
+  32 KB after a jump. A screen of lines just under that takes about 0.3 s.
+
 From the first review, not yet fixed:
 
 - Non-UTF-8 names: a command built from one uses lossy text, `Ctrl+Enter` on a

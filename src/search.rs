@@ -696,4 +696,43 @@ mod tests {
         assert_eq!(parse_hex("zz"), None);
         assert_eq!(parse_hex(""), None);
     }
+
+    #[test]
+    fn regex_classes_keep_their_literal_brackets() {
+        assert!(regex("[]a]+").find("x]a", 0, false).is_some());
+        assert!(regex("[^]a]").find("]a", 0, false).is_none());
+        assert!(regex("[^]a]").find("]b", 0, false).is_some());
+        assert!(regex("[\\d]+").find("a1", 0, false).is_some());
+    }
+
+    #[test]
+    fn fuzzy_search_folds_special_letters() {
+        for (pattern, line) in [
+            ("strasse", "Straße"),
+            ("aeon", "Æon"),
+            ("oeuvre", "œuvre"),
+            ("oslo", "Øslo"),
+            ("lodz", "Łodz"),
+            ("dorde", "Đorde"),
+        ] {
+            let m = Matcher::new(&SearchOptions {
+                fuzzy: true,
+                ..opts(pattern)
+            })
+            .unwrap();
+            assert!(m.find(line, 0, false).is_some(), "{pattern} in {line}");
+        }
+    }
+
+    #[test]
+    fn tokens_split_at_non_letters() {
+        assert_eq!(split_tokens("one-two  three"), ["one", "two", "three"]);
+        assert_eq!(split_tokens("--"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn hex_text() {
+        assert_eq!(parse_hex("41 42"), Some(vec![0x41, 0x42]));
+        assert_eq!(parse_hex("zz"), None);
+    }
 }

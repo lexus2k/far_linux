@@ -1306,4 +1306,55 @@ mod tests {
         assert_eq!(v.decode(&[0xc6]), vec![('Ж', 1)]);
         fs::remove_file(p).unwrap();
     }
+
+    #[test]
+    fn a_folder_cannot_be_viewed() {
+        assert!(Viewer::open(&std::env::temp_dir()).is_err());
+    }
+
+    #[test]
+    fn growth_of_the_file_is_noticed() {
+        let (mut v, p) = make("grow", b"one");
+        fs::write(&p, b"one two").unwrap();
+        v.refresh_size();
+        assert_eq!(v.size, 7);
+        fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn drawing_is_safe_at_every_size_and_in_every_mode() {
+        let mut data = b"short\nline\t\xff\xfe\x1b[2J\n".to_vec();
+        data.extend(vec![b'x'; 500]);
+        data.extend("\nмногобайтный 日本語\n".as_bytes());
+        let (mut v, p) = make("sizes", &data);
+        for (wrap, hex, dump) in [
+            (false, false, false),
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            v.wrap = wrap;
+            v.hex = hex;
+            v.dump = dump;
+            for w in 1..50u16 {
+                for h in 1..8u16 {
+                    let mut s = Screen::new(w, h);
+                    v.draw(&mut s, true);
+                    v.draw(&mut s, false);
+                }
+            }
+        }
+        fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn an_empty_file_draws_and_scrolls() {
+        let (mut v, p) = make("empty", b"");
+        let mut s = Screen::new(40, 10);
+        v.draw(&mut s, true);
+        v.scroll_down(5, 5, 40);
+        v.scroll_up(5, 40);
+        assert_eq!(v.top, 0);
+        fs::remove_file(p).unwrap();
+    }
 }

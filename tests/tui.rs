@@ -1274,3 +1274,425 @@ fn keys_typed_on_the_console_do_not_wait_for_a_later_visit() {
     s.wait_file(&s.p("left/typed_ahead"), true);
     s.wait("5Copy");
 }
+
+#[test]
+fn f8_moves_to_the_trash() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F8"]);
+    s.wait("Move to the trash");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("home/data/Trash/files/alpha.txt"), true);
+    s.wait_file(&s.p("left/alpha.txt"), false);
+}
+
+/// The trash cannot be created under /proc, as on another file system.
+const NO_TRASH: &str = "XDG_DATA_HOME=/proc/far_no_trash";
+
+#[test]
+fn a_file_that_cannot_go_to_the_trash_asks_and_skip_keeps_it() {
+    let Some(s) = Session::start_with(NO_TRASH, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F8"]);
+    s.wait("Move to the trash");
+    s.keys(&["Enter"]);
+    s.wait("This cannot go to the trash");
+    assert!(s.p("left/alpha.txt").exists());
+    // Delete, All, Skip, Cancel.
+    s.keys(&["Right", "Right", "Enter"]);
+    s.wait_gone("This cannot go to the trash");
+    s.wait("5Copy");
+    assert!(s.p("left/alpha.txt").exists());
+}
+
+#[test]
+fn a_file_that_cannot_go_to_the_trash_can_be_deleted_for_good() {
+    let Some(s) = Session::start_with(NO_TRASH, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F8"]);
+    s.wait("Move to the trash");
+    s.keys(&["Enter"]);
+    s.wait("This cannot go to the trash");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/alpha.txt"), false);
+}
+
+#[test]
+fn moving_a_full_folder_into_an_archive_does_not_ask_about_deleting_it() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/full")).unwrap();
+        fs::write(root.join("left/full/inner"), "x").unwrap();
+        fs::write(root.join("right/seed.txt"), "s").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("full");
+    s.keys(&["Tab"]);
+    s.wait("seed.txt");
+    s.keys(&["Down", "S-F1"]);
+    s.wait("Archive name");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/seed.txt.zip"), true);
+    s.wait("2 files");
+    s.keys(&["Enter"]);
+    s.wait("seed.txt.zip:/");
+    s.keys(&["Tab", "Down", "F6"]);
+    s.wait("Move to archive");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/full"), false);
+    assert!(!s.screen().contains("will be deleted"), "{}", s.screen());
+}
+
+#[test]
+fn f3_counts_all_selected_folders() {
+    let Some(s) = Session::start(|root| {
+        for (name, size) in [("one", 1111), ("two", 2222)] {
+            fs::create_dir(root.join("left").join(name)).unwrap();
+            fs::write(root.join("left").join(name).join("data"), vec![0u8; size]).unwrap();
+        }
+    }) else {
+        return;
+    };
+    s.wait("two");
+    s.keys(&["Down", "IC", "IC"]);
+    s.wait("in 2 items");
+    // Back onto a folder, as the selection is what gets counted.
+    s.keys(&["Up", "F3"]);
+    s.wait("3 333 bytes in 2 items");
+}
+
+#[test]
+fn exit_inside_a_longer_command_goes_to_bash_and_far_stays() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text("(exit 3); touch still_here");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/still_here"), true);
+    s.wait("5Copy");
+}
+
+#[test]
+fn key_bar_follows_modifiers_in_the_viewer_and_editor() {
+    let Some(s) = Session::start_with(WIN32, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    let release = "\x1b[16;0;0;0;0;1_";
+    s.text(&win32_key(0x28, 0, 0));
+    s.text(&win32_key(0x72, 0, 0));
+    s.wait("alpha contents");
+    s.wait("7Search");
+    s.text(&win32_key(0x10, 0, SHIFT));
+    s.wait("2WWrap");
+    s.text(release);
+    s.wait("7Search");
+    s.text(&win32_key(0x11, 0, LEFT_CTRL));
+    s.wait("10GoFile");
+    s.text("\x1b[17;0;0;0;0;1_");
+    s.text(&win32_key(0x79, 0, 0));
+    s.wait("5Copy");
+    s.text(&win32_key(0x73, 0, 0));
+    s.wait("alpha contents");
+    s.wait("2Save");
+    s.text(&win32_key(0x10, 0, SHIFT));
+    s.wait("2SaveAs");
+    s.text(release);
+    s.wait("2Save ");
+    s.text(&win32_key(0x11, 0, LEFT_CTRL));
+    s.wait("7Replac");
+}
+
+#[test]
+fn a_failed_save_as_keeps_the_original_file_for_f2() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "F4"]);
+    s.wait("alpha contents");
+    s.text("NEW ");
+    s.wait("NEW alpha");
+    s.keys(&["S-F2"]);
+    s.wait("File name:");
+    s.keys(&["C-y"]);
+    s.text("/proc/no/such/folder/file");
+    s.keys(&["Enter"]);
+    s.wait("Save failed");
+    s.keys(&["Enter"]);
+    s.wait_gone("Save failed");
+    s.keys(&["F2"]);
+    s.wait_for("the save", |_| {
+        fs::read_to_string(s.p("left/alpha.txt")).is_ok_and(|t| t.starts_with("NEW alpha"))
+    });
+}
+
+#[test]
+fn the_results_of_find_show_the_end_of_long_paths() {
+    let deep = "a_very_long_folder_name_that_fills_the_screen/".repeat(4);
+    let Some(s) = Session::start(|root| {
+        fs::create_dir_all(root.join("left").join(&deep)).unwrap();
+        fs::write(root.join("left").join(&deep).join("needle.log"), "x").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("a_very");
+    s.keys(&["M-F7"]);
+    s.wait("File mask");
+    s.keys(&["C-y"]);
+    s.text("needle*");
+    s.keys(&["Enter"]);
+    s.wait("needle.log");
+}
+
+#[test]
+fn ctrl_c_cancels_a_prompt_free_panel_state_without_quitting() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["C-c", "C-c"]);
+    s.keys(&["Down", "IC"]);
+    s.wait("in 1 items");
+}
+
+#[test]
+fn marked_names_are_fixed_yellow_on_screen() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.keys(&["Down", "IC"]);
+    s.wait("in 1 items");
+    s.keys(&["Up"]);
+    s.wait_for("the yellow name", |_| has_color(&s, "226", "alpha.txt"));
+}
+
+fn editor_with_lines(s: &Session) {
+    s.keys(&["Down", "F4"]);
+    s.wait("line_a");
+}
+
+fn with_three_lines(root: &Path) {
+    fs::write(root.join("left/text.txt"), "line_a\nline_b\nline_c\n").unwrap();
+}
+
+#[test]
+fn ctrl_c_then_ctrl_v_in_the_editor_keeps_line_ends() {
+    let Some(s) = Session::start(with_three_lines) else {
+        return;
+    };
+    s.wait("text.txt");
+    editor_with_lines(&s);
+    // Mark all three lines, copy, go to the end and paste.
+    s.keys(&["S-Down", "S-Down", "S-Down", "C-c", "C-End", "C-v", "F2"]);
+    s.wait_for("the save", |_| {
+        fs::read_to_string(s.p("left/text.txt")).is_ok_and(|t| t.lines().count() > 3)
+    });
+    assert_eq!(
+        fs::read_to_string(s.p("left/text.txt")).unwrap(),
+        "line_a\nline_b\nline_c\nline_a\nline_b\nline_c\n"
+    );
+}
+
+#[test]
+fn a_terminal_paste_in_the_editor_keeps_line_ends() {
+    let Some(s) = Session::start(with_three_lines) else {
+        return;
+    };
+    s.wait("text.txt");
+    editor_with_lines(&s);
+    s.tmux(&["set-buffer", "-b", "p", "pasted_1\npasted_2\n"]);
+    s.keys(&["C-End"]);
+    s.tmux(&["paste-buffer", "-p", "-b", "p", "-t", "t"]);
+    s.wait("pasted_2");
+    s.keys(&["F2"]);
+    s.wait_for("the save", |_| {
+        fs::read_to_string(s.p("left/text.txt")).is_ok_and(|t| t.contains("pasted_2"))
+    });
+    assert_eq!(
+        fs::read_to_string(s.p("left/text.txt")).unwrap(),
+        "line_a\nline_b\nline_c\npasted_1\npasted_2\n"
+    );
+}
+
+/// How a paste appears to arrive in Windows Terminal's input mode: characters
+/// sent as key events with no key code. Not confirmed in Windows Terminal.
+fn synthetic_text(text: &str) -> String {
+    text.encode_utf16()
+        .map(|unit| format!("\x1b[0;0;{unit};1;0;1_\x1b[0;0;{unit};0;0;1_"))
+        .collect()
+}
+
+#[test]
+fn a_paste_sent_as_key_events_keeps_line_ends() {
+    let Some(s) = Session::start_with(WIN32, with_three_lines) else {
+        return;
+    };
+    s.wait("text.txt");
+    s.text(&win32_key(0x28, 0, 0));
+    s.text(&win32_key(0x73, 0, 0));
+    s.wait("line_a");
+    s.text(&win32_key(0x23, 0, LEFT_CTRL));
+    s.text(&synthetic_text("pasted_1\rpasted_2\r"));
+    s.wait("pasted_2");
+    s.text(&win32_key(0x71, 0, 0));
+    s.wait_for("the save", |_| {
+        fs::read_to_string(s.p("left/text.txt")).is_ok_and(|t| t.contains("pasted_2"))
+    });
+    assert_eq!(
+        fs::read_to_string(s.p("left/text.txt")).unwrap(),
+        "line_a\nline_b\nline_c\npasted_1\npasted_2\n"
+    );
+}
+
+#[test]
+fn source_code_is_coloured_in_the_editor() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", |root| {
+        fs::write(
+            root.join("left/code.cpp"),
+            "int first; // a_comment\nint main() { return 42; }\nconst char* s = \"text\";\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("code.cpp");
+    s.keys(&["Down", "F4"]);
+    s.wait("a_comment");
+    let raw = |wanted: &str| {
+        s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+            .contains(wanted)
+    };
+    s.wait_for("the comment colour", |_| raw("38;5;30m// a_comment"));
+    assert!(raw("38;5;231mreturn"), "keyword");
+    assert!(raw("38;5;46m42"), "number");
+    assert!(raw("38;5;226mint"), "type");
+    assert!(raw("38;5;226m\"text\""), "string");
+    // Colours must not reach the saved text.
+    s.keys(&["C-End"]);
+    s.text("tail");
+    s.wait("tail");
+    s.keys(&["F2"]);
+    s.wait_for("the save", |_| {
+        fs::read_to_string(s.p("left/code.cpp")).is_ok_and(|t| t.ends_with("tail"))
+    });
+    assert_eq!(
+        fs::read_to_string(s.p("left/code.cpp")).unwrap(),
+        "int first; // a_comment\nint main() { return 42; }\nconst char* s = \"text\";\ntail"
+    );
+}
+
+/// Pasted text as ConPTY delivers it: real key codes, with a line feed as
+/// Ctrl+Enter. Recorded from conhost 10.0.26200.
+fn conpty_text(text: &str) -> String {
+    let press = |vk: u32, unit: u32, state: u32| {
+        format!("\x1b[{vk};0;{unit};1;{state};1_\x1b[{vk};0;{unit};0;{state};1_")
+    };
+    text.chars()
+        .map(|c| match c {
+            '\n' => format!("\x1b[17;29;0;1;8;1_{}\x1b[17;29;0;0;0;1_", press(13, 10, 8)),
+            '\r' => press(13, 13, 0),
+            c => press(c.to_ascii_uppercase() as u32, c as u32, 0),
+        })
+        .collect()
+}
+
+/// A paste marker as ConPTY delivers it: key events with no key code, pressed
+/// and never released.
+fn conpty_marker(marker: &str) -> String {
+    marker
+        .chars()
+        .map(|c| format!("\x1b[0;0;{};1;0;1_", c as u32))
+        .collect()
+}
+
+fn paste_through_conpty(payload: &str) {
+    let Some(s) = Session::start_with(WIN32, with_three_lines) else {
+        return;
+    };
+    s.wait("text.txt");
+    s.text(&win32_key(0x28, 0, 0));
+    s.text(&win32_key(0x73, 0, 0));
+    s.wait("line_a");
+    s.text(&win32_key(0x23, 0, LEFT_CTRL));
+    s.wait("Ln 4/4");
+    s.text(payload);
+    s.wait("pasted_2");
+    s.text(&win32_key(0x71, 0, 0));
+    s.wait_for("the save", |_| {
+        fs::read_to_string(s.p("left/text.txt")).is_ok_and(|t| t.contains("pasted_2"))
+    });
+    assert_eq!(
+        fs::read_to_string(s.p("left/text.txt")).unwrap(),
+        "line_a\nline_b\nline_c\npasted_1\npasted_2\n"
+    );
+}
+
+#[test]
+fn a_paste_with_markers_through_conpty_keeps_line_ends() {
+    let body = conpty_text("pasted_1\npasted_2\n");
+    let start = conpty_marker("\x1b[200~");
+    let end = conpty_marker("\x1b[201~");
+    paste_through_conpty(&format!("{start}{body}{end}"));
+}
+
+#[test]
+fn a_paste_without_markers_through_conpty_keeps_line_ends() {
+    paste_through_conpty(&conpty_text("pasted_1\npasted_2\n"));
+}
+
+/// A paste as the user's Windows Terminal 1.24 sent it: plain markers and text,
+/// with each line end as a pair of key events. Taken from what they saw on screen.
+#[test]
+fn a_paste_with_line_ends_as_key_events_keeps_them() {
+    let end = "\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_";
+    paste_through_conpty(&format!("\x1b[200~pasted_1{end}pasted_2{end}\x1b[201~"));
+}
+
+#[test]
+fn android_logs_are_coloured_in_the_editor() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", |root| {
+        fs::write(
+            root.join("left/device.log"),
+            "x\n11-03 22:44:11.802  1234  5678 E BootTag: failed 42\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("device.log");
+    s.keys(&["Down", "F4"]);
+    s.wait("BootTag");
+    let raw = |wanted: &str| {
+        s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+            .contains(wanted)
+    };
+    s.wait_for("the error colour", |_| raw("38;5;196mBootTag"));
+    assert!(raw("38;5;196mE"), "level");
+    assert!(raw("38;5;46m42"), "number");
+}
+
+/// A paste that stalls longer than the give-up time must not run its rest as a
+/// command when the line end comes late.
+#[test]
+fn a_stalled_paste_does_not_run_its_rest_as_a_command() {
+    let Some(s) = Session::start_with(WIN32, with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text("\x1b[200~touch pwned");
+    std::thread::sleep(Duration::from_millis(1500));
+    s.text("\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_\x1b[201~");
+    s.wait("touch pwned");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert!(!s.p("left/pwned").exists());
+    assert!(s.screen().contains("touch pwned"), "{}", s.screen());
+}

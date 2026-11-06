@@ -2048,4 +2048,339 @@ mod tests {
         assert!(file_contains(&f, b"needle", false, &|| false));
         assert!(!file_contains(&f, b"absent", false, &|| false));
     }
+
+    fn mkfifo(path: &Path) {
+        let c = cstring(path).unwrap();
+        // SAFETY: `c` is a valid path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    }
+
+    /// Permission tests mean nothing to root.
+    fn is_root() -> bool {
+        // SAFETY: geteuid has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    fn inside(d: &TestDir, folder: &str) -> String {
+        fs::create_dir_all(d.p(folder)).unwrap();
+        format!("{}/", d.p(folder).display())
+    }
+
+    #[test]
+    fn special_files_are_reported_and_skipped_not_copied() {
+        let d = TestDir::new("copy_fifo");
+        mkfifo(&d.p("pipe"));
+        let mut ui = Script::default();
+        let target = inside(&d, "out");
+        let s = copy_items(
+            &[d.p("pipe")],
+            &target,
+            &base(),
+            &CopyOptions::default(),
+            &mut ui,
+        );
+        assert_eq!((s.skipped, ui.errors.len()), (1, 1));
+        assert!(!d.p("out/pipe").exists());
+    }
+
+    #[test]
+    fn skip_all_stops_asking_about_errors() {
+        let d = TestDir::new("skip_all");
+        mkfifo(&d.p("one"));
+        mkfifo(&d.p("two"));
+        let mut ui = Script {
+            error: ErrorChoice::SkipAll,
+            ..Default::default()
+        };
+        let target = inside(&d, "out");
+        let s = copy_items(
+            &[d.p("one"), d.p("two")],
+            &target,
+            &base(),
+            &CopyOptions::default(),
+            &mut ui,
+        );
+        assert_eq!((s.skipped, ui.errors.len()), (2, 1));
+    }
+
+    #[test]
+    fn cancel_at_an_error_stops_the_rest() {
+        let d = TestDir::new("cancel_err");
+        mkfifo(&d.p("pipe"));
+        let later = d.write("later", "x");
+        let mut ui = Script {
+            error: ErrorChoice::Cancel,
+            ..Default::default()
+        };
+        let target = inside(&d, "out");
+        let s = copy_items(
+            &[d.p("pipe"), later],
+            &target,
+            &base(),
+            &CopyOptions::default(),
+            &mut ui,
+        );
+        assert!(s.cancelled);
+        assert!(!d.p("out/later").exists());
+    }
+
+    #[test]
+    fn copying_a_file_over_a_folder_keeps_the_folder() {
+        let d = TestDir::new("file_over_dir");
+        let src = d.write("name", "file");
+        fs::create_dir_all(d.p("out/name")).unwrap();
+        d.write("out/name/kept", "kept");
+        let mut ui = Script::default();
+        let target = inside(&d, "out");
+        let s = copy_items(&[src], &target, &base(), &CopyOptions::default(), &mut ui);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(fs::read_to_string(d.p("out/name/kept")).unwrap(), "kept");
+    }
+
+    #[test]
+    fn copying_a_folder_over_a_file_keeps_the_file() {
+        let d = TestDir::new("dir_over_file");
+        fs::create_dir(d.p("name")).unwrap();
+        d.write("name/inner", "x");
+        fs::create_dir(d.p("out")).unwrap();
+        d.write("out/name", "file");
+        let mut ui = Script::default();
+        let target = inside(&d, "out");
+        let s = copy_items(
+            &[d.p("name")],
+            &target,
+            &base(),
+            &CopyOptions::default(),
+            &mut ui,
+        );
+        assert_eq!(s.skipped, 1);
+        assert_eq!(fs::read_to_string(d.p("out/name")).unwrap(), "file");
+    }
+
+    #[test]
+    fn copying_a_link_over_a_folder_keeps_the_folder() {
+        let d = TestDir::new("link_over_dir");
+        symlink("somewhere", d.p("name")).unwrap();
+        fs::create_dir_all(d.p("out/name")).unwrap();
+        d.write("out/name/kept", "kept");
+        let mut ui = Script::default();
+        let target = inside(&d, "out");
+        let s = copy_items(
+            &[d.p("name")],
+            &target,
+            &base(),
+            &CopyOptions::default(),
+            &mut ui,
+        );
+        assert_eq!(s.skipped, 1);
+        assert_eq!(fs::read_to_string(d.p("out/name/kept")).unwrap(), "kept");
+    }
+
+    #[test]
+    fn an_unreadable_source_leaves_the_old_destination_alone() {
+        if is_root() {
+            return;
+        }
+        let d = TestDir::new("unreadable");
+        let src = d.write("name", "new");
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o000)).unwrap();
+        fs::create_dir(d.p("out")).unwrap();
+        d.write("out/name", "old");
+        let mut ui = Script::default();
+        let target = inside(&d, "out");
+        let s = copy_items(&[src], &target, &base(), &CopyOptions::default(), &mut ui);
+        assert_eq!((s.skipped, ui.errors.len()), (1, 1));
+        assert_eq!(fs::read_to_string(d.p("out/name")).unwrap(), "old");
+    }
+
+    #[test]
+    fn moving_a_file_over_a_folder_keeps_both() {
+        let d = TestDir::new("move_over_dir");
+        let src = d.write("name", "file");
+        fs::create_dir_all(d.p("out/name")).unwrap();
+        d.write("out/name/kept", "kept");
+        let mut ui = Script::default();
+        let target = inside(&d, "out");
+        let s = move_items(std::slice::from_ref(&src), &target, &base(), &mut ui);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(fs::read_to_string(&src).unwrap(), "file");
+        assert_eq!(fs::read_to_string(d.p("out/name/kept")).unwrap(), "kept");
+    }
+
+    #[test]
+    fn skipping_the_overwrite_of_a_move_keeps_both_files() {
+        let d = TestDir::new("move_skip");
+        let src = d.write("name", "new");
+        fs::create_dir(d.p("out")).unwrap();
+        d.write("out/name", "old");
+        let mut ui = Script {
+            overwrite: OverwriteChoice::Skip,
+            ..Default::default()
+        };
+        let target = inside(&d, "out");
+        move_items(std::slice::from_ref(&src), &target, &base(), &mut ui);
+        assert_eq!(fs::read_to_string(&src).unwrap(), "new");
+        assert_eq!(fs::read_to_string(d.p("out/name")).unwrap(), "old");
+    }
+
+    #[test]
+    fn a_failed_rename_is_reported_and_keeps_the_source() {
+        if is_root() {
+            return;
+        }
+        let d = TestDir::new("move_denied");
+        fs::create_dir(d.p("locked")).unwrap();
+        let src = d.write("locked/file", "data");
+        fs::set_permissions(d.p("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        let mut ui = Script::default();
+        let target = inside(&d, "out");
+        let s = move_items(std::slice::from_ref(&src), &target, &base(), &mut ui);
+        fs::set_permissions(d.p("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!((s.skipped, ui.errors.len()), (1, 1));
+        assert_eq!(fs::read_to_string(&src).unwrap(), "data");
+        assert!(!d.p("out/file").exists());
+    }
+
+    #[test]
+    fn a_locked_folder_makes_a_delete_report_and_keep_the_file() {
+        if is_root() {
+            return;
+        }
+        let d = TestDir::new("del_denied");
+        fs::create_dir(d.p("locked")).unwrap();
+        let file = d.write("locked/file", "data");
+        fs::set_permissions(d.p("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        let mut ui = Script::default();
+        let s = delete_items(&[d.p("locked")], true, &mut ui);
+        fs::set_permissions(d.p("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!((s.skipped, ui.errors.len()), (1, 1), "{:?}", ui.errors);
+        assert!(file.exists());
+    }
+
+    #[test]
+    fn trash_names_do_not_collide_and_record_where_they_came_from() {
+        let d = TestDir::new("trash_names");
+        let trash = d.p("trash");
+        for _ in 0..2 {
+            let src = d.write("my file.txt", "x");
+            move_to_trash(&src, &trash).unwrap();
+            assert!(!src.exists());
+        }
+        assert!(trash.join("files/my file.txt").exists());
+        assert!(trash.join("files/my file.txt.1").exists());
+        let info = fs::read_to_string(trash.join("info/my file.txt.1.trashinfo")).unwrap();
+        assert!(info.contains("my%20file.txt"), "{info}");
+        assert!(info.contains("DeletionDate="), "{info}");
+    }
+
+    #[test]
+    fn trash_passes_over_a_stray_file_with_the_same_name() {
+        let d = TestDir::new("trash_stray");
+        let trash = d.p("trash");
+        fs::create_dir_all(trash.join("files")).unwrap();
+        fs::write(trash.join("files/name"), "stray").unwrap();
+        let src = d.write("name", "mine");
+        move_to_trash(&src, &trash).unwrap();
+        assert_eq!(
+            fs::read_to_string(trash.join("files/name")).unwrap(),
+            "stray"
+        );
+        assert_eq!(
+            fs::read_to_string(trash.join("files/name.1")).unwrap(),
+            "mine"
+        );
+        assert!(!trash.join("info/name.trashinfo").exists());
+    }
+
+    #[test]
+    fn a_failed_trash_move_leaves_no_info_file() {
+        let d = TestDir::new("trash_fail");
+        let trash = d.p("trash");
+        assert!(move_to_trash(&d.p("missing"), &trash).is_err());
+        assert_eq!(fs::read_dir(trash.join("info")).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn trash_refuses_a_path_without_a_name() {
+        let d = TestDir::new("trash_noname");
+        assert!(move_to_trash(Path::new("/"), &d.p("trash")).is_err());
+    }
+
+    #[test]
+    fn trash_keeps_non_text_names_in_its_record() {
+        use std::os::unix::ffi::OsStringExt;
+        let d = TestDir::new("trash_bytes");
+        let name = OsString::from_vec(b"bad\xffname".to_vec());
+        let src = d.0.join(&name);
+        fs::write(&src, "x").unwrap();
+        move_to_trash(&src, &d.p("trash")).unwrap();
+        assert!(d.p("trash/files").join(&name).exists());
+        let mut info_name = name.clone();
+        info_name.push(".trashinfo");
+        let info = fs::read_to_string(d.p("trash/info").join(info_name)).unwrap();
+        assert!(info.contains("bad%FFname"), "{info}");
+    }
+
+    #[test]
+    fn changing_owner_to_oneself_works_and_to_root_is_reported() {
+        let d = TestDir::new("chown");
+        let file = d.write("file", "x");
+        let own = fs::metadata(&file).unwrap();
+        let mut ui = Script::default();
+        let same = AttrChange {
+            uid: Some(own.uid()),
+            gid: Some(own.gid()),
+            ..Default::default()
+        };
+        let s = set_attributes(std::slice::from_ref(&file), &same, &mut ui);
+        assert_eq!(s.skipped, 0);
+        if is_root() {
+            return;
+        }
+        let root = AttrChange {
+            uid: Some(0),
+            ..Default::default()
+        };
+        let s = set_attributes(std::slice::from_ref(&file), &root, &mut ui);
+        assert_eq!((s.skipped, ui.errors.len()), (1, 1));
+    }
+
+    #[test]
+    fn names_and_numbers_of_users_and_groups() {
+        assert_eq!(lookup_user("0"), Some(0));
+        assert_eq!(lookup_user("root"), Some(0));
+        assert_eq!(lookup_user("no_such_user_here"), None);
+        assert_eq!(lookup_user("nul\0byte"), None);
+        assert_eq!(lookup_group("0"), Some(0));
+        assert_eq!(lookup_group("root"), Some(0));
+        assert_eq!(lookup_group("no_such_group_here"), None);
+        assert_eq!(lookup_group("nul\0byte"), None);
+        assert_eq!(user_name(0), "root");
+        assert_eq!(group_name(0), "root");
+        assert_eq!(user_name(4_000_000_000), "4000000000");
+        assert_eq!(group_name(4_000_000_000), "4000000000");
+    }
+
+    #[test]
+    fn links_of_both_kinds() {
+        let d = TestDir::new("links");
+        let file = d.write("file", "x");
+        make_link(&file, &d.p("soft"), true).unwrap();
+        make_link(&file, &d.p("hard"), false).unwrap();
+        assert!(fs::symlink_metadata(d.p("soft"))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::metadata(&file).unwrap().nlink(), 2);
+        assert!(make_link(&file, &d.p("soft"), true).is_err());
+    }
+
+    #[test]
+    fn mode_text_must_be_short_octal() {
+        assert_eq!(parse_mode(" 755 "), Some(0o755));
+        assert_eq!(parse_mode("4755"), Some(0o4755));
+        for bad in ["", "888", "77777", "rwx", "-1"] {
+            assert_eq!(parse_mode(bad), None, "{bad}");
+        }
+    }
 }
