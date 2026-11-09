@@ -916,9 +916,12 @@ pub fn run(
                     v.go_to(top, w);
                 }
             }
-            (NONE, KeyCode::F(8)) => v.set_encoding((v.enc + 1) % encoding::NAMES.len()),
+            (NONE, KeyCode::F(8)) => v.set_encoding((v.enc + 1) % encoding::BYTE_ENCODINGS),
             (SHIFT, KeyCode::F(8)) => {
-                let items: Vec<String> = encoding::NAMES.iter().map(|n| n.to_string()).collect();
+                let items: Vec<String> = encoding::NAMES[..encoding::BYTE_ENCODINGS]
+                    .iter()
+                    .map(|n| n.to_string())
+                    .collect();
                 if let Some(i) = dialog::menu(tui, "Encoding", &items, v.enc)? {
                     v.set_encoding(i);
                 }

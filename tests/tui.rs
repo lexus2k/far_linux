@@ -2018,3 +2018,32 @@ fn shift_f1_splits_into_volumes_that_open_and_extract() {
         std::thread::sleep(Duration::from_millis(30));
     }
 }
+
+#[test]
+fn f4_edits_a_utf16_file_and_saves_it_as_utf16() {
+    let Some(s) = Session::start(|root| {
+        let mut bytes = vec![0xff, 0xfe];
+        for unit in "Привет, Far\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(root.join("left/wide.txt"), bytes).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("wide.txt");
+    s.keys(&["Down", "F4"]);
+    s.wait("Привет, Far");
+    s.wait("UTF-16LE");
+    s.text("ok ");
+    s.wait("ok Привет");
+    s.keys(&["F2"]);
+    let mut want = vec![0xff, 0xfe];
+    for unit in "ok Привет, Far\r\n".encode_utf16() {
+        want.extend_from_slice(&unit.to_le_bytes());
+    }
+    let start = Instant::now();
+    while fs::read(s.p("left/wide.txt")).unwrap() != want {
+        assert!(start.elapsed() < Duration::from_secs(8), "{}", s.screen());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
