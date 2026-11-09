@@ -2047,3 +2047,33 @@ fn f4_edits_a_utf16_file_and_saves_it_as_utf16() {
         std::thread::sleep(Duration::from_millis(30));
     }
 }
+
+#[test]
+fn f3_shows_a_utf16_file_as_text_and_finds_words_in_it() {
+    let Some(s) = Session::start(|root| {
+        let mut text = String::from("\u{feff}Привет, Far\r\n");
+        for i in 0..40 {
+            text.push_str(&format!("filler {i}\r\n"));
+        }
+        text.push_str("needle Ж\r\n");
+        let mut bytes = Vec::new();
+        for unit in text.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_be_bytes());
+        }
+        fs::write(root.join("left/wide.txt"), bytes).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("wide.txt");
+    s.keys(&["Down", "F3"]);
+    s.wait("Привет, Far");
+    s.wait("UTF-16BE");
+    s.keys(&["F7"]);
+    s.wait("Regular expressions");
+    s.text("needle ж");
+    s.keys(&["Enter"]);
+    s.wait_gone("Regular expressions");
+    s.wait_for("the match on top", |t| {
+        t.lines().nth(1).is_some_and(|l| l.contains("needle Ж"))
+    });
+}
