@@ -20,6 +20,11 @@
 
 ### Changed
 
+- `Enter` runs only programs and `#!` scripts with an execute bit. Other files,
+  including every file on a Windows drive, open in the application registered
+  for their type, through `wslview` or Explorer on WSL and `xdg-open` on a
+  desktop, and in the viewer when there is neither. `Shift+Enter` opens the file
+  or folder that way too.
 - `Shift+F1` opens Create archive laid out as ArcLite's: archive path with
   Append extension, the archivers as radio buttons, compression level from
   Store to Ultra, Split into volumes with the size beside it, and Delete files

@@ -186,7 +186,14 @@ const HELP: &[(&str, &str)] = &[
     ("", ""),
     ("Panels", ""),
     ("Tab", "Other panel"),
-    ("Enter", "Open folder, run program, or run the command line"),
+    (
+        "Enter",
+        "Open folder, run program, open a document in its application",
+    ),
+    (
+        "Shift+Enter",
+        "Open the file or folder in the desktop's application",
+    ),
     ("Ins, Shift+arrows", "Select"),
     ("+  -  *", "Select group, unselect group, invert"),
     (
@@ -671,6 +678,8 @@ impl App {
                     let text = self.cmd.text();
                     self.cmd.clear();
                     self.execute(&text)?;
+                } else {
+                    self.open_outside()?;
                 }
             }
             (CTRL, KeyCode::Enter) => {
@@ -1033,11 +1042,50 @@ impl App {
         } else if let Some(format) = archive::detect_volumes(Path::new(&entry.raw)) {
             let path = self.panels[self.active].entry_path(&entry);
             self.enter_split_archive(&path, format)?;
-        } else if entry.exec {
-            self.execute(&format!("./{}", shell_quote(&entry.name)))?;
         } else {
+            // Programs and scripts run; any other file opens in the
+            // application registered for its type, as Far opens it.
             let path = self.panels[self.active].entry_path(&entry);
-            self.view_file(&path)?;
+            if entry.exec && shell::runs_directly(&path) {
+                self.execute(&format!("./{}", shell_quote(&entry.name)))?;
+            } else if !self.open_with_application(&path)? {
+                self.view_file(&path)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Opens `path` in the application registered for its type. False when
+    /// there is no way to, so the caller can fall back to the viewer.
+    fn open_with_application(&mut self, path: &Path) -> io::Result<bool> {
+        let path_var = std::env::var_os("PATH");
+        let Some(command) = shell::opener(path, path_var.as_deref()) else {
+            return Ok(false);
+        };
+        if let Err(e) = shell::launch(command) {
+            let text = format!("Cannot open {}: {e}", path.display());
+            dialog::alert(&mut self.tui, "Error", &text)?;
+        }
+        Ok(true)
+    }
+
+    /// Shift+Enter: opens the file, or the folder, in the desktop's own
+    /// application, as Far opens a folder in Explorer.
+    fn open_outside(&mut self) -> io::Result<()> {
+        let Some(entry) = self.panels[self.active].current().cloned() else {
+            return Ok(());
+        };
+        if self.panels[self.active].archive.is_some() {
+            return Ok(());
+        }
+        let path = if entry.is_up {
+            self.panels[self.active].path.clone()
+        } else {
+            self.panels[self.active].entry_path(&entry)
+        };
+        if !self.open_with_application(&path)? {
+            let text = "No application to open it with: install wslu or xdg-utils";
+            dialog::alert(&mut self.tui, "Open", text)?;
         }
         Ok(())
     }
