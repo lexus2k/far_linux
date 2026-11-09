@@ -68,7 +68,7 @@ and `xz` programs, and 7z uses `7z`. Zip, tar and tar.gz need nothing installed.
 |---|---|
 | `Enter`, `Ctrl+PgDn` | Open the archive under the cursor, also one inside an open archive |
 | `Ctrl+PgUp` | Go up, leaving the archive from its top folder |
-| `Shift+F1` | Add the selection to a new or existing archive |
+| `Shift+F1` | Add the selection to a new or existing archive, or split a new one into volumes |
 | `Shift+F2` | Extract the chosen archives |
 | `Shift+F3` | Archive commands: test the archive |
 | `F3`, `F4` | Inside an archive: view or edit a temporary copy |
@@ -80,6 +80,12 @@ The format comes from the name's extension, or from the Format button in
 `Shift+F1`. Changing an archive writes a new file and renames it into place, so a
 failure leaves the original intact. Names that would leave the destination are
 refused, and extraction does not follow links or create setuid files.
+
+Split into volumes in `Shift+F1` cuts a new archive into `name.zip.001`, `.002`
+and so on, of the size given, such as `700M`. It works for every format, as
+7-Zip's volumes do. `Enter` on the first volume opens the joined archive,
+read-only, and `Shift+F2` extracts it. Making volumes needs room for the whole
+archive once more while it is cut.
 
 An archive inside an archive opens from a temporary copy, shown as
 `outer.tar:/lib/inner.zip:/`, and `..` at its top returns to the outer one. It is

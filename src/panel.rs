@@ -66,6 +66,15 @@ pub struct ArchiveView {
     /// For an archive opened from inside another: that archive's view, which
     /// `..` at the top returns to. `file` is then a scratch copy.
     pub outer: Option<Box<Outer>>,
+    /// For a split archive, `name.zip.001` and on: the first volume, and the
+    /// scratch folder holding the joined copy that `file` points to.
+    pub joined: Option<Box<Joined>>,
+}
+
+/// The volumes a split archive was joined from.
+pub struct Joined {
+    pub first: PathBuf,
+    _scratch: ScratchDir,
 }
 
 /// The archive a nested archive was opened from.
@@ -84,12 +93,27 @@ impl ArchiveView {
         self.outer.is_some()
     }
 
+    /// Why the archive cannot be changed: it is a scratch copy, of an archive
+    /// inside another or of a split archive's volumes.
+    pub fn read_only(&self) -> Option<&'static str> {
+        if self.outer.is_some() {
+            Some("An archive inside an archive is read-only.\nExtract it to change it.")
+        } else if self.joined.is_some() {
+            Some("A split archive is read-only.\nExtract it to change it.")
+        } else {
+            None
+        }
+    }
+
     /// The archive as the user knows it: `outer.tar:/lib/inner.zip` for a
     /// nested one, rather than the scratch copy.
     pub fn label(&self) -> String {
         match &self.outer {
             Some(outer) => format!("{}:/{}", outer.view.label(), outer.inner),
-            None => util::tilde(&self.file),
+            None => match &self.joined {
+                Some(joined) => util::tilde(&joined.first),
+                None => util::tilde(&self.file),
+            },
         }
     }
 }
@@ -297,6 +321,7 @@ impl Panel {
             items,
             stamp: file_stamp(file),
             outer: None,
+            joined: None,
         });
         self.read_dir();
         self.top = 0;
@@ -328,10 +353,31 @@ impl Panel {
                 inner: inner.to_string(),
                 _scratch: scratch,
             })),
+            joined: None,
         });
         self.read_dir();
         self.top = 0;
         self.cursor = 0;
+        Ok(())
+    }
+
+    /// Opens a split archive from `file`, the volumes from `first` on joined
+    /// in `scratch`, which is kept until the panel leaves it.
+    pub fn open_joined(
+        &mut self,
+        file: &Path,
+        format: Format,
+        first: &Path,
+        scratch: ScratchDir,
+    ) -> Result<(), String> {
+        self.open_archive(file, format)
+            .map_err(|_| format!("{}: not a readable archive", first.display()))?;
+        if let Some(view) = &mut self.archive {
+            view.joined = Some(Box::new(Joined {
+                first: first.to_path_buf(),
+                _scratch: scratch,
+            }));
+        }
         Ok(())
     }
 
@@ -538,7 +584,12 @@ impl Panel {
                             self.archive = Some(outer.view);
                             leaf
                         }
-                        None => leaving.file.file_name().unwrap_or_default().to_os_string(),
+                        None => match &leaving.joined {
+                            Some(joined) => {
+                                joined.first.file_name().unwrap_or_default().to_os_string()
+                            }
+                            None => leaving.file.file_name().unwrap_or_default().to_os_string(),
+                        },
                     }
                 }
                 None => std::mem::take(&mut view.folder).into(),
