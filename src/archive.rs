@@ -11,7 +11,7 @@ use crate::fsops::{self, Cancelled, Ctx, OpSummary, OpUi, Totals};
 use crate::util;
 use flate2::{read::MultiGzDecoder, write::GzEncoder, Compression};
 use std::collections::{BTreeMap, HashSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -1055,6 +1055,201 @@ pub fn find<U: OpUi>(
     Ok(())
 }
 
+/// Parses a volume size as ArcLite's Volume size box takes it: a number of
+/// bytes, or of K, M or G (powers of 1024), such as `700M`.
+pub fn parse_volume_size(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (number, unit) = match text.char_indices().last()? {
+        (at, c) if c.is_ascii_alphabetic() => (&text[..at], c.to_ascii_uppercase()),
+        _ => (text, 'B'),
+    };
+    let scale: u64 = match unit {
+        'B' => 1,
+        'K' => 1 << 10,
+        'M' => 1 << 20,
+        'G' => 1 << 30,
+        _ => return None,
+    };
+    let value: u64 = number.trim().parse().ok()?;
+    value.checked_mul(scale).filter(|&size| size > 0)
+}
+
+/// The path of volume `index`, counting from 1, of a split `archive`:
+/// `name.zip.001`, as 7-Zip names them.
+pub fn volume_path(archive: &Path, index: usize) -> PathBuf {
+    let mut name = archive.as_os_str().to_os_string();
+    name.push(format!(".{index:03}"));
+    PathBuf::from(name)
+}
+
+/// For the first volume of a split archive, `name.zip.001`, the format of the
+/// archive it holds.
+pub fn detect_volumes(first: &Path) -> Option<Format> {
+    let name = first.file_name()?.to_str()?;
+    detect(Path::new(name.strip_suffix(".001")?))
+}
+
+/// The volumes of a split archive, from its first one, in order.
+pub fn volumes(first: &Path) -> Vec<PathBuf> {
+    let Some(archive) = first
+        .to_str()
+        .and_then(|p| p.strip_suffix(".001"))
+        .map(PathBuf::from)
+    else {
+        return Vec::new();
+    };
+    (1..)
+        .map(|i| volume_path(&archive, i))
+        .take_while(|p| p.is_file())
+        .collect()
+}
+
+/// Joins volumes into one file at `dest`.
+pub fn join_volumes(parts: &[PathBuf], dest: &Path, stop: &dyn Fn() -> bool) -> io::Result<()> {
+    let mut out = OpenOptions::new().write(true).create_new(true).open(dest)?;
+    for part in parts {
+        if stop() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        io::copy(&mut File::open(part)?, &mut out)?;
+    }
+    out.sync_all()
+}
+
+/// For the first volume of a split archive, joins all its volumes into a
+/// scratch copy named after the archive, and returns it with its path. For
+/// any other file, returns `None`.
+pub fn join_if_split(
+    file: &Path,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Option<(ScratchDir, PathBuf)>> {
+    if detect_volumes(file).is_none() {
+        return Ok(None);
+    }
+    let parts = volumes(file);
+    if parts.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "no volumes found"));
+    }
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_suffix(".001"))
+        .unwrap_or("joined")
+        .to_string();
+    let scratch = ScratchDir::new()?;
+    let path = scratch.path().join(name);
+    join_volumes(&parts, &path, stop)?;
+    Ok(Some((scratch, path)))
+}
+
+/// Cuts `src` into volumes of `size` bytes named after `archive`. Each volume
+/// is written beside its place and renamed into it, and none replaces an
+/// existing file. On failure the volumes made are removed.
+fn split_into_volumes(
+    src: &Path,
+    archive: &Path,
+    size: u64,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<usize> {
+    let mut made: Vec<PathBuf> = Vec::new();
+    let result = (|| -> io::Result<()> {
+        let mut input = File::open(src)?;
+        let total = input.metadata()?.len();
+        let count = total.div_ceil(size).max(1);
+        for index in 1..=count as usize {
+            if stop() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
+            let path = volume_path(archive, index);
+            let temp = temp_beside(&path);
+            let written = (|| -> io::Result<()> {
+                let mut out = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp)?;
+                io::copy(&mut (&mut input).take(size), &mut out)?;
+                out.sync_all()?;
+                // A hard link fails if the name is taken, so an existing file
+                // is never replaced, even one that appeared meanwhile.
+                fs::hard_link(&temp, &path)
+            })();
+            let _ = fs::remove_file(&temp);
+            written?;
+            made.push(path);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => Ok(made.len()),
+        Err(e) => {
+            for path in &made {
+                let _ = fs::remove_file(path);
+            }
+            Err(e)
+        }
+    }
+}
+
+/// Shift+F1 with Split into volumes: makes a new archive of `sources` and cuts
+/// it into volumes of `size` bytes, `name.zip.001` and on. With `verify`, the
+/// archive is read back before it is cut, for a move. Refuses when the archive
+/// or its first volume exists.
+pub fn add_split<U: OpUi>(
+    file: &Path,
+    format: Format,
+    sources: &[PathBuf],
+    size: u64,
+    verify: bool,
+    ui: &mut U,
+) -> OpSummary {
+    let failed = |ui: &mut U, path: &Path, text: &str| {
+        ui.error(path, text);
+        OpSummary {
+            skipped: 1,
+            ..Default::default()
+        }
+    };
+    let first = volume_path(file, 1);
+    if file.exists() || first.exists() {
+        let taken = if file.exists() { file } else { &first };
+        return failed(
+            ui,
+            taken,
+            "Volumes are made only for a new archive, and this file exists",
+        );
+    }
+    // The name keeps the extension, as 7z adds one to a name without it.
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let temp = file.with_file_name(format!(
+        ".far_vol_{}_{}.{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed),
+        format.extension()
+    ));
+    let summary = add(&temp, format, "", sources, ui);
+    let result = if summary.cancelled || summary.skipped > 0 {
+        Ok(())
+    } else if let Err(e) = verify.then(|| test(&temp, format)).transpose() {
+        Err(e)
+    } else {
+        let stop = || ui.cancelled();
+        split_into_volumes(&temp, file, size, &stop).map(|_| ())
+    };
+    let _ = fs::remove_file(&temp);
+    match result {
+        Ok(()) => summary,
+        Err(e) if e.kind() == io::ErrorKind::Interrupted => OpSummary {
+            cancelled: true,
+            ..summary
+        },
+        Err(e) => {
+            let mut out = failed(ui, file, &e.to_string());
+            out.done = summary.done;
+            out
+        }
+    }
+}
+
 /// Reads the whole archive and returns how many items it holds.
 pub fn test(path: &Path, format: Format) -> io::Result<u64> {
     match format {
@@ -1921,6 +2116,123 @@ mod tests {
         )
         .unwrap();
         assert_eq!(hits, ["plain"]);
+    }
+
+    #[test]
+    fn volume_sizes_take_k_m_and_g() {
+        assert_eq!(parse_volume_size("1000"), Some(1000));
+        assert_eq!(parse_volume_size("64k"), Some(64 << 10));
+        assert_eq!(parse_volume_size(" 700M "), Some(700 << 20));
+        assert_eq!(parse_volume_size("2G"), Some(2 << 30));
+        for bad in ["", "0", "M", "1.5M", "10X", "-1", "99999999999999999999G"] {
+            assert_eq!(parse_volume_size(bad), None, "{bad}");
+        }
+        let a = Path::new("/x/data.tar.gz");
+        assert_eq!(volume_path(a, 1), Path::new("/x/data.tar.gz.001"));
+        assert_eq!(volume_path(a, 1234), Path::new("/x/data.tar.gz.1234"));
+        assert_eq!(
+            detect_volumes(Path::new("/x/data.tar.gz.001")),
+            Some(Format::TarGz)
+        );
+        assert_eq!(detect_volumes(Path::new("/x/data.tar.gz.002")), None);
+        assert_eq!(detect_volumes(Path::new("/x/data.001")), None);
+    }
+
+    /// Files beside the archive, other than the volumes: a temporary file
+    /// left behind would show here.
+    fn leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with('.'))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn every_format_splits_into_volumes_that_join_back() {
+        for format in formats() {
+            let d = TestDir::new("vol");
+            // Random-looking data, so that compression leaves several volumes.
+            let mut seed = 7u64;
+            let noise: String = (0..20_000)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    char::from(b'a' + (seed >> 59) as u8)
+                })
+                .collect();
+            d.write("src/a.txt", &noise);
+            d.write("src/sub/b.txt", "bbb");
+            fs::create_dir(d.p("out")).unwrap();
+            let file = d.p(&format!("out/x.{}", format.extension()));
+            let mut ui = Ui::default();
+            let s = add_split(&file, format, &[d.p("src")], 4096, true, &mut ui);
+            assert_eq!(
+                (s.skipped, s.cancelled),
+                (0, false),
+                "{format:?}: {:?}",
+                ui.errors
+            );
+            assert!(!file.exists(), "{format:?}: only volumes are left");
+            let first = volume_path(&file, 1);
+            let parts = volumes(&first);
+            assert!(parts.len() >= 2, "{format:?}: {parts:?}");
+            for part in &parts[..parts.len() - 1] {
+                assert_eq!(fs::metadata(part).unwrap().len(), 4096, "{format:?}");
+            }
+            assert_eq!(leftovers(&d.p("out")), Vec::<String>::new(), "{format:?}");
+            let (_scratch, joined) = join_if_split(&first, &|| false).unwrap().unwrap();
+            assert!(join_if_split(&d.p("src/a.txt"), &|| false)
+                .unwrap()
+                .is_none());
+            // The same entries as the archive made whole.
+            let whole = d.p(&format!("whole.{}", format.extension()));
+            add(&whole, format, "", &[d.p("src")], &mut Ui::default());
+            assert_eq!(paths(&joined, format), paths(&whole, format), "{format:?}");
+            assert!(paths(&joined, format).contains(&"src/sub/b.txt".to_string()));
+        }
+    }
+
+    #[test]
+    fn volumes_are_refused_over_an_existing_archive_or_volume() {
+        let d = TestDir::new("volexist");
+        d.write("a.txt", "a");
+        let file = d.p("x.zip");
+        fs::write(&file, "old").unwrap();
+        let mut ui = Ui::default();
+        let s = add_split(&file, Format::Zip, &[d.p("a.txt")], 1024, false, &mut ui);
+        assert_eq!((s.skipped, ui.errors.len()), (1, 1));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "old");
+        fs::remove_file(&file).unwrap();
+        fs::write(volume_path(&file, 1), "old volume").unwrap();
+        let s = add_split(&file, Format::Zip, &[d.p("a.txt")], 1024, false, &mut ui);
+        assert_eq!(s.skipped, 1);
+        assert_eq!(
+            fs::read_to_string(volume_path(&file, 1)).unwrap(),
+            "old volume"
+        );
+        assert!(!volume_path(&file, 2).exists());
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_cancelled_split_leaves_nothing_behind() {
+        let d = TestDir::new("volcancel");
+        d.write("a.txt", &"x".repeat(10_000));
+        fs::create_dir(d.p("out")).unwrap();
+        let file = d.p("out/x.tar");
+        let mut ui = Ui {
+            cancel: true,
+            ..Default::default()
+        };
+        let s = add_split(&file, Format::Tar, &[d.p("a.txt")], 1024, false, &mut ui);
+        assert!(s.cancelled);
+        let names: Vec<_> = fs::read_dir(d.p("out")).unwrap().flatten().collect();
+        assert!(names.is_empty(), "{names:?}");
     }
 
     #[test]

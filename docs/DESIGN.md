@@ -84,6 +84,10 @@ Next:
 
 ## Known issues
 
+- Volumes are cut from a finished archive, so making them needs twice the
+  archive's size on disk for a moment, and opening them joins them into a
+  scratch copy first. A split archive is read-only, and volumes are made only
+  for a new archive, not added to an existing one.
 - An archive inside an archive is read-only. Writing a change back would mean
   repacking it and then changing the outer archive with it.
 - Alt+F7 has no "Search in archives" option for archives met while searching

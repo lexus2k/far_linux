@@ -1946,3 +1946,63 @@ fn find_file_mask_shows_matching_history_while_typing() {
     s.keys(&["Enter"]);
     s.wait("Found");
 }
+
+#[test]
+fn shift_f1_splits_into_volumes_that_open_and_extract() {
+    let Some(s) = Session::start(|root| {
+        fs::create_dir(root.join("left/data")).unwrap();
+        // Data that does not compress, so that the archive needs volumes.
+        let mut seed = 11u64;
+        let noise: Vec<u8> = (0..6000)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (seed >> 56) as u8
+            })
+            .collect();
+        fs::write(root.join("left/data/noise.bin"), &noise).unwrap();
+        fs::write(root.join("left/data/readme.txt"), "volume test").unwrap();
+    }) else {
+        return;
+    };
+    s.wait("data");
+    s.keys(&["Down", "S-F1"]);
+    s.wait("Split into volumes");
+    // Archive name, Move, Split into volumes, Volume size.
+    s.keys(&["Down", "Down", "Space", "Down", "C-y"]);
+    s.text("1K");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/data.zip.001"), true);
+    s.wait("data.zip.004");
+    assert!(!s.p("left/data.zip").exists());
+    let hidden: Vec<String> = fs::read_dir(s.p("left"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with('.'))
+        .collect();
+    assert!(hidden.is_empty(), "{hidden:?}");
+    // Enter on the first volume opens the whole archive, read-only.
+    s.keys(&["Home", "Down", "Down", "Enter"]);
+    s.wait("data.zip.001:/");
+    s.keys(&["Down", "Enter"]);
+    s.wait("readme.txt");
+    s.keys(&["End", "F8"]);
+    s.wait("A split archive is read-only");
+    s.keys(&["Enter"]);
+    s.wait_gone("read-only");
+    // Out again, with the cursor on the first volume, and Shift+F2 extracts.
+    s.keys(&["Home", "Enter"]);
+    s.keys(&["Home", "Enter"]);
+    s.wait_gone("data.zip.001:/");
+    s.keys(&["S-F2"]);
+    s.wait("Extract to");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("right/data/readme.txt"), true);
+    let start = Instant::now();
+    while fs::read_to_string(s.p("right/data/readme.txt")).unwrap_or_default() != "volume test" {
+        assert!(start.elapsed() < Duration::from_secs(8), "{}", s.screen());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}

@@ -4,6 +4,10 @@
 
 ### Added
 
+- `Shift+F1` can split a new archive into volumes, as ArcLite's Split into
+  volumes does: `name.zip.001`, `.002` and on, of a size given in bytes or
+  with K, M or G. `Enter` on a `.001` file opens the joined volumes, read-only,
+  and `Shift+F2` and `Shift+F3` extract and test them.
 - Archives inside archives open with `Enter` or `Ctrl+PgDn`, from a temporary
   copy made by the usual safe extraction, to any depth. `..` at the top goes
   back to the outer archive. They are read-only: `F4`, `F6`, `F7`, `F8` and

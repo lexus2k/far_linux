@@ -166,9 +166,6 @@ fn commands_menu() -> Vec<MenuItem> {
     ]
 }
 
-const NESTED_READ_ONLY: &str =
-    "An archive inside an archive is read-only.\nExtract it to change it.";
-
 const HELP: &[(&str, &str)] = &[
     ("F9, Commands", "Files highlighting: edit the colour groups"),
     ("far:about", "Version information, typed as a command"),
@@ -860,6 +857,8 @@ impl App {
             let path = self.panels[self.active].entry_path(&entry);
             if let Some(format) = archive::detect(&path) {
                 let _ = self.enter_archive(&path, format);
+            } else if let Some(format) = archive::detect_volumes(&path) {
+                let _ = self.enter_split_archive(&path, format);
             }
         }
     }
@@ -875,6 +874,49 @@ impl App {
         }
         self.show_wait("Archive", "Reading the archive...")?;
         if let Err(text) = self.panel().open_archive(path, format) {
+            dialog::alert(&mut self.tui, "Archive", &text)?;
+        }
+        Ok(())
+    }
+
+    /// Opens a split archive from its first volume, `name.zip.001`: the volumes
+    /// are joined into a scratch copy, which is read-only.
+    fn enter_split_archive(&mut self, first: &Path, format: Format) -> io::Result<()> {
+        if !format.is_available() {
+            let text = format!(
+                "{} is needed to open this archive",
+                format.tool().unwrap_or_default()
+            );
+            return dialog::alert(&mut self.tui, "Archive", &text);
+        }
+        let (tx, rx) = mpsc::channel();
+        let from = first.to_path_buf();
+        let summary = self.run_op("Join volumes", move |ui| {
+            match archive::join_if_split(&from, &|| ui.cancelled()) {
+                Ok(joined) => {
+                    let _ = tx.send(joined);
+                    OpSummary::default()
+                }
+                Err(e) => {
+                    if e.kind() != io::ErrorKind::Interrupted {
+                        ui.error(&from, &e.to_string());
+                    }
+                    OpSummary {
+                        skipped: 1,
+                        cancelled: e.kind() == io::ErrorKind::Interrupted,
+                        ..Default::default()
+                    }
+                }
+            }
+        })?;
+        let Ok(Some((scratch, path))) = rx.try_recv() else {
+            return Ok(());
+        };
+        if summary.cancelled {
+            return Ok(());
+        }
+        self.show_wait("Archive", "Reading the archive...")?;
+        if let Err(text) = self.panel().open_joined(&path, format, first, scratch) {
             dialog::alert(&mut self.tui, "Archive", &text)?;
         }
         Ok(())
@@ -910,14 +952,14 @@ impl App {
     /// True, after telling the user, when the active panel shows an archive
     /// inside another one, which cannot be changed.
     fn refuse_nested(&mut self, panel: usize, title: &str) -> io::Result<bool> {
-        let nested = self.panels[panel]
+        let reason = self.panels[panel]
             .archive
             .as_ref()
-            .is_some_and(|v| v.nested());
-        if nested {
-            dialog::alert(&mut self.tui, title, NESTED_READ_ONLY)?;
+            .and_then(|v| v.read_only());
+        if let Some(reason) = reason {
+            dialog::alert(&mut self.tui, title, reason)?;
         }
-        Ok(nested)
+        Ok(reason.is_some())
     }
 
     /// Shows a message while the program does something short.
@@ -988,6 +1030,9 @@ impl App {
         } else if let Some(format) = archive::detect(Path::new(&entry.raw)) {
             let path = self.panels[self.active].entry_path(&entry);
             self.enter_archive(&path, format)?;
+        } else if let Some(format) = archive::detect_volumes(Path::new(&entry.raw)) {
+            let path = self.panels[self.active].entry_path(&entry);
+            self.enter_split_archive(&path, format)?;
         } else if entry.exec {
             self.execute(&format!("./{}", shell_quote(&entry.name)))?;
         } else {
@@ -2216,9 +2261,15 @@ impl App {
             .and_then(|ext| FORMATS.into_iter().find(|f| f.extension() == ext))
             .unwrap_or(Format::Zip);
         let name = format!("{stem}.{}", format.extension());
+        let size = self
+            .db
+            .setting("archive.volume_size")
+            .unwrap_or_else(|| "100M".to_string());
         let mut form = Form::new(vec![
             Field::with_history("&Archive name", &name, Kind::Target),
             Field::check("&Move files to the archive", false),
+            Field::check("Split into &volumes", false),
+            Field::text("Volume size (bytes, or with K, M or G):", &size),
         ])
         .with_buttons(&["Add", "&Format", "Cancel"])
         .with_db(&self.db);
@@ -2259,17 +2310,41 @@ impl App {
             let message = format!("{} is not installed", format.tool().unwrap_or_default());
             return dialog::alert(&mut self.tui, "Add to archive", &message);
         }
+        let volume_size = if form.checked(2) {
+            let Some(size) = archive::parse_volume_size(&form.text(3)) else {
+                return dialog::alert(&mut self.tui, "Add to archive", "Invalid volume size");
+            };
+            self.db
+                .set_setting("archive.volume_size", form.text(3).trim());
+            Some(size)
+        } else {
+            None
+        };
         self.db.add(Kind::Target, &text);
         self.db.set_setting("archive.format", format.extension());
         let file = util::resolve_path(&base, &text);
         let moving = form.checked(1);
         let target = file.clone();
-        let summary = self.run_op("Add to archive", move |ui| {
-            add_then_remove(&target, format, "", &sources, moving, ui)
+        let summary = self.run_op("Add to archive", move |ui| match volume_size {
+            Some(size) => {
+                // With a move, the archive is read back before it is cut, and
+                // the sources go only once every volume is written.
+                let made = archive::add_split(&target, format, &sources, size, moving, ui);
+                if !moving || made.cancelled || made.skipped > 0 {
+                    return made;
+                }
+                fsops::remove_moved(&sources, ui)
+            }
+            None => add_then_remove(&target, format, "", &sources, moving, ui),
         })?;
         self.after_op(&summary);
-        if file.parent() == Some(base.as_path()) {
-            if let Some(leaf) = file.file_name() {
+        // The cursor goes to the new archive, or to its first volume.
+        let shown = match volume_size {
+            Some(_) => archive::volume_path(&file, 1),
+            None => file.clone(),
+        };
+        if shown.parent() == Some(base.as_path()) {
+            if let Some(leaf) = shown.file_name() {
                 let leaf = leaf.to_os_string();
                 self.panel().goto_name(&leaf);
             }
@@ -2282,7 +2357,11 @@ impl App {
         self.panels[self.active]
             .targets()
             .into_iter()
-            .filter_map(|path| archive::detect(&path).map(|format| (path, format)))
+            .filter_map(|path| {
+                archive::detect(&path)
+                    .or_else(|| archive::detect_volumes(&path))
+                    .map(|format| (path, format))
+            })
             .collect()
     }
 
@@ -2317,13 +2396,23 @@ impl App {
                 let mut target = dest.clone();
                 if own_folder {
                     let name = file.file_name().unwrap_or_default().to_string_lossy();
-                    target.push(archive::stem(&name));
+                    target.push(archive::stem(name.strip_suffix(".001").unwrap_or(&name)));
                 }
                 let request = ExtractRequest {
                     dest: target,
                     ..Default::default()
                 };
-                let one = archive::extract(file, *format, &request, ui);
+                // A split archive is extracted from its volumes joined.
+                let joined = match archive::join_if_split(file, &|| ui.cancelled()) {
+                    Ok(joined) => joined,
+                    Err(e) => {
+                        ui.error(file, &e.to_string());
+                        total.skipped += 1;
+                        continue;
+                    }
+                };
+                let source = joined.as_ref().map_or(file.as_path(), |(_, p)| p.as_path());
+                let one = archive::extract(source, *format, &request, ui);
                 total.done += one.done;
                 total.skipped += one.skipped;
                 total.cancelled = one.cancelled;
@@ -2356,7 +2445,12 @@ impl App {
             return dialog::alert(&mut self.tui, "Test archive", &text);
         }
         self.show_wait("Test archive", "Reading the whole archive...")?;
-        let text = match archive::test(&file, format) {
+        let joined = archive::join_if_split(&file, &|| false);
+        let tested = joined.and_then(|joined| {
+            let source = joined.as_ref().map_or(file.as_path(), |(_, p)| p.as_path());
+            archive::test(source, format)
+        });
+        let text = match tested {
             Ok(count) => format!("No errors found in {count} items"),
             Err(e) => format!("The archive is damaged:\n{e}"),
         };
