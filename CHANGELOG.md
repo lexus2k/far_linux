@@ -4,6 +4,10 @@
 
 ### Added
 
+- The editor opens UTF-16 files, little and big endian, by their byte order mark,
+  and saves them back as UTF-16 with the mark, byte for byte when unchanged.
+  `Shift+F8` offers UTF-16LE and UTF-16BE for any file; `F8` cycles UTF-8 and
+  the single-byte encodings, and from UTF-16 goes to UTF-8.
 - `Shift+F1` can split a new archive into volumes, as ArcLite's Split into
   volumes does: `name.zip.001`, `.002` and on, of a size given in bytes or
   with K, M or G. `Enter` on a `.001` file opens the joined volumes, read-only,

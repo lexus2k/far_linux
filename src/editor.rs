@@ -277,8 +277,14 @@ pub struct FileFormat {
 /// Decodes file contents. Mixed line endings stay in the text as `\r`, so
 /// they survive a save unchanged.
 pub fn decode_file(bytes: &[u8]) -> Result<(String, FileFormat), String> {
-    if encoding::is_utf16(bytes) {
-        return Err("UTF-16 files can be viewed with F3 but not edited yet".into());
+    // A UTF-16 signature says the byte order. Text that is not valid UTF-16
+    // after it falls through to the single-byte path, which keeps every byte.
+    for enc in [encoding::UTF16LE, encoding::UTF16BE] {
+        if let Some(body) = bytes.strip_prefix(encoding::bom(enc)) {
+            if let Some(text) = encoding::decode(body, enc) {
+                return Ok(split_lines(text, enc, true));
+            }
+        }
     }
     let (body, bom) = match bytes.strip_prefix(BOM) {
         Some(rest) => (rest, true),
@@ -289,6 +295,11 @@ pub fn decode_file(bytes: &[u8]) -> Result<(String, FileFormat), String> {
         // Not UTF-8. A single-byte encoding round-trips every byte.
         None => (encoding::decode(body, 1).unwrap_or_default(), 1),
     };
+    Ok(split_lines(text, enc, bom))
+}
+
+/// Takes CRLF line breaks out of decoded text when every break is one.
+fn split_lines(text: String, enc: usize, bom: bool) -> (String, FileFormat) {
     let lf = text.matches('\n').count();
     let crlf = lf > 0 && text.matches("\r\n").count() == lf;
     let text = if crlf {
@@ -296,7 +307,7 @@ pub fn decode_file(bytes: &[u8]) -> Result<(String, FileFormat), String> {
     } else {
         text
     };
-    Ok((text, FileFormat { enc, crlf, bom }))
+    (text, FileFormat { enc, crlf, bom })
 }
 
 /// Encodes text for saving. Fails if a character does not fit the encoding.
@@ -315,7 +326,7 @@ pub fn encode_file(text: &str, format: &FileFormat) -> Result<Vec<u8>, String> {
         ));
     };
     if format.bom {
-        let mut out = BOM.to_vec();
+        let mut out = encoding::bom(format.enc).to_vec();
         out.append(&mut bytes);
         return Ok(out);
     }
@@ -1609,8 +1620,10 @@ pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<Ed
             (SHIFT, KeyCode::F(8)) => {
                 let items: Vec<String> = encoding::NAMES.iter().map(|n| n.to_string()).collect();
                 if let Some(i) = dialog::menu(tui, "Encoding", &items, ed.format.enc)? {
-                    ed.format.enc = (i + encoding::NAMES.len() - 1) % encoding::NAMES.len();
-                    change_encoding(&mut ed)?;
+                    if !set_encoding(&mut ed, i) {
+                        let text = format!("The file is not valid {}", encoding::NAMES[i]);
+                        dialog::alert(tui, "Encoding", &text)?;
+                    }
                 }
             }
             (NONE, KeyCode::F(7)) => search_dialog(tui, &mut ed, ctx.db, false)?,
@@ -1697,44 +1710,64 @@ fn confirm_leave(tui: &mut Tui, ed: &mut Editor) -> io::Result<bool> {
     }
 }
 
-/// F8: reread an unmodified file in the next encoding. With unsaved edits,
-/// only the encoding used for saving changes.
+/// F8: the next of UTF-8 and the single-byte encodings, skipping UTF-8 for
+/// a file that is not UTF-8. From UTF-16 it goes to UTF-8.
 fn change_encoding(ed: &mut Editor) -> io::Result<()> {
-    let next = (ed.format.enc + 1) % encoding::NAMES.len();
-    if ed.buf.is_modified() || ed.mtime.is_none() {
-        ed.format.enc = next;
-        return Ok(());
-    }
-    // The file may be gone by now. The text in the editor is still good.
-    let Ok(bytes) = fs::read(&ed.path) else {
-        ed.format.enc = next;
-        return Ok(());
-    };
-    let body = if ed.format.bom {
-        bytes.strip_prefix(BOM).unwrap_or(&bytes)
-    } else {
-        &bytes[..]
-    };
-    match encoding::decode(body, next) {
-        Some(text) => {
-            let text = if ed.format.crlf {
-                text.replace("\r\n", "\n")
-            } else {
-                text
-            };
-            ed.buf = Buffer::from_text(&text);
-            ed.format.enc = next;
-            ed.cursor = ed.buf.clamp(ed.cursor);
-            ed.selection = None;
-            ed.sync_vis();
-        }
-        None => {
-            // UTF-8 was tried on bytes that are not UTF-8: skip to the next.
-            ed.format.enc = next;
-            return change_encoding(ed);
+    let mut next = ed.format.enc;
+    for _ in 0..encoding::BYTE_ENCODINGS {
+        next = if encoding::is_utf16_index(next) {
+            0
+        } else {
+            (next + 1) % encoding::BYTE_ENCODINGS
+        };
+        if set_encoding(ed, next) {
+            break;
         }
     }
     Ok(())
+}
+
+/// Rereads an unmodified file in encoding `enc`, or with unsaved edits only
+/// changes the encoding used for saving. False when the file's bytes are not
+/// valid in `enc`, which leaves everything as it was.
+fn set_encoding(ed: &mut Editor, enc: usize) -> bool {
+    let was_utf16 = encoding::is_utf16_index(ed.format.enc);
+    let utf16 = encoding::is_utf16_index(enc);
+    let reread = !ed.buf.is_modified() && ed.mtime.is_some();
+    // The file may be gone by now. The text in the editor is still good.
+    let bytes = if reread {
+        fs::read(&ed.path).ok()
+    } else {
+        None
+    };
+    let Some(bytes) = bytes else {
+        // Text typed for UTF-16 gets its signature, so that it opens as
+        // UTF-16 again; leaving UTF-16 drops it.
+        if was_utf16 != utf16 {
+            ed.format.bom = utf16;
+        }
+        ed.format.enc = enc;
+        return true;
+    };
+    let (body, bom) = match bytes.strip_prefix(encoding::bom(enc)) {
+        Some(rest) => (rest, true),
+        None => (&bytes[..], false),
+    };
+    let Some(text) = encoding::decode(body, enc) else {
+        return false;
+    };
+    let text = if ed.format.crlf {
+        text.replace("\r\n", "\n")
+    } else {
+        text
+    };
+    ed.buf = Buffer::from_text(&text);
+    ed.format.enc = enc;
+    ed.format.bom = bom;
+    ed.cursor = ed.buf.clamp(ed.cursor);
+    ed.selection = None;
+    ed.sync_vis();
+    true
 }
 
 /// F7 and Ctrl+F7.
@@ -2472,6 +2505,14 @@ mod tests {
             "кириллица\n".as_bytes(),
             b"\xcf\xf0\xe8\xe2\xe5\xf2\n",
             b"\x00\x01binary\xff\xfe\x80\n",
+            // UTF-16 in both byte orders, with CRLF and mixed breaks.
+            b"\xff\xfea\x00\r\x00\n\x00\x36\x04\n\x00",
+            b"\xfe\xff\x00a\x00\r\x00\n\x04\x36",
+            b"\xff\xfea\x00\r\x00\n\x00b\x00\n\x00",
+            b"\xff\xfe",
+            // A UTF-16 signature before bytes that are not UTF-16.
+            b"\xff\xfeodd",
+            b"\xff\xfe\x00\xd8",
         ];
         for sample in samples {
             let (text, format) = decode_file(sample).unwrap();
@@ -2490,7 +2531,15 @@ mod tests {
         assert!(!decode_file(b"a\r\nb\n").unwrap().1.crlf);
         assert_eq!(decode_file(b"\xff\n").unwrap().1.enc, 1);
         assert!(decode_file(b"\xef\xbb\xbfx").unwrap().1.bom);
-        assert!(decode_file(b"\xff\xfex\x00").is_err());
+        let (text, format) = decode_file(b"\xff\xfex\x00\r\x00\n\x00").unwrap();
+        assert_eq!(
+            (text.as_str(), format.enc, format.crlf, format.bom),
+            ("x\n", 5, true, true)
+        );
+        let (text, format) = decode_file(b"\xfe\xff\x04\x36").unwrap();
+        assert_eq!((text.as_str(), format.enc), ("ж", encoding::UTF16BE));
+        // Not UTF-16 after all: read byte for byte.
+        assert_eq!(decode_file(b"\xff\xfeodd").unwrap().1.enc, 1);
     }
 
     #[test]
@@ -2571,6 +2620,50 @@ mod tests {
         assert!(ed.buf.is_modified());
         ed.save().unwrap();
         assert_eq!(fs::read_to_string(&file).unwrap(), "new old");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn utf16_files_are_edited_and_saved_as_utf16() {
+        let dir = temp_dir("utf16");
+        let file = dir.join("notes.txt");
+        fs::write(&file, b"\xff\xfea\x00\r\x00\n\x00").unwrap();
+        let mut ed = Editor::open(&file).unwrap();
+        assert_eq!(ed.format.enc, encoding::UTF16LE);
+        ed.type_text("ж");
+        ed.save().unwrap();
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            b"\xff\xfe\x36\x04a\x00\r\x00\n\x00"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn shift_f8_rereads_in_utf16_and_f8_leaves_it() {
+        let dir = temp_dir("utf16_switch");
+        let file = dir.join("plain.txt");
+        // UTF-16LE without a signature opens as bytes.
+        fs::write(&file, b"h\x00i\x00").unwrap();
+        let mut ed = Editor::open(&file).unwrap();
+        assert_eq!(ed.format.enc, 0);
+        assert!(set_encoding(&mut ed, encoding::UTF16LE));
+        assert_eq!(ed.buf.to_text(), "hi");
+        assert!(!ed.format.bom, "no signature on disk, none added");
+        ed.save().unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"h\x00i\x00");
+        // An odd length is not UTF-16: nothing changes.
+        fs::write(&file, b"abc").unwrap();
+        let mut ed = Editor::open(&file).unwrap();
+        assert!(!set_encoding(&mut ed, encoding::UTF16LE));
+        assert_eq!((ed.format.enc, ed.buf.to_text().as_str()), (0, "abc"));
+        // Typed text chosen as UTF-16 gets a signature; F8 goes back to UTF-8.
+        ed.type_text("x");
+        assert!(set_encoding(&mut ed, encoding::UTF16BE));
+        assert!(ed.format.bom);
+        ed.save().unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"\xfe\xff\x00x\x00a\x00b\x00c");
+        change_encoding(&mut ed).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }
 
