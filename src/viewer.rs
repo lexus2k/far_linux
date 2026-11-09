@@ -90,7 +90,7 @@ impl Viewer {
         } else {
             Source::File(file)
         };
-        Ok(Viewer {
+        let mut viewer = Viewer {
             path: path.to_path_buf(),
             source,
             size,
@@ -108,7 +108,69 @@ impl Viewer {
             bookmarks: [None; 10],
             jumps: Vec::new(),
             table: ['?'; 256],
-        })
+        };
+        // A UTF-16 byte order mark says the encoding, as in Far.
+        let head = viewer.read_at(0, 2);
+        for enc in [encoding::UTF16LE, encoding::UTF16BE] {
+            if head == encoding::bom(enc) {
+                viewer.set_encoding(enc);
+            }
+        }
+        Ok(viewer)
+    }
+
+    fn utf16(&self) -> bool {
+        encoding::is_utf16_index(self.enc)
+    }
+
+    /// Bytes per code unit: 2 in UTF-16, else 1. Offsets of lines and rows
+    /// are multiples of it.
+    fn unit(&self) -> usize {
+        if self.utf16() {
+            2
+        } else {
+            1
+        }
+    }
+
+    /// The code unit of a character below U+0100, such as `\n`.
+    fn unit_of(&self, c: u8) -> [u8; 2] {
+        match self.enc {
+            encoding::UTF16LE => [c, 0],
+            encoding::UTF16BE => [0, c],
+            _ => [c, 0],
+        }
+    }
+
+    /// Index of the first line break in `bytes`, which start on a unit.
+    fn find_newline(&self, bytes: &[u8]) -> Option<usize> {
+        if !self.utf16() {
+            return bytes.iter().position(|b| *b == b'\n');
+        }
+        let nl = self.unit_of(b'\n');
+        bytes.chunks_exact(2).position(|u| u == nl).map(|i| i * 2)
+    }
+
+    /// Index of the last line break in `bytes`, which start on a unit.
+    fn rfind_newline(&self, bytes: &[u8]) -> Option<usize> {
+        if !self.utf16() {
+            return bytes.iter().rposition(|b| *b == b'\n');
+        }
+        let nl = self.unit_of(b'\n');
+        bytes.chunks_exact(2).rposition(|u| u == nl).map(|i| i * 2)
+    }
+
+    fn ends_with_newline(&self, bytes: &[u8]) -> bool {
+        if self.utf16() {
+            bytes.len() % 2 == 0 && bytes.ends_with(&self.unit_of(b'\n'))
+        } else {
+            bytes.ends_with(b"\n")
+        }
+    }
+
+    /// `offset` moved back to the start of its code unit.
+    fn align(&self, offset: u64) -> u64 {
+        offset - offset % self.unit() as u64
     }
 
     /// Picks up growth of a file being written while it is viewed.
@@ -123,9 +185,10 @@ impl Viewer {
     /// Selects an encoding by index in [`encoding::NAMES`].
     pub fn set_encoding(&mut self, index: usize) {
         self.enc = index;
-        if index != 0 {
+        if index != 0 && index < encoding::BYTE_ENCODINGS {
             self.table = encoding::table(index);
         }
+        self.top = self.align(self.top);
     }
 
     fn read_at(&self, offset: u64, len: usize) -> Vec<u8> {
@@ -155,6 +218,9 @@ impl Viewer {
 
     /// Splits bytes into characters and the number of bytes each one uses.
     pub fn decode(&self, bytes: &[u8]) -> Vec<(char, usize)> {
+        if self.utf16() {
+            return decode_utf16(bytes, self.enc == encoding::UTF16LE);
+        }
         if self.enc != 0 {
             return bytes.iter().map(|b| (self.table[*b as usize], 1)).collect();
         }
@@ -200,16 +266,28 @@ impl Viewer {
             };
         }
         let chunk = self.read_at(offset, MAX_LINE);
-        let newline = chunk.iter().position(|b| *b == b'\n');
+        let newline = self.find_newline(&chunk);
         let mut line_len = newline.unwrap_or(chunk.len());
         let mut next = match newline {
-            Some(pos) => offset + pos as u64 + 1,
+            Some(pos) => offset + (pos + self.unit()) as u64,
             None => offset + chunk.len() as u64,
         };
-        if newline.is_none() && self.enc == 0 && chunk.len() == MAX_LINE {
-            // A forced break must not split a UTF-8 sequence.
-            line_len = utf8_safe_cut(&chunk);
+        if newline.is_none() && chunk.len() == MAX_LINE {
+            // A forced break must not split a character.
+            if self.enc == 0 {
+                line_len = utf8_safe_cut(&chunk);
+            } else if self.utf16() {
+                line_len = utf16_safe_cut(&chunk, self.enc == encoding::UTF16LE);
+            }
             next = offset + line_len as u64;
+        }
+        // The CR of a CRLF line ending is not shown, as in Far.
+        if newline.is_some() {
+            let cr = self.unit_of(b'\r');
+            let cr: &[u8] = if self.utf16() { &cr } else { b"\r" };
+            if chunk[..line_len].ends_with(cr) {
+                line_len -= cr.len();
+            }
         }
         if self.wrap {
             let mut col = 0;
@@ -240,14 +318,15 @@ impl Viewer {
 
     /// Finds where the logical line containing the byte before `offset` starts.
     fn line_start(&self, offset: u64) -> u64 {
+        let offset = self.align(offset);
         if offset == 0 {
             return 0;
         }
         let begin = offset.saturating_sub(MAX_LINE as u64);
         let chunk = self.read_at(begin, (offset - begin) as usize);
-        let search = &chunk[..chunk.len().saturating_sub(1)];
-        match search.iter().rposition(|b| *b == b'\n') {
-            Some(pos) => begin + pos as u64 + 1,
+        let search = &chunk[..chunk.len().saturating_sub(self.unit())];
+        match self.rfind_newline(search) {
+            Some(pos) => begin + (pos + self.unit()) as u64,
             None => begin,
         }
     }
@@ -255,7 +334,7 @@ impl Viewer {
     /// Returns the start of the row above `offset`.
     pub fn prev_row(&self, offset: u64, width: usize) -> u64 {
         if self.dump {
-            return offset.saturating_sub(width.max(1) as u64);
+            return self.align(offset.saturating_sub((width.max(1) * self.unit()) as u64));
         }
         let mut at = self.line_start(offset);
         loop {
@@ -325,7 +404,7 @@ impl Viewer {
         if self.hex {
             self.top = offset - offset % self.hex_width;
         } else if self.dump {
-            self.top = offset;
+            self.top = self.align(offset);
         } else {
             self.top = self.line_start(offset);
             let mut at = self.top;
@@ -399,7 +478,12 @@ impl Viewer {
         limit: u64,
         backward: bool,
     ) -> Option<(u64, u64)> {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        let cr = self.unit_of(b'\r');
+        let line = if self.utf16() {
+            line.strip_suffix(&cr[..]).unwrap_or(line)
+        } else {
+            line.strip_suffix(b"\r").unwrap_or(line)
+        };
         let decoded = self.decode(line);
         let text: String = decoded.iter().map(|(c, _)| *c).collect();
         let mut offsets = Vec::with_capacity(decoded.len() + 1);
@@ -433,6 +517,7 @@ impl Viewer {
 
     fn search_text_forward(&self, m: &Matcher, from: u64) -> Option<(u64, u64)> {
         let mut at = self.line_start(from.saturating_add(1).min(self.size));
+        let unit = self.unit();
         while at < self.size {
             let window = self.read_at(at, WINDOW);
             if window.is_empty() {
@@ -440,7 +525,7 @@ impl Viewer {
             }
             let mut start = 0;
             while start < window.len() {
-                let newline = window[start..].iter().position(|b| *b == b'\n');
+                let newline = self.find_newline(&window[start..]);
                 let Some(length) = newline else {
                     if start > 0 {
                         break; // Reread so that the line is complete.
@@ -458,7 +543,7 @@ impl Viewer {
                 if hit.is_some() {
                     return hit;
                 }
-                start += length + 1;
+                start += length + unit;
             }
             at += start as u64;
         }
@@ -467,8 +552,9 @@ impl Viewer {
 
     fn search_text_backward(&self, m: &Matcher, from: u64) -> Option<(u64, u64)> {
         let mut end = from.min(self.size);
+        let unit = self.unit();
         // Include the rest of the line, so a match ending at `from` is seen.
-        let mut limit_line_end = end;
+        let mut limit_line_end = self.align(end);
         while end > 0 || limit_line_end > 0 {
             let begin = limit_line_end.saturating_sub(WINDOW as u64);
             let window = self.read_at(begin, (limit_line_end - begin) as usize);
@@ -477,11 +563,10 @@ impl Viewer {
             }
             let mut stop = window.len();
             loop {
-                let search = &window[..stop.saturating_sub(usize::from(
-                    window.get(stop.wrapping_sub(1)) == Some(&b'\n'),
-                ))];
-                let newline = search.iter().rposition(|b| *b == b'\n');
-                let start = newline.map_or(0, |p| p + 1);
+                let trailing = self.ends_with_newline(&window[..stop]);
+                let search = &window[..stop.saturating_sub(if trailing { unit } else { 0 })];
+                let newline = self.rfind_newline(search);
+                let start = newline.map_or(0, |p| p + unit);
                 // A partial first line is reread from an earlier window.
                 if newline.is_none() && begin > 0 && stop < window.len() {
                     break;
@@ -707,6 +792,57 @@ impl Viewer {
     }
 }
 
+/// Splits UTF-16 into characters and the bytes each uses. Unpaired
+/// surrogates and an odd last byte become U+FFFD.
+fn decode_utf16(bytes: &[u8], little: bool) -> Vec<(char, usize)> {
+    let unit = |i: usize| {
+        let pair = [bytes[i], bytes[i + 1]];
+        if little {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        }
+    };
+    let mut out = Vec::with_capacity(bytes.len() / 2 + 1);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let first = unit(i);
+        if (0xd800..0xdc00).contains(&first) && i + 3 < bytes.len() {
+            let second = unit(i + 2);
+            if (0xdc00..0xe000).contains(&second) {
+                let code =
+                    0x10000 + ((u32::from(first) - 0xd800) << 10) + (u32::from(second) - 0xdc00);
+                out.push((char::from_u32(code).unwrap_or('\u{fffd}'), 4));
+                i += 4;
+                continue;
+            }
+        }
+        out.push((char::from_u32(u32::from(first)).unwrap_or('\u{fffd}'), 2));
+        i += 2;
+    }
+    if i < bytes.len() {
+        out.push(('\u{fffd}', 1));
+    }
+    out
+}
+
+/// Length of UTF-16 `bytes` cut to whole units, not between a surrogate pair.
+fn utf16_safe_cut(bytes: &[u8], little: bool) -> usize {
+    let len = bytes.len() & !1;
+    if len >= 2 {
+        let pair = [bytes[len - 2], bytes[len - 1]];
+        let last = if little {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        };
+        if (0xd800..0xdc00).contains(&last) {
+            return len - 2;
+        }
+    }
+    len
+}
+
 /// Length of `bytes` without a trailing incomplete UTF-8 sequence.
 fn utf8_safe_cut(bytes: &[u8]) -> usize {
     let len = bytes.len();
@@ -916,12 +1052,17 @@ pub fn run(
                     v.go_to(top, w);
                 }
             }
-            (NONE, KeyCode::F(8)) => v.set_encoding((v.enc + 1) % encoding::BYTE_ENCODINGS),
+            (NONE, KeyCode::F(8)) => {
+                // UTF-8 and the single-byte encodings; from UTF-16 to UTF-8.
+                let next = if encoding::is_utf16_index(v.enc) {
+                    0
+                } else {
+                    (v.enc + 1) % encoding::BYTE_ENCODINGS
+                };
+                v.set_encoding(next);
+            }
             (SHIFT, KeyCode::F(8)) => {
-                let items: Vec<String> = encoding::NAMES[..encoding::BYTE_ENCODINGS]
-                    .iter()
-                    .map(|n| n.to_string())
-                    .collect();
+                let items: Vec<String> = encoding::NAMES.iter().map(|n| n.to_string()).collect();
                 if let Some(i) = dialog::menu(tui, "Encoding", &items, v.enc)? {
                     v.set_encoding(i);
                 }
@@ -1033,7 +1174,14 @@ fn find_next(v: &mut Viewer, state: &SearchState, backward: bool, width: usize) 
         (None, _) => v.top,
     };
     let o = &state.opts;
-    let plain_bytes = state.hex || (o.case_sensitive && !o.whole_words && !o.fuzzy && !o.regex);
+    // In UTF-16 the encoded text could match across two characters, so the
+    // text search, which keeps to whole characters, is used instead.
+    let plain_bytes = state.hex
+        || (o.case_sensitive
+            && !o.whole_words
+            && !o.fuzzy
+            && !o.regex
+            && !encoding::is_utf16_index(v.enc));
     let found = if plain_bytes {
         let needle = if state.hex {
             let Some(bytes) = parse_hex(&o.text) else {
@@ -1088,6 +1236,8 @@ mod tests {
         assert_eq!((r.bytes.as_slice(), r.next), (&b"one"[..], 4));
         v.scroll_down(1, 1, 80);
         assert_eq!(v.top, 4);
+        // The CR of CRLF is not part of what is shown.
+        assert_eq!(v.row_at(4, 80).bytes, b"two");
         v.scroll_down(1, 1, 80);
         assert_eq!(v.top, 9);
         v.scroll_up(1, 80);
@@ -1192,6 +1342,92 @@ mod tests {
         assert_eq!(v.search_text(&m, 18, true), Some((13, 3)));
         assert_eq!(v.search_text(&m, 13, true), Some((5, 3)));
         assert_eq!(v.search_text(&m, 5, true), None);
+        fs::remove_file(p).unwrap();
+    }
+
+    fn utf16(text: &str, little: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        for unit in format!("\u{feff}{text}").encode_utf16() {
+            if little {
+                out.extend_from_slice(&unit.to_le_bytes());
+            } else {
+                out.extend_from_slice(&unit.to_be_bytes());
+            }
+        }
+        out
+    }
+
+    fn row_string(v: &Viewer, offset: u64) -> (String, u64) {
+        let row = v.row_at(offset, 80);
+        let text = v.decode(&row.bytes).iter().map(|(c, _)| *c).collect();
+        (text, row.next)
+    }
+
+    #[test]
+    fn utf16_files_open_as_utf16_and_split_into_lines() {
+        for little in [true, false] {
+            let (mut v, p) = make(
+                &format!("u16_{little}"),
+                &utf16("жж Foo\nbar foo\r\n🦀", little),
+            );
+            let want = if little {
+                encoding::UTF16LE
+            } else {
+                encoding::UTF16BE
+            };
+            assert_eq!(v.enc, want);
+            assert_eq!(row_string(&v, 0), ("\u{feff}жж Foo".to_string(), 16));
+            assert_eq!(row_string(&v, 16), ("bar foo".to_string(), 34));
+            assert_eq!(row_string(&v, 34), ("🦀".to_string(), 38));
+            v.scroll_down(2, 1, 80);
+            assert_eq!(v.top, 34);
+            v.scroll_up(1, 80);
+            assert_eq!(v.top, 16);
+            // Going to an odd offset lands on the start of its line.
+            v.go_to(27, 80);
+            assert_eq!(v.top, 16);
+            fs::remove_file(p).unwrap();
+        }
+    }
+
+    #[test]
+    fn utf16_line_breaks_are_whole_units() {
+        // U+0A41 U+2000 is 41 0A 00 20: a 0A 00 pair, but not on a unit.
+        let (v, p) = make("u16_units", &utf16("\u{0a41}\u{2000}x\ny", true));
+        assert_eq!(row_string(&v, 0).0, "\u{feff}\u{0a41}\u{2000}x");
+        fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn utf16_search_reports_byte_offsets_in_both_directions() {
+        let (v, p) = make("u16_find", &utf16("жж Foo\nbar foo\r\nfoo", true));
+        let m = matcher("foo", false, false);
+        assert_eq!(v.search_text(&m, 0, false), Some((8, 6)));
+        assert_eq!(v.search_text(&m, 9, false), Some((24, 6)));
+        assert_eq!(v.search_text(&m, 25, false), Some((34, 6)));
+        assert_eq!(v.search_text(&m, 35, false), None);
+        assert_eq!(v.search_text(&m, v.size, true), Some((34, 6)));
+        assert_eq!(v.search_text(&m, 34, true), Some((24, 6)));
+        assert_eq!(v.search_text(&m, 24, true), Some((8, 6)));
+        assert_eq!(v.search_text(&m, 8, true), None);
+        fs::remove_file(p).unwrap();
+    }
+
+    #[test]
+    fn utf16_decoding_survives_broken_input_and_long_lines() {
+        // A lone surrogate and an odd last byte.
+        let decoded = decode_utf16(&[0x00, 0xd8, 0x41, 0x00, 0x42], true);
+        assert_eq!(decoded, vec![('\u{fffd}', 2), ('A', 2), ('\u{fffd}', 1)]);
+        assert_eq!(
+            decode_utf16(&[0x3e, 0xd8, 0x80, 0xdd], true),
+            vec![('🦀', 4)]
+        );
+        // A forced break keeps a surrogate pair together.
+        assert_eq!(utf16_safe_cut(&[0x41, 0, 0x3d, 0xd8], true), 2);
+        assert_eq!(utf16_safe_cut(&[0x41, 0, 0x42], true), 2);
+        let long = utf16(&"a".repeat(MAX_LINE), true);
+        let (v, p) = make("u16_long", &long);
+        assert_eq!(v.row_at(0, 80).next, MAX_LINE as u64);
         fs::remove_file(p).unwrap();
     }
 

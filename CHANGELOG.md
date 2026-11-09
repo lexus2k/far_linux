@@ -4,6 +4,9 @@
 
 ### Added
 
+- The viewer shows UTF-16 files, little and big endian, as text, recognised by
+  their byte order mark. Lines, scrolling and search work in whole characters,
+  and `Shift+F8` offers UTF-16LE and UTF-16BE for any file.
 - The editor opens UTF-16 files, little and big endian, by their byte order mark,
   and saves them back as UTF-16 with the mark, byte for byte when unchanged.
   `Shift+F8` offers UTF-16LE and UTF-16BE for any file; `F8` cycles UTF-8 and
@@ -41,6 +44,8 @@
 
 ### Fixed
 
+- The viewer no longer shows the CR of CRLF line endings as `·` at the end of
+  each line.
 - Sizes show as Far shows them: plain digits when they fit, otherwise scaled
   with a space before the unit, such as `1385 K` or `90 M`. The line under the
   files showed `111 943`, split into groups, and the size column `1385K`.
