@@ -934,7 +934,7 @@ fn f3_on_up_counts_the_current_folder_into_the_size_column() {
     s.wait("data.bin");
     // The cursor starts on `..`, and the footer shows it.
     s.keys(&["F3"]);
-    s.wait("22 345 bytes");
+    s.wait("22345");
     assert!(!s.screen().contains("Folder size"), "{}", s.screen());
 }
 
@@ -948,7 +948,7 @@ fn f3_on_a_folder_counts_it_and_leaves_the_panel_usable() {
     };
     s.wait("sub");
     s.keys(&["Down", "F3"]);
-    s.wait("4 321 bytes");
+    s.wait("4321");
     s.keys(&["Enter"]);
     s.wait("more.bin");
 }

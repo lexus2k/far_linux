@@ -61,7 +61,9 @@ pub fn group_digits(n: u64) -> String {
     out
 }
 
-/// Formats a size so that it fits in `width` columns, scaling units if needed.
+/// Formats a size as Far does: plain digits when they fit in `width`
+/// columns, otherwise in K, M, G and on, with a space before the unit, such as
+/// `111943`, `1385 K` or `90 M`.
 pub fn fit_size(n: u64, width: usize) -> String {
     let plain = n.to_string();
     if plain.len() <= width {
@@ -70,7 +72,7 @@ pub fn fit_size(n: u64, width: usize) -> String {
     let mut value = n as f64;
     for unit in ["K", "M", "G", "T", "P", "E"] {
         value /= 1024.0;
-        let text = format!("{}{unit}", value.round() as u64);
+        let text = format!("{} {unit}", value.round() as u64);
         if text.len() <= width {
             return text;
         }
@@ -259,8 +261,13 @@ mod tests {
         assert_eq!(group_digits(1234567), "1 234 567");
         assert_eq!(group_digits(999), "999");
         assert_eq!(fit_size(1023, 6), "1023");
-        assert_eq!(fit_size(10 * 1024 * 1024, 6), "10240K");
-        assert_eq!(fit_size(10 * 1024 * 1024, 4), "10M");
+        assert_eq!(fit_size(111_943, 6), "111943");
+        assert_eq!(fit_size(1_418_240, 6), "1385 K");
+        assert_eq!(fit_size(6_139_904, 6), "5996 K");
+        assert_eq!(fit_size(90 * 1024 * 1024, 6), "90 M");
+        assert_eq!(fit_size(123 << 30, 6), "123 G");
+        assert_eq!(fit_size(10 * 1024 * 1024, 6), "10 M");
+        assert_eq!(fit_size(10 * 1024 * 1024, 10), "10485760");
     }
 
     #[test]

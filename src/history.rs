@@ -57,7 +57,13 @@ pub fn default_path() -> Option<PathBuf> {
 
 fn init(db: Connection) -> rusqlite::Result<History> {
     db.execute_batch(
+        // WAL with NORMAL sync: a write no longer waits for the disk, which
+        // took about 8 ms on each change of folder. A crash can lose the
+        // last entries but cannot damage the file, and several windows can
+        // still share it.
         "PRAGMA busy_timeout = 2000;
+         PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = NORMAL;
          CREATE TABLE IF NOT EXISTS history (
              kind TEXT NOT NULL,
              value TEXT NOT NULL,

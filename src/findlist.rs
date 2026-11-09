@@ -451,7 +451,7 @@ mod tests {
         f.mtime = 1_790_000_000;
         let line = item_line(&f);
         assert!(
-            line.ends_with("│ 3000K│-rw-r--r--│adb_camera-app.log"),
+            line.ends_with("│3000 K│-rw-r--r--│adb_camera-app.log"),
             "{line}"
         );
         f.is_dir = true;
