@@ -25,6 +25,17 @@
   a status line, and New search, Go to, View, Stop and Cancel. `F3` and `F4`
   view or edit a found file while the search goes on.
 
+### Fixed
+
+- Sizes show as Far shows them: plain digits when they fit, otherwise scaled
+  with a space before the unit, such as `1385 K` or `90 M`. The line under the
+  files showed `111 943`, split into groups, and the size column `1385K`.
+- Opening a folder is faster. Large folders are read on several threads, which
+  matters on Windows drives under WSL, where each file's details take about a
+  millisecond: `/mnt/c/Windows/System32` opens in 1.1 s instead of 5.2 s. The
+  history database no longer waits for the disk on each change of folder,
+  which took about 8 ms.
+
 ## 0.3.0 - 2026-11-06
 
 ### Added
