@@ -370,6 +370,95 @@ impl Drop for IgnoreInterrupts {
     }
 }
 
+/// Whether `Enter` runs a file rather than opening it in an application: it
+/// must have an execute bit and be a program, ELF or a `#!` script, or on WSL
+/// a Windows program. Files on Windows drives all have execute bits, so the
+/// bits alone are not enough.
+pub fn runs_directly(path: &Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
+        return false;
+    }
+    let mut head = [0u8; 4];
+    let n = fs::File::open(path)
+        .and_then(|mut f| io::Read::read(&mut f, &mut head))
+        .unwrap_or(0);
+    let head = &head[..n];
+    head.starts_with(b"\x7fELF") || head.starts_with(b"#!") || (head.starts_with(b"MZ") && is_wsl())
+}
+
+/// Running under WSL, where Windows programs and associations are reachable.
+pub fn is_wsl() -> bool {
+    std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || Path::new("/proc/sys/fs/binfmt_misc/WSLInterop").exists()
+}
+
+/// The command that opens `path` in the application registered for its
+/// type: on WSL the Windows one, through `wslview` or Explorer, otherwise
+/// `xdg-open` when a desktop is there. `None` when there is no way to.
+pub fn opener(path: &Path, path_var: Option<&std::ffi::OsStr>) -> Option<Command> {
+    let desktop =
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some();
+    opener_for(path, path_var, is_wsl(), desktop)
+}
+
+/// `opener` for a given system: WSL or plain Linux, with or without a
+/// desktop.
+fn opener_for(
+    path: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+    wsl: bool,
+    desktop: bool,
+) -> Option<Command> {
+    let found = |name: &str| {
+        std::env::split_paths(path_var.unwrap_or_default())
+            .map(|dir| dir.join(name))
+            .find(|p| p.is_file())
+    };
+    if wsl {
+        if let Some(tool) = found("wslview") {
+            let mut command = Command::new(tool);
+            command.arg(path);
+            return Some(command);
+        }
+        let explorer = found("explorer.exe").or_else(|| {
+            Some(PathBuf::from("/mnt/c/Windows/explorer.exe")).filter(|p| p.is_file())
+        })?;
+        let windows = Command::new(found("wslpath")?)
+            .arg("-w")
+            .arg(path)
+            .output()
+            .ok()?;
+        let windows = String::from_utf8(windows.stdout).ok()?;
+        let windows = windows.trim_end_matches('\n');
+        if windows.is_empty() {
+            return None;
+        }
+        let mut command = Command::new(explorer);
+        command.arg(windows);
+        return Some(command);
+    }
+    let tool = found("xdg-open").filter(|_| desktop)?;
+    let mut command = Command::new(tool);
+    command.arg(path);
+    Some(command)
+}
+
+/// Starts `command` apart from far: no terminal, its own process group so
+/// Ctrl+C does not reach it, and reaped on a thread.
+pub fn launch(mut command: Command) -> io::Result<()> {
+    let mut child = command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,5 +622,50 @@ mod tests {
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o700);
         drop(shell);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn enter_runs_programs_and_scripts_but_not_files_with_only_execute_bits() {
+        let dir = std::env::temp_dir().join(format!("far-runs-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, body: &[u8], mode: u32| {
+            let p = dir.join(name);
+            fs::write(&p, body).unwrap();
+            fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
+            p
+        };
+        assert!(runs_directly(&write(
+            "script",
+            b"#!/bin/sh\necho hi\n",
+            0o755
+        )));
+        assert!(runs_directly(&write("program", b"\x7fELF\x02\x01", 0o755)));
+        // A document with execute bits, as everything on a Windows drive.
+        assert!(!runs_directly(&write("notes.txt", b"hello\n", 0o777)));
+        assert!(!runs_directly(&write("plain", b"#!/bin/sh\n", 0o644)));
+        assert!(!runs_directly(&write("empty", b"", 0o755)));
+        assert!(!runs_directly(&dir));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn plain_linux_opens_with_xdg_open_only_on_a_desktop() {
+        let dir = std::env::temp_dir().join(format!("far-opener-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for name in ["xdg-open", "wslview"] {
+            fs::write(dir.join(name), "#!/bin/sh\n").unwrap();
+        }
+        let file = Path::new("/etc/hostname");
+        let var = Some(dir.as_os_str());
+        let program = |c: Command| c.get_program().to_owned();
+        // Plain Linux on a desktop: xdg-open, never the WSL tool.
+        let desktop = opener_for(file, var, false, true).map(program);
+        assert_eq!(desktop, Some(dir.join("xdg-open").into_os_string()));
+        // Over SSH or on the console there is nothing, so Enter views it.
+        assert!(opener_for(file, var, false, false).is_none());
+        // WSL prefers wslview, desktop or not.
+        let wsl = opener_for(file, var, true, false).map(program);
+        assert_eq!(wsl, Some(dir.join("wslview").into_os_string()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

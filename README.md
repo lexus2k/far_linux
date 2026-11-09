@@ -149,8 +149,12 @@ entry from the history and `Ctrl+End` completes from the first match.
 - Each command runs in its own `bash`. Working directory and exported variables
   carry over, and `~/.bash_aliases` is loaded, but functions and anything else
   from `~/.bashrc` are not. `Ctrl+Z` is ignored for commands.
-- `Enter` on a non-executable file opens the viewer, because there is no file
-  association system.
+- `Enter` runs a file only when it has an execute bit and is a program or a
+  `#!` script. Any other file opens in the application registered for its type,
+  as Windows' associations open it in Far: on WSL through `wslview` or Explorer,
+  elsewhere through `xdg-open` when a desktop is running. Without either it opens
+  in the viewer. far has no association menu of its own. `Shift+Enter` opens the
+  file or folder the same way, as Far opens a folder in Explorer.
 - `exit` ends far without asking, and `exit 3` ignores the code: far itself exits
   with 0.
 - `Tab` completes file and command names on the console (`Ctrl+O`), as bash does.
