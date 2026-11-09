@@ -87,6 +87,71 @@ fn program_exists(name: &str) -> bool {
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(name).is_file()))
 }
 
+/// Compression level, as ArcLite's Create archive dialog offers it. Normal
+/// keeps each format's own default.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Level {
+    Store,
+    Fastest,
+    #[default]
+    Normal,
+    Maximum,
+    Ultra,
+}
+
+pub const LEVELS: [Level; 5] = [
+    Level::Store,
+    Level::Fastest,
+    Level::Normal,
+    Level::Maximum,
+    Level::Ultra,
+];
+
+impl Level {
+    pub fn name(self) -> &'static str {
+        match self {
+            Level::Store => "Store",
+            Level::Fastest => "Fastest",
+            Level::Normal => "Normal",
+            Level::Maximum => "Maximum",
+            Level::Ultra => "Ultra",
+        }
+    }
+
+    /// The option for an external compressor, bzip2 or xz. Neither can
+    /// store, so Store is their fastest level.
+    fn tool_arg(self, tool: &str) -> Option<&'static str> {
+        match (self, tool) {
+            (Level::Normal, _) => None,
+            (Level::Store, "xz") => Some("-0"),
+            (Level::Store | Level::Fastest, _) => Some("-1"),
+            (Level::Ultra, "xz") => Some("-9e"),
+            (Level::Maximum | Level::Ultra, _) => Some("-9"),
+        }
+    }
+
+    /// The deflate level for zip and gzip; `None` is the default.
+    fn deflate(self) -> Option<u32> {
+        match self {
+            Level::Store => Some(0),
+            Level::Fastest => Some(1),
+            Level::Normal => None,
+            Level::Maximum | Level::Ultra => Some(9),
+        }
+    }
+
+    /// 7z's `-mx` switch.
+    fn seven_z(self) -> Option<&'static str> {
+        match self {
+            Level::Store => Some("-mx0"),
+            Level::Fastest => Some("-mx1"),
+            Level::Normal => None,
+            Level::Maximum => Some("-mx7"),
+            Level::Ultra => Some("-mx9"),
+        }
+    }
+}
+
 /// Recognizes an archive by its file name.
 pub fn detect(path: &Path) -> Option<Format> {
     let name = path.file_name()?.to_string_lossy().to_lowercase();
@@ -308,11 +373,12 @@ impl Write for TarOut {
 }
 
 impl TarOut {
-    fn create(file: File, format: Format) -> io::Result<Self> {
+    fn create(file: File, format: Format, level: Level) -> io::Result<Self> {
         match format.compressor() {
             Some(tool) => {
                 let mut child = Command::new(tool)
                     .arg("-c")
+                    .args(level.tool_arg(tool))
                     .stdin(Stdio::piped())
                     .stdout(file)
                     .stderr(Stdio::null())
@@ -321,7 +387,10 @@ impl TarOut {
                 Ok(TarOut::Pipe(child, stdin))
             }
             None if format == Format::TarGz => {
-                Ok(TarOut::Gz(GzEncoder::new(file, Compression::default())))
+                let compression = level
+                    .deflate()
+                    .map_or(Compression::default(), Compression::new);
+                Ok(TarOut::Gz(GzEncoder::new(file, compression)))
             }
             None => Ok(TarOut::Plain(file)),
         }
@@ -1200,6 +1269,7 @@ pub fn add_split<U: OpUi>(
     sources: &[PathBuf],
     size: u64,
     verify: bool,
+    level: Level,
     ui: &mut U,
 ) -> OpSummary {
     let failed = |ui: &mut U, path: &Path, text: &str| {
@@ -1226,7 +1296,7 @@ pub fn add_split<U: OpUi>(
         COUNTER.fetch_add(1, Ordering::Relaxed),
         format.extension()
     ));
-    let summary = add(&temp, format, "", sources, ui);
+    let summary = add_with(&temp, format, "", sources, level, ui);
     let result = if summary.cancelled || summary.skipped > 0 {
         Ok(())
     } else if let Err(e) = verify.then(|| test(&temp, format)).transpose() {
@@ -1330,16 +1400,16 @@ fn collect_items(
 }
 
 enum Writer {
-    Zip(Box<ZipWriter<File>>),
+    Zip(Box<ZipWriter<File>>, Level),
     Tar(Box<tar::Builder<TarOut>>),
 }
 
 impl Writer {
-    fn create(file: File, format: Format) -> io::Result<Self> {
+    fn create(file: File, format: Format, level: Level) -> io::Result<Self> {
         Ok(match format {
-            Format::Zip => Writer::Zip(Box::new(ZipWriter::new(file))),
+            Format::Zip => Writer::Zip(Box::new(ZipWriter::new(file)), level),
             _ => {
-                let mut builder = tar::Builder::new(TarOut::create(file, format)?);
+                let mut builder = tar::Builder::new(TarOut::create(file, format, level)?);
                 builder.mode(tar::HeaderMode::Complete);
                 Writer::Tar(Box::new(builder))
             }
@@ -1348,7 +1418,7 @@ impl Writer {
 
     fn finish(self) -> io::Result<()> {
         match self {
-            Writer::Zip(writer) => {
+            Writer::Zip(writer, _) => {
                 let file = writer.finish().map_err(invalid)?;
                 file.sync_all()
             }
@@ -1358,7 +1428,7 @@ impl Writer {
 
     fn add_dir(&mut self, name: &str, mode: u32, mtime: i64) -> io::Result<()> {
         match self {
-            Writer::Zip(zip) => {
+            Writer::Zip(zip, _) => {
                 let options = SimpleFileOptions::default()
                     .unix_permissions(mode & 0o777)
                     .last_modified_time(zip_stamp(mtime));
@@ -1378,7 +1448,7 @@ impl Writer {
 
     fn add_link(&mut self, name: &str, target: &Path, mtime: i64) -> io::Result<()> {
         match self {
-            Writer::Zip(zip) => {
+            Writer::Zip(zip, _) => {
                 let options = SimpleFileOptions::default()
                     .unix_permissions(0o777)
                     .last_modified_time(zip_stamp(mtime));
@@ -1408,9 +1478,20 @@ impl Writer {
             Err(e) => return Ok(Err(e)),
         };
         match self {
-            Writer::Zip(zip) => {
+            Writer::Zip(zip, level) => {
+                let method = if *level == Level::Store {
+                    CompressionMethod::Stored
+                } else {
+                    CompressionMethod::Deflated
+                };
                 let options = SimpleFileOptions::default()
-                    .compression_method(CompressionMethod::Deflated)
+                    .compression_method(method)
+                    .compression_level(
+                        level
+                            .deflate()
+                            .filter(|_| method != CompressionMethod::Stored)
+                            .map(i64::from),
+                    )
                     .unix_permissions(meta.mode() & 0o777)
                     .last_modified_time(zip_stamp(meta.mtime()))
                     .large_file(meta.len() >= u32::MAX as u64);
@@ -1457,7 +1538,7 @@ fn copy_existing<U: OpUi>(
     keep: &dyn Fn(&str) -> bool,
 ) -> Result<io::Result<()>, Cancelled> {
     match writer {
-        Writer::Zip(zip) => {
+        Writer::Zip(zip, _) => {
             let mut archive =
                 match File::open(path).and_then(|f| ZipArchive::new(f).map_err(invalid)) {
                     Ok(archive) => archive,
@@ -1580,6 +1661,7 @@ fn rewrite<U: OpUi>(
     format: Format,
     keep: &dyn Fn(&str) -> bool,
     items: &[NewItem],
+    level: Level,
 ) -> Result<io::Result<()>, Cancelled> {
     let existing = fs::metadata(path).ok();
     let temp = temp_beside(path);
@@ -1594,7 +1676,7 @@ fn rewrite<U: OpUi>(
         Err(e) => return Ok(Err(e)),
     };
     let result = (|| -> Result<io::Result<()>, Cancelled> {
-        let mut writer = match Writer::create(file, format) {
+        let mut writer = match Writer::create(file, format, level) {
             Ok(writer) => writer,
             Err(e) => return Ok(Err(e)),
         };
@@ -1670,6 +1752,18 @@ pub fn add<U: OpUi>(
     sources: &[PathBuf],
     ui: &mut U,
 ) -> OpSummary {
+    add_with(path, format, folder, sources, Level::Normal, ui)
+}
+
+/// `add` with a compression level.
+pub fn add_with<U: OpUi>(
+    path: &Path,
+    format: Format,
+    folder: &str,
+    sources: &[PathBuf],
+    level: Level,
+    ui: &mut U,
+) -> OpSummary {
     let mut ctx = Ctx::new(ui, false);
     let mut totals = Totals::default();
     {
@@ -1681,7 +1775,7 @@ pub fn add<U: OpUi>(
     }
     ctx.progress.bytes_total = totals.bytes;
     ctx.progress.items_total = totals.files + totals.dirs;
-    let result = add_inner(&mut ctx, path, format, folder, sources);
+    let result = add_inner(&mut ctx, path, format, folder, sources, level);
     let result = report_outcome(&mut ctx, path, result);
     ctx.finish(result)
 }
@@ -1692,6 +1786,7 @@ fn add_inner<U: OpUi>(
     format: Format,
     folder: &str,
     sources: &[PathBuf],
+    level: Level,
 ) -> Result<io::Result<()>, Cancelled> {
     let known = if path.exists() {
         match list(path, format) {
@@ -1719,9 +1814,16 @@ fn add_inner<U: OpUi>(
         return Ok(Ok(()));
     }
     if format == Format::SevenZ {
-        return add_7z(ctx, path, folder, sources, &items);
+        return add_7z(ctx, path, folder, sources, &items, level);
     }
-    rewrite(ctx, path, format, &|name| !replaced.contains(name), &items)
+    rewrite(
+        ctx,
+        path,
+        format,
+        &|name| !replaced.contains(name),
+        &items,
+        level,
+    )
 }
 
 fn add_7z<U: OpUi>(
@@ -1730,6 +1832,7 @@ fn add_7z<U: OpUi>(
     folder: &str,
     sources: &[PathBuf],
     items: &[NewItem],
+    level: Level,
 ) -> Result<io::Result<()>, Cancelled> {
     let absolute = match fs::canonicalize(path.parent().unwrap_or(Path::new("."))) {
         Ok(dir) => dir.join(path.file_name().unwrap_or_default()),
@@ -1768,14 +1871,9 @@ fn add_7z<U: OpUi>(
             let first = folder.split('/').next().unwrap_or(folder);
             vec![std::ffi::OsString::from(first)]
         };
-        let mut args: Vec<&std::ffi::OsStr> = vec![
-            os("a"),
-            os("-y"),
-            os("-spd"),
-            os("-snl"),
-            os("--"),
-            absolute.as_os_str(),
-        ];
+        let mut args: Vec<&std::ffi::OsStr> = vec![os("a"), os("-y"), os("-spd"), os("-snl")];
+        args.extend(level.seven_z().map(os));
+        args.extend([os("--"), absolute.as_os_str()]);
         args.extend(top.iter().map(|n| n.as_os_str()));
         run_7z(&args, Some(&stage)).map(|_| ())
     })();
@@ -1797,7 +1895,14 @@ pub fn update_file<U: OpUi>(
 ) -> OpSummary {
     let mut ctx = Ctx::new(ui, false);
     ctx.overwrite_all = Some(true);
-    let result = add_inner(&mut ctx, path, format, folder, &[source.to_path_buf()]);
+    let result = add_inner(
+        &mut ctx,
+        path,
+        format,
+        folder,
+        &[source.to_path_buf()],
+        Level::Normal,
+    );
     let result = report_outcome(&mut ctx, path, result);
     ctx.finish(result)
 }
@@ -1861,9 +1966,9 @@ pub fn make_folder<U: OpUi>(path: &Path, format: Format, name: &str, ui: &mut U)
         name: name.to_string(),
     }];
     let result = if format == Format::SevenZ {
-        add_7z(&mut ctx, path, name, &[], &items)
+        add_7z(&mut ctx, path, name, &[], &items, Level::Normal)
     } else {
-        rewrite(&mut ctx, path, format, &|_| true, &items)
+        rewrite(&mut ctx, path, format, &|_| true, &items, Level::Normal)
     };
     let result = report_outcome(&mut ctx, path, result);
     ctx.finish(result)
@@ -1884,6 +1989,7 @@ pub fn delete<U: OpUi>(path: &Path, format: Format, names: &[String], ui: &mut U
             format,
             &|entry| !names.iter().any(|n| is_under(entry, n)),
             &[],
+            Level::Normal,
         )
     };
     if matches!(result, Ok(Ok(()))) {
@@ -2119,6 +2225,33 @@ mod tests {
     }
 
     #[test]
+    fn compression_levels_reach_every_format() {
+        for format in formats() {
+            let d = TestDir::new("level");
+            d.write("src/text.txt", &"far manager level test ".repeat(4000));
+            let mut sizes = Vec::new();
+            for level in LEVELS {
+                let file = d.p(&format!("{}.{}", level.name(), format.extension()));
+                let mut ui = Ui::default();
+                let s = add_with(&file, format, "", &[d.p("src")], level, &mut ui);
+                assert_eq!(s.skipped, 0, "{format:?} {level:?}: {:?}", ui.errors);
+                assert!(paths(&file, format).contains(&"src/text.txt".to_string()));
+                sizes.push(fs::metadata(&file).unwrap().len());
+            }
+            let (store, ultra) = (sizes[0], sizes[4]);
+            match format {
+                Format::Tar => assert_eq!(store, ultra, "tar does not compress"),
+                // bzip2 and xz cannot store; Store is their fastest level.
+                Format::TarBz2 | Format::TarXz => {}
+                _ => assert!(
+                    store > ultra * 2,
+                    "{format:?}: store {store}, ultra {ultra}"
+                ),
+            }
+        }
+    }
+
+    #[test]
     fn volume_sizes_take_k_m_and_g() {
         assert_eq!(parse_volume_size("1000"), Some(1000));
         assert_eq!(parse_volume_size("64k"), Some(64 << 10));
@@ -2170,7 +2303,15 @@ mod tests {
             fs::create_dir(d.p("out")).unwrap();
             let file = d.p(&format!("out/x.{}", format.extension()));
             let mut ui = Ui::default();
-            let s = add_split(&file, format, &[d.p("src")], 4096, true, &mut ui);
+            let s = add_split(
+                &file,
+                format,
+                &[d.p("src")],
+                4096,
+                true,
+                Level::Normal,
+                &mut ui,
+            );
             assert_eq!(
                 (s.skipped, s.cancelled),
                 (0, false),
@@ -2204,12 +2345,28 @@ mod tests {
         let file = d.p("x.zip");
         fs::write(&file, "old").unwrap();
         let mut ui = Ui::default();
-        let s = add_split(&file, Format::Zip, &[d.p("a.txt")], 1024, false, &mut ui);
+        let s = add_split(
+            &file,
+            Format::Zip,
+            &[d.p("a.txt")],
+            1024,
+            false,
+            Level::Normal,
+            &mut ui,
+        );
         assert_eq!((s.skipped, ui.errors.len()), (1, 1));
         assert_eq!(fs::read_to_string(&file).unwrap(), "old");
         fs::remove_file(&file).unwrap();
         fs::write(volume_path(&file, 1), "old volume").unwrap();
-        let s = add_split(&file, Format::Zip, &[d.p("a.txt")], 1024, false, &mut ui);
+        let s = add_split(
+            &file,
+            Format::Zip,
+            &[d.p("a.txt")],
+            1024,
+            false,
+            Level::Normal,
+            &mut ui,
+        );
         assert_eq!(s.skipped, 1);
         assert_eq!(
             fs::read_to_string(volume_path(&file, 1)).unwrap(),
@@ -2229,7 +2386,15 @@ mod tests {
             cancel: true,
             ..Default::default()
         };
-        let s = add_split(&file, Format::Tar, &[d.p("a.txt")], 1024, false, &mut ui);
+        let s = add_split(
+            &file,
+            Format::Tar,
+            &[d.p("a.txt")],
+            1024,
+            false,
+            Level::Normal,
+            &mut ui,
+        );
         assert!(s.cancelled);
         let names: Vec<_> = fs::read_dir(d.p("out")).unwrap().flatten().collect();
         assert!(names.is_empty(), "{names:?}");

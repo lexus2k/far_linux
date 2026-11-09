@@ -670,7 +670,7 @@ fn shift_f1_packs_enter_browses_f5_extracts_and_f8_deletes() {
     };
     s.wait("data");
     s.keys(&["Down", "S-F1"]);
-    s.wait("Archive name");
+    s.wait("Archive path");
     s.keys(&["Enter"]);
     s.wait_file(&s.p("left/data.zip"), true);
     s.wait("1 files");
@@ -720,12 +720,11 @@ fn shift_f2_extracts_a_tar_gz_made_with_the_format_button() {
     };
     s.wait("note.txt");
     s.keys(&["Down", "S-F1"]);
-    s.wait("Archive name");
-    s.keys(&["M-f"]);
-    s.wait("Format");
-    s.keys(&["Down", "Enter"]);
+    s.wait("Archive path");
+    // Down to the archiver row: Right chooses tar.gz, and the name follows.
+    s.keys(&["Down", "Down", "Right"]);
     s.wait("note.txt.tar.gz");
-    s.keys(&["Tab", "Tab", "Enter"]);
+    s.keys(&["Enter"]);
     s.wait_file(&s.p("left/note.txt.tar.gz"), true);
     s.wait("2 files");
     s.keys(&["S-F2"]);
@@ -749,7 +748,7 @@ fn f6_to_an_archive_on_the_other_panel_moves_the_files() {
     s.keys(&["Tab"]);
     s.wait("seed.txt");
     s.keys(&["Down", "S-F1"]);
-    s.wait("Archive name");
+    s.wait("Archive path");
     s.keys(&["Enter"]);
     s.wait_file(&s.p("right/seed.txt.zip"), true);
     s.wait("2 files");
@@ -1076,12 +1075,25 @@ fn exit_command_ends_far_from_panels_and_console() {
             std::thread::sleep(Duration::from_millis(30));
         }
         // The harness keeps the pane alive with `sleep`: far itself must be gone.
+        // It restores the screen first and then closes the history, so give
+        // it a moment to finish exiting.
         let shell = s.tmux(&["display", "-p", "-t", "t", "#{pane_pid}"]);
-        let far = Command::new("pgrep")
-            .args(["-P", shell.trim(), "far"])
-            .output()
-            .expect("pgrep runs");
-        assert!(far.stdout.is_empty(), "far is still running");
+        let running = || {
+            !Command::new("pgrep")
+                .args(["-P", shell.trim(), "far"])
+                .output()
+                .expect("pgrep runs")
+                .stdout
+                .is_empty()
+        };
+        let start = Instant::now();
+        while running() {
+            assert!(
+                start.elapsed() < Duration::from_secs(8),
+                "far is still running"
+            );
+            std::thread::sleep(Duration::from_millis(30));
+        }
     }
 }
 
@@ -1336,7 +1348,7 @@ fn moving_a_full_folder_into_an_archive_does_not_ask_about_deleting_it() {
     s.keys(&["Tab"]);
     s.wait("seed.txt");
     s.keys(&["Down", "S-F1"]);
-    s.wait("Archive name");
+    s.wait("Archive path");
     s.keys(&["Enter"]);
     s.wait_file(&s.p("right/seed.txt.zip"), true);
     s.wait("2 files");
@@ -1969,8 +1981,8 @@ fn shift_f1_splits_into_volumes_that_open_and_extract() {
     s.wait("data");
     s.keys(&["Down", "S-F1"]);
     s.wait("Split into volumes");
-    // Archive name, Move, Split into volumes, Volume size.
-    s.keys(&["Down", "Down", "Space", "Down", "C-y"]);
+    // Path, Append extension, archiver, level, Split into volumes, size.
+    s.keys(&["Down", "Down", "Down", "Down", "Space", "Down", "C-y"]);
     s.text("1K");
     s.keys(&["Enter"]);
     s.wait_file(&s.p("left/data.zip.001"), true);

@@ -20,6 +20,11 @@
 
 ### Changed
 
+- `Shift+F1` opens Create archive laid out as ArcLite's: archive path with
+  Append extension, the archivers as radio buttons, compression level from
+  Store to Ultra, Split into volumes with the size beside it, and Delete files
+  after archiving. Choosing an archiver changes the extension, and the
+  archiver, level and volume size are remembered.
 - `Alt+F7` shows its results as Far's Find file window does, filling while the
   search runs: files under a line for their folder, with date, size and mode,
   a status line, and New search, Go to, View, Stop and Cancel. `F3` and `F4`
