@@ -2193,7 +2193,15 @@ impl App {
             return Ok(());
         }
         let summary = self.run_op(verb, move |ui| {
-            add_then_remove(&file, format, &folder, &sources, moving, ui)
+            add_then_remove(
+                &file,
+                format,
+                &folder,
+                &sources,
+                moving,
+                archive::Level::Normal,
+                ui,
+            )
         })?;
         self.after_op(&summary);
         Ok(())
@@ -2237,10 +2245,12 @@ impl App {
     }
 
     /// Shift+F1: packs the selection into a new or existing archive.
+    /// Shift+F1: packs the selection into a new or existing archive, in a
+    /// dialog laid out as ArcLite's Create archive.
     fn archive_add(&mut self) -> io::Result<()> {
         if self.panels[self.active].archive.is_some() {
             let text = "Leave the archive first, or use F5 from the other panel";
-            return dialog::alert(&mut self.tui, "Add to archive", text);
+            return dialog::alert(&mut self.tui, "Create archive", text);
         }
         let sources = self.panels[self.active].targets();
         if sources.is_empty() {
@@ -2255,87 +2265,106 @@ impl App {
                 .file_name()
                 .map_or("archive".to_string(), |n| n.to_string_lossy().into_owned()),
         };
-        let mut format = self
-            .db
-            .setting("archive.format")
+        let setting = |key: &str| self.db.setting(key);
+        let format = setting("archive.format")
             .and_then(|ext| FORMATS.into_iter().find(|f| f.extension() == ext))
             .unwrap_or(Format::Zip);
+        let level = setting("archive.level")
+            .and_then(|name| archive::LEVELS.into_iter().find(|l| l.name() == name))
+            .unwrap_or_default();
+        let size = setting("archive.volume_size").unwrap_or_else(|| "100M".to_string());
+        let append = setting("archive.append").is_none_or(|v| v == "1");
         let name = format!("{stem}.{}", format.extension());
-        let size = self
-            .db
-            .setting("archive.volume_size")
-            .unwrap_or_else(|| "100M".to_string());
+        let format_names: Vec<&str> = FORMATS.iter().map(|f| f.extension()).collect();
+        let level_names: Vec<&str> = archive::LEVELS.iter().map(|l| l.name()).collect();
+        let at = |list: &[&str], item: &str| list.iter().position(|n| *n == item).unwrap_or(0);
         let mut form = Form::new(vec![
-            Field::with_history("&Archive name", &name, Kind::Target),
-            Field::check("&Move files to the archive", false),
+            Field::with_history("Archive &path:", &name, Kind::Target),
+            Field::check("&Append extension", append),
+            Field::Separator,
+            Field::Label("Select archiver:".to_string()),
+            Field::radio("", &format_names, at(&format_names, format.extension())),
+            Field::Separator,
+            Field::Label("Compression level:".to_string()),
+            Field::radio("", &level_names, at(&level_names, level.name())),
+            Field::Separator,
             Field::check("Split into &volumes", false),
-            Field::text("Volume size (bytes, or with K, M or G):", &size),
+            Field::text("Volume size:", &size).laid_out(dialog::TextLayout::Beside),
+            Field::check("&Delete files after archiving", false),
+            Field::Separator,
         ])
-        .with_buttons(&["Add", "&Format", "Cancel"])
-        .with_db(&self.db);
-        let title = format!("Add {} to archive", Self::describe(&sources));
-        loop {
-            match form.run_buttons(&mut self.tui, &title)? {
-                Some(0) => break,
-                Some(1) => {
-                    let items: Vec<String> = FORMATS
-                        .iter()
-                        .map(|f| match f.tool() {
-                            Some(tool) if !f.is_available() => {
-                                format!("{} (needs {tool})", f.extension())
-                            }
-                            _ => f.extension().to_string(),
-                        })
-                        .collect();
-                    let at = FORMATS.iter().position(|f| *f == format).unwrap_or(0);
-                    if let Some(i) = dialog::menu(&mut self.tui, "Format", &items, at)? {
-                        format = FORMATS[i];
-                        let text = form.text(0);
-                        let renamed = format!("{}.{}", archive::stem(&text), format.extension());
-                        form.set_text(0, &renamed);
-                    }
-                }
-                _ => return Ok(()),
+        .with_buttons(&["OK", "Cancel"])
+        .with_db(&self.db)
+        .on_change(|fields, focus| {
+            // Choosing an archiver changes the extension typed, as ArcLite does.
+            if focus != ARC_FORMAT {
+                return;
             }
+            let Some(Field::Radio { chosen, .. }) = fields.get(ARC_FORMAT) else {
+                return;
+            };
+            let format = FORMATS[*chosen];
+            if let Some(Field::Text { edit, .. }) = fields.get_mut(ARC_PATH) {
+                let text = edit.text();
+                if archive::detect(Path::new(&text)).is_some_and(|f| f != format) {
+                    edit.set(&format!("{}.{}", archive::stem(&text), format.extension()));
+                }
+            }
+        });
+        if form.run_buttons(&mut self.tui, "Create archive")? != Some(0) {
+            return Ok(());
         }
-        let mut text = form.text(0);
+        let mut text = form.text(ARC_PATH).trim().to_string();
         if text.is_empty() {
             return Ok(());
         }
-        match archive::detect(Path::new(&text)) {
-            Some(named) => format = named,
-            None => text = format!("{text}.{}", format.extension()),
-        }
+        let append = form.checked(ARC_APPEND);
+        let chosen = FORMATS[form.chosen(ARC_FORMAT)];
+        let level = archive::LEVELS[form.chosen(ARC_LEVEL)];
+        // A name with a known extension says its format; one without gets the
+        // chosen archiver's extension when Append extension is on.
+        let format = match archive::detect(Path::new(&text)) {
+            Some(named) => named,
+            None => {
+                if append {
+                    text = format!("{text}.{}", chosen.extension());
+                }
+                chosen
+            }
+        };
         if !format.is_available() {
             let message = format!("{} is not installed", format.tool().unwrap_or_default());
-            return dialog::alert(&mut self.tui, "Add to archive", &message);
+            return dialog::alert(&mut self.tui, "Create archive", &message);
         }
-        let volume_size = if form.checked(2) {
-            let Some(size) = archive::parse_volume_size(&form.text(3)) else {
-                return dialog::alert(&mut self.tui, "Add to archive", "Invalid volume size");
+        let volume_size = if form.checked(ARC_SPLIT) {
+            let Some(size) = archive::parse_volume_size(&form.text(ARC_SIZE)) else {
+                return dialog::alert(&mut self.tui, "Create archive", "Invalid volume size");
             };
             self.db
-                .set_setting("archive.volume_size", form.text(3).trim());
+                .set_setting("archive.volume_size", form.text(ARC_SIZE).trim());
             Some(size)
         } else {
             None
         };
         self.db.add(Kind::Target, &text);
         self.db.set_setting("archive.format", format.extension());
+        self.db.set_setting("archive.level", level.name());
+        self.db
+            .set_setting("archive.append", if append { "1" } else { "0" });
         let file = util::resolve_path(&base, &text);
-        let moving = form.checked(1);
+        let moving = form.checked(ARC_DELETE);
         let target = file.clone();
-        let summary = self.run_op("Add to archive", move |ui| match volume_size {
+        let summary = self.run_op("Create archive", move |ui| match volume_size {
             Some(size) => {
                 // With a move, the archive is read back before it is cut, and
                 // the sources go only once every volume is written.
-                let made = archive::add_split(&target, format, &sources, size, moving, ui);
+                let made = archive::add_split(&target, format, &sources, size, moving, level, ui);
                 if !moving || made.cancelled || made.skipped > 0 {
                     return made;
                 }
                 fsops::remove_moved(&sources, ui)
             }
-            None => add_then_remove(&target, format, "", &sources, moving, ui),
+            None => add_then_remove(&target, format, "", &sources, moving, level, ui),
         })?;
         self.after_op(&summary);
         // The cursor goes to the new archive, or to its first volume.
@@ -3335,6 +3364,15 @@ fn field_changed(text: &str, prefilled: &str) -> bool {
     !text.trim().is_empty() && text.trim() != prefilled.trim()
 }
 
+/// Fields of the Create archive dialog.
+const ARC_PATH: usize = 0;
+const ARC_APPEND: usize = 1;
+const ARC_FORMAT: usize = 4;
+const ARC_LEVEL: usize = 7;
+const ARC_SPLIT: usize = 9;
+const ARC_SIZE: usize = 10;
+const ARC_DELETE: usize = 11;
+
 /// Adds files to an archive. With `moving`, the sources are removed only after
 /// nothing was skipped and the archive reads back without errors.
 fn add_then_remove(
@@ -3343,9 +3381,10 @@ fn add_then_remove(
     folder: &str,
     sources: &[PathBuf],
     moving: bool,
+    level: archive::Level,
     ui: &mut ChannelUi,
 ) -> OpSummary {
-    let summary = archive::add(file, format, folder, sources, ui);
+    let summary = archive::add_with(file, format, folder, sources, level, ui);
     if !moving || summary.cancelled || summary.skipped > 0 {
         return summary;
     }

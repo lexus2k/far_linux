@@ -154,6 +154,16 @@ pub enum Field {
         label: String,
         edit: LineEdit,
         history: Option<Kind>,
+        layout: TextLayout,
+    },
+    /// A line across the dialog between groups, as Far draws them.
+    Separator,
+    /// Radio buttons on one row after a label: `Label: (•) a ( ) b`. Left and
+    /// Right choose.
+    Radio {
+        label: String,
+        options: Vec<String>,
+        chosen: usize,
     },
     Check {
         label: String,
@@ -169,6 +179,19 @@ pub enum Field {
         three: Vec<bool>,
         col: usize,
     },
+}
+
+/// Where a text box goes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TextLayout {
+    /// The label on its own row, the box under it.
+    #[default]
+    Below,
+    /// The label and the box on one row.
+    Row,
+    /// Label and box on the right half of the row of the field before it,
+    /// such as a size beside its checkbox.
+    Beside,
 }
 
 /// Width of the label column of `Field::Boxes` rows.
@@ -202,6 +225,7 @@ impl Field {
             label: label.to_string(),
             edit: LineEdit::prefilled(value),
             history: None,
+            layout: TextLayout::Below,
         }
     }
 
@@ -211,6 +235,7 @@ impl Field {
             label: label.to_string(),
             edit: LineEdit::prefilled(value),
             history: Some(kind),
+            layout: TextLayout::Below,
         }
     }
 
@@ -234,21 +259,44 @@ impl Field {
         }
     }
 
+    /// Puts a text box on one row with its label, or with `beside`, on the
+    /// right half of the row of the field before it.
+    pub fn laid_out(mut self, how: TextLayout) -> Field {
+        if let Field::Text { layout, .. } = &mut self {
+            *layout = how;
+        }
+        self
+    }
+
+    pub fn radio(label: &str, options: &[&str], chosen: usize) -> Field {
+        Field::Radio {
+            label: label.to_string(),
+            options: options.iter().map(|o| o.to_string()).collect(),
+            chosen: chosen.min(options.len().saturating_sub(1)),
+        }
+    }
+
     fn focusable(&self) -> bool {
-        !matches!(self, Field::Label(_))
+        !matches!(self, Field::Label(_) | Field::Separator)
     }
 
     fn height(&self) -> u16 {
         match self {
-            Field::Text { .. } => 2,
+            Field::Text { layout, .. } => match layout {
+                TextLayout::Below => 2,
+                TextLayout::Row => 1,
+                TextLayout::Beside => 0,
+            },
             _ => 1,
         }
     }
 
     fn hotkey(&self) -> Option<char> {
         match self {
-            Field::Text { label, .. } | Field::Check { label, .. } => parse_label(label).1,
-            Field::Label(_) | Field::Boxes { .. } => None,
+            Field::Text { label, .. } | Field::Check { label, .. } | Field::Radio { label, .. } => {
+                parse_label(label).1
+            }
+            Field::Label(_) | Field::Boxes { .. } | Field::Separator => None,
         }
     }
 }
@@ -392,6 +440,14 @@ impl Form {
         self
     }
 
+    /// The chosen option of a row of radio buttons.
+    pub fn chosen(&self, index: usize) -> usize {
+        match &self.fields[index] {
+            Field::Radio { chosen, .. } => *chosen,
+            _ => 0,
+        }
+    }
+
     /// States of a row of checkboxes.
     pub fn boxes(&self, index: usize) -> Vec<Option<bool>> {
         match &self.fields[index] {
@@ -525,6 +581,17 @@ impl Form {
                             *on = !*on;
                         }
                     }
+                    Some(Field::Radio {
+                        options, chosen, ..
+                    }) => match key.code {
+                        KeyCode::Left => *chosen = chosen.saturating_sub(1),
+                        KeyCode::Right => {
+                            *chosen = (*chosen + 1).min(options.len().saturating_sub(1))
+                        }
+                        KeyCode::Home => *chosen = 0,
+                        KeyCode::End => *chosen = options.len().saturating_sub(1),
+                        _ => {}
+                    },
                     Some(Field::Boxes {
                         names,
                         states,
@@ -619,17 +686,70 @@ impl Form {
                     s.put(x + 3, row, &fit_left(text, inner), theme::DIALOG);
                     row += 1;
                 }
-                Field::Text { label, edit, .. } => {
+                Field::Text {
+                    label,
+                    edit,
+                    layout,
+                    ..
+                } => {
                     let shown = parse_label(label).0;
-                    s.put(x + 3, row, &fit_left(&shown, inner), theme::DIALOG);
-                    row += 1;
-                    let (visible, cursor) = visible_text(edit, inner);
-                    s.put(x + 3, row, &fit(&visible, inner), theme::INPUT);
+                    // Where the box goes: under its label, after it on the
+                    // same row, or on the right half of the row before.
+                    let (box_x, box_row, box_w) = match layout {
+                        TextLayout::Below => {
+                            s.put(x + 3, row, &fit_left(&shown, inner), theme::DIALOG);
+                            row += 2;
+                            (x + 3, row - 1, inner)
+                        }
+                        TextLayout::Row | TextLayout::Beside => {
+                            let (lx, ly, room) = if *layout == TextLayout::Row {
+                                row += 1;
+                                (x + 3, row - 1, inner)
+                            } else {
+                                let half = inner / 2;
+                                (x + 3 + half as u16, row.saturating_sub(1), inner - half)
+                            };
+                            let label_w = str_width(&shown) + 1;
+                            s.put(lx, ly, &fit_left(&shown, room), theme::DIALOG);
+                            (lx + label_w as u16, ly, room.saturating_sub(label_w))
+                        }
+                    };
+                    let (visible, cursor) = visible_text(edit, box_w);
+                    s.put(box_x, box_row, &fit(&visible, box_w), theme::INPUT);
                     if i == focus {
-                        s.cursor = Some((x + 3 + cursor as u16, row));
+                        s.cursor = Some((box_x + cursor as u16, box_row));
                     }
                     if self.suggest.as_ref().is_some_and(|l| l.field == i) {
-                        list_at = Some((x + 3, row + 1, inner as u16));
+                        list_at = Some((box_x, box_row + 1, box_w as u16));
+                    }
+                }
+                Field::Separator => {
+                    let line = format!("╟{}╢", "─".repeat(w.saturating_sub(4) as usize));
+                    s.put(x + 1, row, &line, theme::DIALOG);
+                    row += 1;
+                }
+                Field::Radio {
+                    label,
+                    options,
+                    chosen,
+                } => {
+                    let shown = parse_label(label).0;
+                    let mut bx = x + 3;
+                    if !shown.is_empty() {
+                        bx = s.put(bx, row, &shown, theme::DIALOG) + 1;
+                    }
+                    for (o, option) in options.iter().enumerate() {
+                        let mark = if o == *chosen { '•' } else { ' ' };
+                        let here = i == focus && o == *chosen;
+                        let style = if here {
+                            theme::DIALOG_FOCUS
+                        } else {
+                            theme::DIALOG
+                        };
+                        if here {
+                            s.cursor = Some((bx + 1, row));
+                        }
+                        bx = s.put(bx, row, &format!("({mark}) {option}"), style) + 2;
                     }
                     row += 1;
                 }
@@ -1156,5 +1276,30 @@ mod tests {
             .position(|r| r.contains("*.") && !r.contains("*.log"))
             .unwrap();
         assert!(rows[input + 2].contains("*.log"), "{rows:#?}");
+    }
+
+    #[test]
+    fn radio_rows_separators_and_boxes_beside_a_checkbox() {
+        let form = Form::new(vec![
+            Field::Label("Select archiver:".to_string()),
+            Field::radio("", &["zip", "7z"], 1),
+            Field::Separator,
+            Field::check("Split into volumes", false),
+            Field::text("Volume size:", "100M").laid_out(TextLayout::Beside),
+        ]);
+        assert_eq!(form.chosen(1), 1);
+        let mut s = Screen::new(80, 20);
+        form.draw(&mut s, "Create archive", 1);
+        let rows: Vec<String> = (0..s.h).map(|y| s.row_text(y)).collect();
+        assert!(
+            rows.iter().any(|r| r.contains("( ) zip  (•) 7z")),
+            "{rows:#?}"
+        );
+        assert!(rows.iter().any(|r| r.contains("╟───")), "{rows:#?}");
+        let split = rows
+            .iter()
+            .find(|r| r.contains("Split into volumes"))
+            .unwrap();
+        assert!(split.contains("Volume size: 100M"), "{rows:#?}");
     }
 }

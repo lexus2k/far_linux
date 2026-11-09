@@ -76,8 +76,10 @@ and `xz` programs, and 7z uses `7z`. Zip, tar and tar.gz need nothing installed.
 | `F6` | The same, then remove the originals |
 | `F7`, `F8` | Inside an archive: make a folder, delete |
 
-The format comes from the name's extension, or from the Format button in
-`Shift+F1`. Changing an archive writes a new file and renames it into place, so a
+`Shift+F1` opens Create archive, laid out as ArcLite's. The format comes from the
+name's extension, or from the archiver chosen, which also changes the extension.
+Compression level runs from Store to Ultra: bzip2 and xz cannot store, so Store is
+their fastest level, and zip and gzip stop at 9. Changing an archive writes a new file and renames it into place, so a
 failure leaves the original intact. Names that would leave the destination are
 refused, and extraction does not follow links or create setuid files.
 
@@ -134,6 +136,9 @@ entry from the history and `Ctrl+End` completes from the first match.
   Colorer does.
 - The Alt+F7 results window shows the Unix mode where Far shows Windows
   attributes, and has no Panel button for a temporary panel of the results.
+- Create archive (`Shift+F1`) has no profiles, encryption, self-extracting
+  archives, method, solid or advanced parameters, filter, or choice for files
+  already in the archive.
 - `Ctrl+A` shows Unix permission bits rather than Far's Windows attributes,
   and has no file times. Its checkboxes work as Far's do: `[?]` where the
   items differ, and only the changed bits are applied.
