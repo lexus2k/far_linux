@@ -55,6 +55,9 @@ pub enum View {
     Wide,
 }
 
+/// Width of the size on the status line under the files, as in Far.
+const STATUS_SIZE: usize = 6;
+
 /// An open archive shown in a panel. `Panel::path` stays the folder that holds
 /// the archive file, which is where shell commands run.
 pub struct ArchiveView {
@@ -910,8 +913,10 @@ impl Panel {
         }
 
         if let Some(entry) = self.current().cloned() {
+            // The size as Far's status line shows it: digits, or scaled with a
+            // unit when they do not fit, never split into groups.
             let detail = if let Some(bytes) = entry.scanned {
-                format!("{} bytes", util::group_digits(bytes))
+                util::fit_size(bytes, STATUS_SIZE)
             } else if entry.is_up {
                 String::from("Up")
             } else if entry.is_dir {
@@ -919,7 +924,7 @@ impl Panel {
             } else {
                 format!(
                     "{} {} {}",
-                    util::group_digits(entry.size),
+                    util::fit_size(entry.size, STATUS_SIZE),
                     util::format_date(entry.mtime),
                     util::format_time(entry.mtime)
                 )
