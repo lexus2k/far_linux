@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 - 2026-11-09
 
 ### Added
 
@@ -24,41 +24,6 @@
   typing, as Far's AutoComplete does. `Down` and `Up` choose, `Enter` takes
   one without closing the dialog, `Esc` closes the list, `Shift+Del` removes
   an entry, and `Ctrl+End` completes from the first match.
-
-### Changed
-
-- `Enter` runs only programs and `#!` scripts with an execute bit. Other files,
-  including every file on a Windows drive, open in the application registered
-  for their type, through `wslview` or Explorer on WSL and `xdg-open` on a
-  desktop, and in the viewer when there is neither. `Shift+Enter` opens the file
-  or folder that way too.
-- `Shift+F1` opens Create archive laid out as ArcLite's: archive path with
-  Append extension, the archivers as radio buttons, compression level from
-  Store to Ultra, Split into volumes with the size beside it, and Delete files
-  after archiving. Choosing an archiver changes the extension, and the
-  archiver, level and volume size are remembered.
-- `Alt+F7` shows its results as Far's Find file window does, filling while the
-  search runs: files under a line for their folder, with date, size and mode,
-  a status line, and New search, Go to, View, Stop and Cancel. `F3` and `F4`
-  view or edit a found file while the search goes on.
-
-### Fixed
-
-- The viewer no longer shows the CR of CRLF line endings as `·` at the end of
-  each line.
-- Sizes show as Far shows them: plain digits when they fit, otherwise scaled
-  with a space before the unit, such as `1385 K` or `90 M`. The line under the
-  files showed `111 943`, split into groups, and the size column `1385K`.
-- Opening a folder is faster. Large folders are read on several threads, which
-  matters on Windows drives under WSL, where each file's details take about a
-  millisecond: `/mnt/c/Windows/System32` opens in 1.1 s instead of 5.2 s. The
-  history database no longer waits for the disk on each change of folder,
-  which took about 8 ms.
-
-## 0.3.0 - 2026-11-06
-
-### Added
-
 - `Ctrl+A` has checkboxes for each permission bit next to the octal box, as in
   Midnight Commander, kept in step with it. As in Far, a box shows `[?]` where
   the selected items differ, and only the bits changed are applied to each item,
@@ -119,6 +84,20 @@
 
 ### Changed
 
+- `Enter` runs only programs and `#!` scripts with an execute bit. Other files,
+  including every file on a Windows drive, open in the application registered
+  for their type, through `wslview` or Explorer on WSL and `xdg-open` on a
+  desktop, and in the viewer when there is neither. `Shift+Enter` opens the file
+  or folder that way too.
+- `Shift+F1` opens Create archive laid out as ArcLite's: archive path with
+  Append extension, the archivers as radio buttons, compression level from
+  Store to Ultra, Split into volumes with the size beside it, and Delete files
+  after archiving. Choosing an archiver changes the extension, and the
+  archiver, level and volume size are remembered.
+- `Alt+F7` shows its results as Far's Find file window does, filling while the
+  search runs: files under a line for their folder, with date, size and mode,
+  a status line, and New search, Go to, View, Stop and Cancel. `F3` and `F4`
+  view or edit a found file while the search goes on.
 - `F3` on a folder shows its size in the panel instead of a dialog, as in Far. On
   `..` it counts the current folder, and it counts all selected folders.
 - Colours no longer depend on the terminal's scheme where 256 colours exist, so
@@ -131,6 +110,16 @@
 
 ### Fixed
 
+- The viewer no longer shows the CR of CRLF line endings as `·` at the end of
+  each line.
+- Sizes show as Far shows them: plain digits when they fit, otherwise scaled
+  with a space before the unit, such as `1385 K` or `90 M`. The line under the
+  files showed `111 943`, split into groups, and the size column `1385K`.
+- Opening a folder is faster. Large folders are read on several threads, which
+  matters on Windows drives under WSL, where each file's details take about a
+  millisecond: `/mnt/c/Windows/System32` opens in 1.1 s instead of 5.2 s. The
+  history database no longer waits for the disk on each change of folder,
+  which took about 8 ms.
 - A recursive permission change that takes away a folder's own read or
   execute bit no longer stops at that folder: bits are added before its
   contents are changed and removed after.
@@ -168,3 +157,4 @@
   narrow terminals, non-UTF-8 command line arguments, and `F8` in the editor
   after the file was deleted.
 - The trash ignored `XDG_DATA_HOME`.
+
