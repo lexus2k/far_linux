@@ -2018,3 +2018,47 @@ fn shift_f1_splits_into_volumes_that_open_and_extract() {
         std::thread::sleep(Duration::from_millis(30));
     }
 }
+
+#[test]
+fn enter_opens_documents_in_their_application_and_runs_scripts() {
+    use std::os::unix::fs::PermissionsExt;
+    // Stand-ins for the desktop's openers record what they were asked to open.
+    let tools =
+        Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("openers_{}", std::process::id()));
+    fs::create_dir_all(&tools).unwrap();
+    let log = tools.join("opened.log");
+    for name in ["wslview", "xdg-open"] {
+        let script = format!("#!/bin/sh\nprintf '%s\\n' \"$1\" >> {}\n", log.display());
+        let path = tools.join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let env = format!(
+        "PATH={}:/usr/bin:/bin DISPLAY=:99 WSL_DISTRO_NAME=test",
+        tools.display()
+    );
+    let Some(s) = Session::start_with(&env, |root| {
+        let left = root.join("left");
+        // Execute bits alone, as on a Windows drive, do not make a program.
+        fs::write(left.join("b_notes.txt"), "notes\n").unwrap();
+        fs::set_permissions(left.join("b_notes.txt"), fs::Permissions::from_mode(0o777)).unwrap();
+        fs::write(left.join("c_run.sh"), "#!/bin/sh\necho ran > ran.txt\n").unwrap();
+        fs::set_permissions(left.join("c_run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("b_notes.txt");
+    s.keys(&["Down", "Enter"]);
+    s.wait_file(&log, true);
+    let opened = || fs::read_to_string(&log).unwrap_or_default();
+    let start = Instant::now();
+    while !opened().contains("b_notes.txt") {
+        assert!(start.elapsed() < Duration::from_secs(5), "{}", opened());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(opened().ends_with("left/b_notes.txt\n"), "{}", opened());
+    // The script runs instead.
+    s.keys(&["Down", "Enter"]);
+    s.wait_file(&s.p("left/ran.txt"), true);
+    let _ = fs::remove_dir_all(&tools);
+}
