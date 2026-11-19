@@ -1,6 +1,6 @@
 [package]
 name = "far_linux"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.85"
 description = "A Far Manager 3 style file manager for Linux terminals"
