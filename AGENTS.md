@@ -96,7 +96,7 @@ Add a test for any change to these paths. In `fsops.rs`, use the scripted
 
 `.github/workflows/release.yml` runs only when started by hand, from Actions,
 Release, Run workflow, or with `gh workflow run release.yml -f version=0.2.0`.
-It runs the tests and builds `far-linux` packages for amd64 and arm64 with
+It runs the CI workflow's checks and builds `far-linux` packages for amd64 and arm64 with
 `cargo deb`, cross-compiling arm64 on Ubuntu 22.04 and checking it under qemu.
 Then it publishes release `v<version>` with the packages and `SHA256SUMS`.
 `-f publish=false` builds and checks without publishing.
@@ -104,6 +104,11 @@ Then it publishes release `v<version>` with the packages and `SHA256SUMS`.
 The version input overrides `Cargo.toml` only for the build. Bump `Cargo.toml`
 and the `CHANGELOG.md` heading in a PR first, so that `far --version` and the
 repository agree. Package metadata is under `[package.metadata.deb]`.
+
+`.github/workflows/ci.yml` runs `cargo fmt --check`, clippy with `-D warnings`
+and the tests on every pull request and push to `main`, and the release reuses
+it. Both use the Rust release pinned in `rust-toolchain.toml`. Raise it on
+purpose, and fix what the new clippy reports in the same PR.
 
 ## Git conventions
 

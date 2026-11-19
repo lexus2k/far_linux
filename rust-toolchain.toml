@@ -1,0 +1,7 @@
+# The Rust release used locally and by the GitHub workflows. A pinned release
+# keeps a new clippy lint from failing a release that passed the day before.
+# Raise it on purpose, and fix what the new clippy reports in the same PR.
+[toolchain]
+channel = "1.100.0"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
