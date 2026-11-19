@@ -148,7 +148,10 @@ entry from the history and `Ctrl+End` completes from the first match.
   hidden panel's area is blank rather than showing command output behind it.
 - Each command runs in its own `bash`. Working directory and exported variables
   carry over, and `~/.bash_aliases` is loaded, but functions and anything else
-  from `~/.bashrc` are not. `Ctrl+Z` is ignored for commands.
+  from `~/.bashrc` are not. `Ctrl+Z` is ignored for commands. An unknown
+  command is reported as Ubuntu's shell reports it, with package suggestions
+  where `command-not-found` is installed, and other errors read
+  `bash: line 1: ...`, as from `bash -c`.
 - `Enter` runs a file only when it has an execute bit and is a program or a
   `#!` script. Any other file opens in the application registered for its type,
   as Windows' associations open it in Far: on WSL through `wslview` or Explorer,

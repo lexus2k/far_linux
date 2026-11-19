@@ -11,22 +11,25 @@ use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const WRAPPER: &str = r#"
-__far_state="$FAR_STATE_DIR"; __far_cmd="$1"; __far_pwd="$PWD"
-[ -r "$__far_state/env" ] && . "$__far_state/env" 2>/dev/null
-export PWD="$__far_pwd"
-unset FAR_STATE_DIR __far_pwd
-__far_save() {
-    __far_rc=$?
-    pwd > "$__far_state/cwd"
-    export -p > "$__far_state/env" 2>/dev/null
-    exit $__far_rc
-}
-trap __far_save EXIT
-shopt -s expand_aliases 2>/dev/null
-[ -r "$HOME/.bash_aliases" ] && . "$HOME/.bash_aliases" 2>/dev/null
-eval "$__far_cmd"
-"#;
+/// The script that runs each command, one statement per entry. They are joined
+/// into a single line so that bash, which names the line of any error, reports
+/// `bash: line 1:` as `bash -c` does anywhere, and not a line of this script.
+const WRAPPER: &[&str] = &[
+    r#"__far_state="$FAR_STATE_DIR""#,
+    r#"__far_cmd="$1""#,
+    r#"__far_pwd="$PWD""#,
+    r#"[ -r "$__far_state/env" ] && . "$__far_state/env" 2>/dev/null"#,
+    r#"export PWD="$__far_pwd""#,
+    r#"unset FAR_STATE_DIR __far_pwd"#,
+    r#"__far_save() { __far_rc=$?; pwd > "$__far_state/cwd"; export -p > "$__far_state/env" 2>/dev/null; exit $__far_rc; }"#,
+    r#"trap __far_save EXIT"#,
+    // As Ubuntu's /etc/bash.bashrc does, which --norc skips: suggest a
+    // package for an unknown command, or say just that it was not found.
+    r#"command_not_found_handle() { if [ -x /usr/lib/command-not-found ]; then /usr/lib/command-not-found -- "$1"; return $?; elif [ -x /usr/share/command-not-found/command-not-found ]; then /usr/share/command-not-found/command-not-found -- "$1"; return $?; else printf '%s: command not found\n' "$1" >&2; return 127; fi; }"#,
+    r#"shopt -s expand_aliases 2>/dev/null"#,
+    r#"[ -r "$HOME/.bash_aliases" ] && . "$HOME/.bash_aliases" 2>/dev/null"#,
+    r#"eval "$__far_cmd""#,
+];
 
 /// Commands bash knows that are not files on `PATH`.
 const BUILTINS: &[&str] = &[
@@ -296,8 +299,8 @@ impl Shell {
             .arg("--noprofile")
             .arg("--norc")
             .arg("-c")
-            .arg(WRAPPER)
-            .arg("far")
+            .arg(WRAPPER.join("; "))
+            .arg("bash")
             .arg(command)
             .current_dir(cwd);
         // After the first command the saved file is the whole environment,
@@ -612,6 +615,50 @@ mod tests {
         let done = shell.run("cd /usr; exit 3", Path::new("/")).unwrap();
         assert_eq!(done.code, Some(3));
         assert_eq!(done.cwd.as_deref(), Some(Path::new("/usr")));
+    }
+
+    /// Runs `cmd` and returns what it wrote to stderr.
+    fn errors(shell: &Shell, cmd: &str) -> String {
+        let file = shell.state.join("test_stderr");
+        let quoted = file.to_str().unwrap();
+        shell
+            .run(&format!("{{ {cmd} ; }} 2>'{quoted}'"), Path::new("/"))
+            .unwrap();
+        fs::read_to_string(&file).unwrap()
+    }
+
+    #[test]
+    fn unknown_commands_are_reported_as_in_a_terminal() {
+        let shell = Shell::new().unwrap();
+        let done = shell
+            .run("far_no_such_command_xyz 2>/dev/null", Path::new("/"))
+            .unwrap();
+        assert_eq!(done.code, Some(127));
+        let text = errors(&shell, "far_no_such_command_xyz");
+        assert_eq!(text, "far_no_such_command_xyz: command not found\n");
+    }
+
+    #[test]
+    fn other_errors_name_bash_and_line_1_not_the_wrapper() {
+        let shell = Shell::new().unwrap();
+        let text = errors(&shell, "cd /far_no_such_folder");
+        assert_eq!(
+            text,
+            "bash: line 1: cd: /far_no_such_folder: No such file or directory\n"
+        );
+    }
+
+    #[test]
+    fn aliases_load_although_the_script_is_one_line() {
+        let home = Tree::new("aliases", &["x"]);
+        fs::write(home.0.join(".bash_aliases"), "alias far_hi='echo hi'\n").unwrap();
+        let shell = Shell::new().unwrap();
+        let home_dir = home.0.display();
+        quiet(&shell, &format!("export HOME='{home_dir}'"), Path::new("/"));
+        let out = shell.state.join("test_out");
+        let cmd = format!("far_hi > '{}'", out.display());
+        shell.run(&cmd, Path::new("/")).unwrap();
+        assert_eq!(fs::read_to_string(&out).unwrap(), "hi\n");
     }
 
     #[test]

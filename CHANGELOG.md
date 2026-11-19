@@ -6,6 +6,10 @@
 
 - Leaving the editor with unsaved changes asks in a red warning box, as Far
   does, instead of a blue one.
+- Errors from commands no longer start with `far: line 15:`. An unknown
+  command prints `name: command not found`, or Ubuntu's package suggestions
+  where `command-not-found` is installed, and other errors read
+  `bash: line 1: ...`, as from `bash -c`.
 
 ## 0.3.0 - 2026-11-09
 
