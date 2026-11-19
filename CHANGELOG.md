@@ -1,16 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 - 2026-11-19
 
 ### Changed
 
 - `Alt+F7` with text to find in an archive extracts up to 512 MiB of files at
   a time instead of 64 MiB, so a compressed archive is read fewer times.
-
-## 0.4.0 - 2026-11-19
-
-### Changed
-
 - Leaving the editor with unsaved changes asks in a red warning box, as Far
   does, instead of a blue one.
 - Errors from commands no longer start with `far: line 15:`. An unknown
