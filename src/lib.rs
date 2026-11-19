@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod archive;
+pub mod autocomplete;
 pub mod dialog;
 pub mod editor;
 pub mod encoding;

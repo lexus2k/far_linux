@@ -2129,3 +2129,45 @@ fn enter_opens_documents_in_their_application_and_runs_scripts() {
     s.wait_file(&s.p("left/ran.txt"), true);
     let _ = fs::remove_dir_all(&tools);
 }
+
+#[test]
+fn typed_commands_offer_history_and_file_names_on_panels_and_console() {
+    let Some(s) = Session::start(with_file) else {
+        return;
+    };
+    s.wait("alpha.txt");
+    s.text("touch made_by_history_1");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/made_by_history_1"), true);
+    // The panels are back once the new file is listed.
+    s.wait("║made_by_history_1 ");
+    // Typing opens the list of earlier commands; Down and Enter take one.
+    s.text("touch m");
+    s.wait("touch made_by_history_1");
+    s.keys(&["Down", "Enter"]);
+    // A typed character that matches nothing closes the list.
+    s.text("2");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/made_by_history_12"), true);
+    // The last word completes from the file names.
+    s.wait("║made_by_history_12 ");
+    s.text("cat al");
+    s.wait("cat alpha.txt");
+    // Esc closes the list and keeps the text, then clears it as before.
+    s.keys(&["Escape"]);
+    s.wait_gone("cat alpha.txt");
+    assert!(s.screen().contains("cat al"), "{}", s.screen());
+    s.keys(&["Escape"]);
+    s.wait_gone("cat al");
+    // The console shows the list under its command line.
+    s.keys(&["C-o"]);
+    s.wait_gone("╔");
+    s.text("touch made_by_history_1");
+    s.wait("touch made_by_history_12");
+    s.keys(&["Down", "Enter"]);
+    s.text("3");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/made_by_history_123"), true);
+    s.keys(&["C-o"]);
+    s.wait("╔");
+}

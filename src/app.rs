@@ -1,6 +1,7 @@
 //! The application: panels, command line, hot keys and file operation dialogs.
 
 use crate::archive::{self, ExtractRequest, Format, ScratchDir, FORMATS};
+use crate::autocomplete;
 use crate::dialog::{self, Field, Form};
 use crate::editor::{self, Clipboard, EditorContext, EditorExit};
 use crate::findlist::{Command, FindList, Found};
@@ -14,7 +15,7 @@ use crate::input;
 use crate::lineedit::LineEdit;
 use crate::panel::{Panel, Sort, View};
 use crate::screen::{
-    self, fit, fit_left, str_width, theme, Input, Key, KeyBars, Tui, ALT, CTRL, NONE, SHIFT,
+    self, fit, fit_left, str_width, theme, Input, Key, KeyBars, Screen, Tui, ALT, CTRL, NONE, SHIFT,
 };
 use crate::shell::{self, Shell};
 use crate::util;
@@ -238,6 +239,8 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl+F", "Insert full path"),
     ("Ctrl+[, Ctrl+]", "Insert path of left, right panel"),
     ("Ctrl+E, Ctrl+X", "Previous, next command"),
+    ("Ctrl+Space", "List matching commands and names"),
+    ("Ctrl+End", "Complete from command history"),
     ("Alt+F8", "Command history"),
     ("Alt+F11, Alt+F12", "View history, folder history"),
     ("Ctrl+Y, Esc", "Clear"),
@@ -391,6 +394,18 @@ struct App {
     keybar: bool,
     history: Vec<String>,
     history_pos: Option<usize>,
+    /// Far's AutoComplete list for the command line, while it is open.
+    suggest: Option<autocomplete::List>,
+    /// The command line text was typed by the last key, which opens the list.
+    typed: bool,
+    /// Commands on `PATH`, for the list.
+    commands: autocomplete::Commands,
+    /// Ctrl+End: the text it completes, and the text it put on the line.
+    ctrl_end: Option<(String, String)>,
+    /// Ctrl+O was pressed on the console.
+    leave_console: bool,
+    /// Rows above the console's command line given to the AutoComplete box.
+    console_rows: u16,
     folders: Vec<PathBuf>,
     viewed: Vec<(PathBuf, bool)>,
     clipboard: Clipboard,
@@ -457,6 +472,12 @@ pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
         keybar: true,
         history,
         history_pos: None,
+        suggest: None,
+        typed: false,
+        commands: autocomplete::Commands::load(std::env::var_os("PATH")),
+        ctrl_end: None,
+        leave_console: false,
+        console_rows: 0,
         folders,
         viewed,
         clipboard: Clipboard::default(),
@@ -556,8 +577,15 @@ impl App {
             self.draw_main();
             self.tui.draw()?;
             match self.tui.read(TICK)? {
-                Some(Input::Key(key)) => self.on_key(key)?,
-                Some(Input::Paste(text)) => self.cmd.insert_str(&text),
+                Some(Input::Key(key)) => {
+                    let before = self.cmd.text();
+                    self.on_key(key)?;
+                    self.after_cmd_key(&before);
+                }
+                Some(Input::Paste(text)) => {
+                    self.cmd.insert_str(&text);
+                    self.refresh_suggest();
+                }
                 Some(Input::Resize | Input::Held(_)) => {}
                 None => self.refresh_changed(),
             }
@@ -624,6 +652,9 @@ impl App {
         let (shown, column) = dialog::visible_text(&self.cmd, room.max(1));
         s.put(x, y, &fit(&shown, room), theme::CMDLINE);
         s.cursor = Some((x + column as u16, y));
+        if let Some(list) = &self.suggest {
+            list.draw(s, x, y);
+        }
         if self.keybar && h > 1 {
             s.keybar(h - 1, &PANEL_KEYS);
         }
@@ -653,6 +684,9 @@ impl App {
 
     fn on_key(&mut self, key: Key) -> io::Result<()> {
         if self.handle_quick(key)? {
+            return Ok(());
+        }
+        if self.suggest_key(key) {
             return Ok(());
         }
         let cmd_empty = self.cmd.is_empty();
@@ -757,6 +791,8 @@ impl App {
             (NONE, KeyCode::Char('-')) if cmd_empty => self.perform(Action::UnselectGroup)?,
             (NONE, KeyCode::Char('*')) if cmd_empty => self.perform(Action::InvertSelection)?,
             (NONE, KeyCode::Char(' ')) if cmd_empty => {}
+            (CTRL, KeyCode::Char(' ')) => self.refresh_suggest(),
+            (CTRL, KeyCode::End) if !cmd_empty => self.complete_from_history(),
             (NONE, KeyCode::F(9)) => self.top_menu()?,
             (NONE, KeyCode::Delete) if cmd_empty => self.perform(Action::Trash)?,
             (SHIFT, KeyCode::Delete) => self.perform(Action::DeletePermanently)?,
@@ -766,7 +802,7 @@ impl App {
                 if let Some(action) = key_action(key, self.tui.enhanced) {
                     self.perform(action)?;
                 } else {
-                    self.cmd.handle(key.code, key.mods);
+                    self.typed = self.cmd.handle(key.code, key.mods);
                 }
             }
         }
@@ -1201,7 +1237,11 @@ impl App {
                 Print("\r"),
                 terminal::Clear(terminal::ClearType::CurrentLine),
                 Print(&prompt),
-                Print(fit(&shown, room).trim_end()),
+                Print(fit(&shown, room).trim_end())
+            )?;
+            self.print_suggest(str_width(&prompt))?;
+            execute!(
+                out,
                 cursor::MoveToColumn((str_width(&prompt) + column) as u16)
             )?;
             let Some(input) = self.tui.read(TICK)? else {
@@ -1211,20 +1251,47 @@ impl App {
                 Input::Key(key) => key,
                 Input::Paste(text) => {
                     self.cmd.insert_str(&text);
+                    self.refresh_suggest();
                     continue;
                 }
                 Input::Resize | Input::Held(_) => continue,
             };
+            let before = self.cmd.text();
+            self.typed = false;
+            if !self.suggest_key(key) {
+                self.console_key(key)?;
+            }
+            self.after_cmd_key(&before);
+            if self.quit || self.leave_console {
+                self.leave_console = false;
+                return Ok(());
+            }
+        }
+    }
+
+    /// A key on the console that the AutoComplete list did not take.
+    fn console_key(&mut self, key: Key) -> io::Result<()> {
+        let mut out = io::stdout();
+        let (w, _) = terminal::size()?;
+        let prompt = format!(
+            "{}$ ",
+            util::printable(&util::tilde(&self.panels[self.active].path))
+        );
+        let prompt = fit_left(&prompt, (w / 2) as usize);
+        {
             match (key.mods, key.code) {
                 (CTRL, KeyCode::Char('o')) => {
+                    self.close_console_suggest()?;
                     execute!(
                         out,
                         Print("\r"),
                         terminal::Clear(terminal::ClearType::CurrentLine)
                     )?;
+                    self.leave_console = true;
                     return Ok(());
                 }
                 (NONE, KeyCode::Enter) | (SHIFT, KeyCode::Enter) => {
+                    self.close_console_suggest()?;
                     let text = self.cmd.text();
                     self.cmd.clear();
                     execute!(
@@ -1247,21 +1314,193 @@ impl App {
                 (NONE, KeyCode::Tab) => self.complete_command()?,
                 // As in a shell: give up on this line and start another.
                 (CTRL, KeyCode::Char('c')) => {
+                    self.close_console_suggest()?;
                     self.cmd.clear();
                     execute!(out, Print("^C\r\n"))?;
                 }
                 (NONE, KeyCode::Esc) => self.cmd.clear(),
                 (NONE, KeyCode::Up) | (CTRL, KeyCode::Char('e')) => self.history_step(-1),
                 (NONE, KeyCode::Down) | (CTRL, KeyCode::Char('x')) => self.history_step(1),
+                (CTRL, KeyCode::Char(' ')) => self.refresh_suggest(),
+                (CTRL, KeyCode::End) if !self.cmd.is_empty() => self.complete_from_history(),
                 _ => {
-                    self.cmd.handle(key.code, key.mods);
+                    self.typed = self.cmd.handle(key.code, key.mods);
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Keys for the open AutoComplete list. Returns true when the key was used.
+    fn suggest_key(&mut self, key: Key) -> bool {
+        let Some(list) = &mut self.suggest else {
+            return false;
+        };
+        match list.key(key) {
+            autocomplete::Outcome::Ignored => return false,
+            autocomplete::Outcome::Moved => {}
+            autocomplete::Outcome::Close => self.suggest = None,
+            autocomplete::Outcome::Pick(text) => {
+                self.cmd.set(&text);
+                self.suggest = None;
+            }
+            autocomplete::Outcome::Remove(text) => {
+                self.db.remove(Kind::Command, &text);
+                self.history.retain(|c| c != &text);
+                self.history_pos = None;
+                let chosen = list.chosen;
+                self.refresh_suggest();
+                if let Some(list) = &mut self.suggest {
+                    let last = list.items.len() - 1;
+                    list.chosen = chosen.map(|c| c.min(last));
+                }
+            }
+        }
+        true
+    }
+
+    /// After a key: typing opens or updates the list, and any other change of
+    /// the text, such as a history step, closes it.
+    fn after_cmd_key(&mut self, before: &str) {
+        let typed = std::mem::take(&mut self.typed);
+        if self.cmd.text() == before {
+            return;
+        }
+        if typed {
+            self.refresh_suggest();
+        } else {
+            self.suggest = None;
+        }
+    }
+
+    /// Fills the AutoComplete list for the command line as it now is.
+    fn refresh_suggest(&mut self) {
+        let history: Vec<String> = self.history.iter().rev().cloned().collect();
+        let env: Vec<String> = std::env::vars_os()
+            .filter_map(|(name, _)| name.into_string().ok())
+            .collect();
+        let sources = autocomplete::Sources {
+            history: &history,
+            cwd: &self.panels[self.active].path,
+            commands: self.commands.get(),
+            env: &env,
+        };
+        let items = autocomplete::suggestions(&self.cmd.text(), &sources);
+        self.suggest = autocomplete::List::new(items);
+    }
+
+    /// Ctrl+End at the end of the command line: the newest earlier command that
+    /// starts with the typed text, and the next one on each further press.
+    fn complete_from_history(&mut self) {
+        if self.cmd.cursor() < self.cmd.text().chars().count() {
+            self.cmd.handle(KeyCode::End, CTRL);
+            return;
+        }
+        let text = self.cmd.text();
+        let (prefix, after) = match &self.ctrl_end {
+            Some((prefix, shown)) if *shown == text => (prefix.clone(), Some(text.clone())),
+            _ => (text.clone(), None),
+        };
+        let lower = prefix.to_lowercase();
+        let matches: Vec<&String> = self
+            .history
+            .iter()
+            .rev()
+            .filter(|c| c.to_lowercase().starts_with(&lower) && **c != prefix)
+            .collect();
+        let next = match after {
+            Some(shown) => matches
+                .iter()
+                .position(|c| **c == shown)
+                .and_then(|i| matches.get(i + 1)),
+            None => matches.first(),
+        };
+        if let Some(next) = next {
+            let next = (*next).clone();
+            self.cmd.set(&next);
+            self.ctrl_end = Some((prefix, next));
+        }
+    }
+
+    /// Draws the AutoComplete list on the console as a framed box just above
+    /// the command line, as Far does. To make room, the command line moves down
+    /// with line feeds, so that output scrolls up into the scrollback rather
+    /// than being drawn over. When the list shrinks or closes, the command line
+    /// moves back up over the rows it no longer needs. The cursor must be at
+    /// the end of the command line; it ends there, or on the same row.
+    fn print_suggest(&mut self, x: usize) -> io::Result<()> {
+        let (w, h) = terminal::size()?;
+        let rows = match &self.suggest {
+            Some(list) if (w as usize) >= x + 4 => {
+                list.shown((h as usize).saturating_sub(3)).len() as u16
+            }
+            _ => 0,
+        };
+        let needed = if rows == 0 { 0 } else { rows + 2 };
+        let mut out = io::stdout();
+        if needed != self.console_rows {
+            let line = self.console_line();
+            if needed > self.console_rows {
+                execute!(
+                    out,
+                    Print("\r"),
+                    terminal::Clear(terminal::ClearType::CurrentLine),
+                    Print("\r\n".repeat((needed - self.console_rows) as usize))
+                )?;
+            } else {
+                execute!(
+                    out,
+                    cursor::MoveUp(self.console_rows - needed),
+                    Print("\r"),
+                    terminal::Clear(terminal::ClearType::FromCursorDown)
+                )?;
+            }
+            execute!(out, Print(line))?;
+            self.console_rows = needed;
+        }
+        let Some(list) = self.suggest.as_ref().filter(|_| needed > 0) else {
+            return Ok(());
+        };
+        let mut boxed = Screen::new(w, needed);
+        list.draw(&mut boxed, x as u16, needed);
+        execute!(out, cursor::SavePosition, cursor::MoveUp(needed))?;
+        for row in 0..needed {
+            execute!(
+                out,
+                cursor::MoveToColumn(0),
+                terminal::Clear(terminal::ClearType::CurrentLine),
+                cursor::MoveToColumn(x as u16)
+            )?;
+            self.tui.print_row(&boxed, row, x as u16)?;
+            execute!(out, cursor::MoveDown(1))?;
+        }
+        execute!(out, cursor::RestorePosition)?;
+        Ok(())
+    }
+
+    /// Closes the list on the console and takes back the rows of its box.
+    fn close_console_suggest(&mut self) -> io::Result<()> {
+        self.suggest = None;
+        execute!(io::stdout(), cursor::MoveToColumn(0))?;
+        self.print_suggest(0)
+    }
+
+    /// The console's prompt and command line, as `console_loop` prints them.
+    fn console_line(&self) -> String {
+        let (w, _) = terminal::size().unwrap_or((80, 24));
+        let prompt = format!(
+            "{}$ ",
+            util::printable(&util::tilde(&self.panels[self.active].path))
+        );
+        let prompt = fit_left(&prompt, (w / 2) as usize);
+        let room = (w as usize).saturating_sub(str_width(&prompt)).max(1);
+        let (shown, _) = dialog::visible_text(&self.cmd, room);
+        format!("{prompt}{}", fit(&shown, room).trim_end())
     }
 
     /// Tab on the console. Panels keep Tab for changing panel, as in Far.
     fn complete_command(&mut self) -> io::Result<()> {
+        self.close_console_suggest()?;
         let cwd = self.panels[self.active].path.clone();
         let path = std::env::var_os("PATH");
         let done = shell::complete(&self.cmd.before_cursor(), &cwd, path.as_deref());
