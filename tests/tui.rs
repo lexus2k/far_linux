@@ -353,7 +353,8 @@ fn f3_views_and_escape_returns() {
 
 #[test]
 fn f4_edits_saves_and_warns_about_unsaved_changes() {
-    let Some(s) = Session::start(with_file) else {
+    // Fixed colours, so that dark red is 88 whatever terminal runs the test.
+    let Some(s) = Session::start_with("COLORTERM=truecolor", with_file) else {
         return;
     };
     s.wait("alpha.txt");
