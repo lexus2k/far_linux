@@ -118,9 +118,8 @@ entry from the history and `Ctrl+End` completes from the first match.
 The command line does the same, on the panels and on the `Ctrl+O` console, in
 a box above it. The list offers earlier commands that start with the typed
 text, newest first, then the line with its last word completed: a command from
-`PATH` for the first word, a program or folder for a path in its place, such as
-`./`, a file or folder for later words, and a variable for a word starting with
-`$`. Earlier commands that run `./` or `../` paths missing from the current
+`PATH` for the first word, a file or folder for a typed path, such as `./` or
+`./docs/`, and for later words, and a variable for a word starting with `$`. Earlier commands that run `./` or `../` paths missing from the current
 folder are left out. `Down`, `Up`, `PgDn` and `PgUp` choose an entry, `Enter`
 puts it on the command line, `Esc` closes the list, `Shift+Del` removes the
 entry from the history and `Ctrl+Space` opens the list again. `Ctrl+End` at the

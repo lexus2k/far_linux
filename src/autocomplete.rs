@@ -64,11 +64,6 @@ pub fn suggestions(line: &str, src: &Sources) -> Vec<String> {
             }
         } else {
             let mut files = file_matches(&word.value, src.cwd, word.command == "cd");
-            // A path where a command goes, such as `./`, is a program to run,
-            // or a folder on the way to one.
-            if word.is_command {
-                files.retain(|f| f.ends_with('/') || is_program(&src.cwd.join(f)));
-            }
             files.sort();
             for file in files {
                 add(format!("{head}{}", escape_word(&file)), &mut found);
@@ -77,13 +72,6 @@ pub fn suggestions(line: &str, src: &Sources) -> Vec<String> {
     }
     found.truncate(MAX_ITEMS);
     found
-}
-
-/// A file with an execute bit.
-fn is_program(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    path.metadata()
-        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
 }
 
 /// Whether the words of `command` that start with `./` or `../` name files in
@@ -359,8 +347,7 @@ mod tests {
     #[test]
     fn history_with_paths_from_other_folders_is_left_out() {
         let cwd = folder("relative", &["build.sh", "notes.md", "src/"]);
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(cwd.join("build.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(cwd.join("src/main.rs"), "").unwrap();
         let history = strings(&[
             "./build.sh --release",
             "./deploy.sh",
@@ -376,8 +363,10 @@ mod tests {
         };
         assert_eq!(
             suggestions("./", &src),
-            strings(&["./build.sh --release", "./build.sh", "./src/"])
+            strings(&["./build.sh --release", "./build.sh", "./notes.md", "./src/"])
         );
+        // A typed folder lists what is in it, as soon as its `/` is typed.
+        assert_eq!(suggestions("./src/", &src), strings(&["./src/main.rs"]));
         assert_eq!(
             suggestions("cat ", &src),
             strings(&["cat ./src/../build.sh"])
