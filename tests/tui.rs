@@ -363,6 +363,13 @@ fn f4_edits_saves_and_warns_about_unsaved_changes() {
     s.wait("NEW alpha contents");
     s.keys(&["Escape"]);
     s.wait("has been modified");
+    // Far asks this as a warning, in white on red.
+    let screen = s.tmux(&["capture-pane", "-p", "-e", "-t", "t"]);
+    let line = screen
+        .lines()
+        .find(|l| l.contains("has been modified"))
+        .unwrap();
+    assert!(line.contains("48;5;88m"), "{line}");
     s.keys(&["c"]);
     s.wait_gone("has been modified");
     s.keys(&["F2"]);

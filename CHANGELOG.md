@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Changed
+
+- Leaving the editor with unsaved changes asks in a red warning box, as Far
+  does, instead of a blue one.
+
 ## 0.3.0 - 2026-11-09
 
 ### Added
