@@ -246,9 +246,9 @@ impl Buffer {
             }
             return None;
         }
-        for l in from.line..self.lines.len() {
+        for (l, line) in self.lines.iter().enumerate().skip(from.line) {
             let start = if l == from.line { from.col } else { 0 };
-            if let Some(hit) = m.find(&self.lines[l], start, false) {
+            if let Some(hit) = m.find(line, start, false) {
                 return found(l, hit);
             }
         }
