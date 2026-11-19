@@ -494,6 +494,31 @@ impl Tui {
         Ok(())
     }
 
+    /// Prints row `y` of `screen` from column `from` at the cursor, in the
+    /// screen's colours, for drawing over the console that Ctrl+O shows.
+    pub fn print_row(&self, screen: &Screen, y: u16, from: u16) -> io::Result<()> {
+        let mut out = io::stdout();
+        for x in from..screen.w {
+            let cell = &screen.cells[y as usize * screen.w as usize + x as usize];
+            if cell.cont {
+                continue;
+            }
+            let (fg, bg) = if self.fixed_colors {
+                (fixed_color(cell.style.fg), fixed_color(cell.style.bg))
+            } else {
+                (basic_color(cell.style.fg), basic_color(cell.style.bg))
+            };
+            queue!(
+                out,
+                SetForegroundColor(fg),
+                SetBackgroundColor(bg),
+                Print(cell.ch)
+            )?;
+        }
+        queue!(out, SetAttribute(Attribute::Reset), ResetColor)?;
+        out.flush()
+    }
+
     /// Returns to the normal screen, keeping raw mode so keys can still be
     /// read. This is what Ctrl+O shows.
     pub fn show_console(&mut self) -> io::Result<()> {

@@ -41,19 +41,19 @@ const BUILTINS: &[&str] = &[
 
 /// The word Tab completes.
 #[derive(Debug, Default, PartialEq, Eq)]
-struct Word {
+pub(crate) struct Word {
     /// Character index where it starts.
-    start: usize,
+    pub start: usize,
     /// Its text with quotes and escapes removed.
-    value: String,
+    pub value: String,
     /// It is where a command name goes.
-    is_command: bool,
+    pub is_command: bool,
     /// The command it is an argument of, with quotes removed.
-    command: String,
+    pub command: String,
 }
 
 /// Finds the last word of a command line, following shell quoting.
-fn last_word(line: &str) -> Word {
+pub(crate) fn last_word(line: &str) -> Word {
     let mut word = Word {
         is_command: true,
         ..Word::default()
@@ -138,8 +138,52 @@ fn command_matches(prefix: &str, path: Option<&std::ffi::OsStr>) -> Vec<String> 
     found
 }
 
+/// Every command on `path` and the builtins, sorted, for AutoComplete.
+/// Windows folders under WSL are on a file system where each check of a file
+/// is slow and every file looks executable, so there only names that Windows
+/// runs count, and no file is checked.
+pub fn path_commands(path: Option<&std::ffi::OsStr>) -> Vec<String> {
+    let wsl = is_wsl();
+    let mut found: Vec<String> = BUILTINS.iter().map(|b| b.to_string()).collect();
+    for dir in std::env::split_paths(path.unwrap_or_default()) {
+        let windows = wsl && dir.starts_with("/mnt/");
+        let Ok(items) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in items.flatten() {
+            let Ok(name) = item.file_name().into_string() else {
+                continue;
+            };
+            if name.chars().any(char::is_control) {
+                continue;
+            }
+            let runnable = if windows {
+                is_windows_program(&name)
+            } else {
+                !item.file_type().is_ok_and(|t| t.is_dir())
+                    && fs::metadata(item.path())
+                        .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            };
+            if runnable {
+                found.push(name);
+            }
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// A name Windows runs as a program.
+fn is_windows_program(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    [".exe", ".bat", ".cmd", ".com"]
+        .iter()
+        .any(|ext| lower.len() > ext.len() && lower.ends_with(ext))
+}
+
 /// Paths matching `typed`, spelled as typed. Folders end in `/`.
-fn file_matches(typed: &str, cwd: &Path, dirs_only: bool) -> Vec<String> {
+pub(crate) fn file_matches(typed: &str, cwd: &Path, dirs_only: bool) -> Vec<String> {
     let (folder, prefix) = match typed.rfind('/') {
         Some(i) => typed.split_at(i + 1),
         None => ("", typed),
@@ -187,7 +231,7 @@ fn common_prefix(items: &[String]) -> String {
 }
 
 /// Escapes text for bash. A leading `~` stays active, because bash expands it.
-fn escape_word(text: &str) -> String {
+pub(crate) fn escape_word(text: &str) -> String {
     let mut out = String::new();
     for (i, c) in text.chars().enumerate() {
         let tilde = c == '~' && (i > 0 || text == "~" || text.starts_with("~/"));
@@ -659,6 +703,22 @@ mod tests {
         let cmd = format!("far_hi > '{}'", out.display());
         shell.run(&cmd, Path::new("/")).unwrap();
         assert_eq!(fs::read_to_string(&out).unwrap(), "hi\n");
+    }
+
+    #[test]
+    fn path_commands_lists_executables_and_builtins_only() {
+        let tree = Tree::new("path_commands", &["bin/tool", "bin/plain", "bin/sub/"]);
+        let bin = tree.0.join("bin");
+        fs::set_permissions(bin.join("tool"), fs::Permissions::from_mode(0o755)).unwrap();
+        let found = path_commands(Some(bin.as_os_str()));
+        assert!(found.contains(&"tool".to_string()));
+        assert!(found.contains(&"cd".to_string()));
+        assert!(!found.contains(&"plain".to_string()));
+        assert!(!found.contains(&"sub".to_string()));
+        assert!(is_windows_program("notepad.EXE"));
+        assert!(is_windows_program("run.cmd"));
+        assert!(!is_windows_program("kernel32.dll"));
+        assert!(!is_windows_program(".exe"));
     }
 
     #[test]

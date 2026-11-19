@@ -115,6 +115,18 @@ are listed under it, as Far's AutoComplete does. `Down` and `Up` choose one,
 `Enter` puts it in the box, `Esc` closes the list, `Shift+Del` removes the
 entry from the history and `Ctrl+End` completes from the first match.
 
+The command line does the same, on the panels and on the `Ctrl+O` console, in
+a box above it. The list offers earlier commands that start with the typed
+text, newest first, then the line with its last word completed: a command from
+`PATH` for the first word, a file or folder for a typed path, such as `./` or
+`./docs/`, and for later words, and a variable for a word starting with `$`. Earlier commands that run `./` or `../` paths missing from the current
+folder are left out. `Down`, `Up`, `PgDn` and `PgUp` choose an entry, `Enter`
+puts it on the command line, `Esc` closes the list, `Shift+Del` removes the
+entry from the history and `Ctrl+Space` opens the list again. `Ctrl+End` at the
+end of the command line puts the newest earlier command starting with the
+typed text there, and the next one on each further press. On the console, the
+box makes room by scrolling the output up rather than covering it.
+
 ## How file operations behave
 
 - **Copying** writes to a temporary file and renames it into place, so

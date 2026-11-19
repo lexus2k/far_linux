@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- The command line lists matching earlier commands while you type, on the
+  panels and on the `Ctrl+O` console, as Far's AutoComplete does, with
+  commands from `PATH`, files, folders and variables completing the last
+  word. `Ctrl+Space` opens the list, and `Ctrl+End` completes from the
+  command history.
+
 ## 0.5.1 - 2026-11-19
 
 ### Changed

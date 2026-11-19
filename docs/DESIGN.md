@@ -128,6 +128,14 @@ Other:
   hand, not in Windows Terminal. Paste has the least evidence: the decoder expects
   the bracketed paste markers as plain bytes.
 - `F3` does not count folders inside an archive.
+- Command line AutoComplete has none of Far's settings: the list always opens
+  while typing, from every source. Variables come from far's own environment,
+  not from those exported by earlier commands. Programs on `PATH` are read once
+  at start, so a program installed later or a `PATH` changed by `export` is
+  not offered. Under WSL, Windows folders on `PATH` count only `.exe`, `.bat`,
+  `.cmd` and `.com` files, since every file there has an execute bit.
+- On the `Ctrl+O` console the AutoComplete box is drawn with terminal escapes
+  over the real screen, and has been tried only in tmux.
 - A highlighting file of about 1 MB of masks costs some 3 ms per row on each draw.
 - Enter pressed several times quickly after `Shift+Del` answers the prompts that
   follow, because keys are not discarded before a prompt.
