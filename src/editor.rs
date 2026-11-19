@@ -1699,7 +1699,7 @@ fn confirm_leave(tui: &mut Tui, ed: &mut Editor) -> io::Result<bool> {
         "Editor",
         &lines,
         &["Save", "Don't save", "Continue"],
-        false,
+        true,
     )? {
         Some(0) => {
             save_interactive(tui, ed)?;
