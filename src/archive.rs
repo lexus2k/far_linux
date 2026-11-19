@@ -1032,7 +1032,7 @@ fn report_outcome<U: OpUi>(
 
 /// Files a content search extracts at once. The scratch copies are removed
 /// before the next batch, so that a large archive does not fill the disk.
-const FIND_BATCH_BYTES: u64 = 64 * 1024 * 1024;
+const FIND_BATCH_BYTES: u64 = 512 * 1024 * 1024;
 
 /// Alt+F7 in an archive: finds entries from `folder` down whose name matches
 /// `masks`, and with `text`, files that contain it. Calls `found` with each

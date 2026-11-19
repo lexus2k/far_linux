@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- `Alt+F7` with text to find in an archive extracts up to 512 MiB of files at
+  a time instead of 64 MiB, so a compressed archive is read fewer times.
+
 ## 0.4.0 - 2026-11-19
 
 ### Changed
