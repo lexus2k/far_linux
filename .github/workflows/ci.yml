@@ -1,0 +1,28 @@
+# Checks every pull request and push to main with the same steps the release
+# runs, so that a release does not find a failure first.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install tmux for the end-to-end tests
+        run: sudo apt-get update && sudo apt-get install -y tmux
+      # Installs the release named in rust-toolchain.toml.
+      - run: rustup toolchain install
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test

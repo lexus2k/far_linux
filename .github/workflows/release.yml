@@ -53,15 +53,7 @@ jobs:
           echo "Version: $version"
 
   test:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v7
-      - name: Install tmux for the end-to-end tests
-        run: sudo apt-get update && sudo apt-get install -y tmux
-      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
-      - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test
+    uses: ./.github/workflows/ci.yml
 
   package:
     needs: [version, test]
@@ -85,7 +77,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu libc6-dev-arm64-cross qemu-user
-      - run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+      # The release named in rust-toolchain.toml, as CI uses.
+      - run: rustup toolchain install && rustup target add ${{ matrix.target }}
       - name: Install cargo-deb
         run: cargo install cargo-deb --locked --version "$CARGO_DEB_VERSION"
       - name: Set the version
