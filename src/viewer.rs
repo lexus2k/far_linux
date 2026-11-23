@@ -996,9 +996,20 @@ const HELP: &[(&str, &str)] = &[
     ("Ctrl+S", "Scroll bar"),
 ];
 
-/// Runs the viewer until it is closed, starting with line `start_line`,
-/// counted from 0, at the top.
+/// Runs the viewer until it is closed.
 pub fn run(
+    tui: &mut Tui,
+    path: &Path,
+    keybar: &mut bool,
+    clipboard: &mut Clipboard,
+    db: &Rc<History>,
+) -> io::Result<ViewerExit> {
+    run_at(tui, path, 0, keybar, clipboard, db)
+}
+
+/// Runs the viewer until it is closed, starting with line `start_line`,
+/// counted from 0, at the top, as F6 in the editor leaves it.
+pub fn run_at(
     tui: &mut Tui,
     path: &Path,
     start_line: usize,
@@ -1043,7 +1054,16 @@ pub fn run(
             (_, KeyCode::Esc) | (NONE, KeyCode::F(3)) | (NONE, KeyCode::F(10)) => {
                 return Ok(ViewerExit::Close);
             }
-            (NONE, KeyCode::F(6)) => return Ok(ViewerExit::Edit(v.line_of(v.top))),
+            (NONE, KeyCode::F(6)) => {
+                // The editor refuses a file this large, so do not read it
+                // all to count lines first.
+                let line = if v.size > crate::editor::MAX_EDIT_SIZE {
+                    0
+                } else {
+                    v.line_of(v.top)
+                };
+                return Ok(ViewerExit::Edit(line));
+            }
             (NONE, KeyCode::Char('+')) => return Ok(ViewerExit::NextFile),
             (NONE, KeyCode::Char('-')) => return Ok(ViewerExit::PreviousFile),
             (CTRL, KeyCode::F(10)) => return Ok(ViewerExit::GoToFile),

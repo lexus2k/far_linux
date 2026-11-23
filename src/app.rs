@@ -1666,13 +1666,12 @@ impl App {
     }
 
     /// Views `path` with line `start_line`, from 0, at the top.
-    fn view_file_at(&mut self, path: &Path, start_line: usize) -> io::Result<()> {
+    fn view_file_at(&mut self, path: &Path, mut start_line: usize) -> io::Result<()> {
         let mut current = path.to_path_buf();
-        let mut start_line = start_line;
         loop {
             self.remember_viewed(&current, false);
             let db = self.db.clone();
-            let exit = viewer::run(
+            let exit = viewer::run_at(
                 &mut self.tui,
                 &current,
                 start_line,
@@ -1760,7 +1759,7 @@ impl App {
         self.draw_main();
         match exit {
             EditorExit::Close => Ok(()),
-            EditorExit::View(line) => self.view_file_at(path, line),
+            EditorExit::View(saved, line) => self.view_file_at(&saved, line),
             EditorExit::NewFile => self.new_file(),
             EditorExit::GoToFile => self.jump_to(path),
             EditorExit::History => self.view_history(),
@@ -2305,7 +2304,6 @@ impl App {
         let exit = viewer::run(
             &mut self.tui,
             &path,
-            0,
             &mut self.keybar,
             &mut self.clipboard,
             &db,
@@ -2313,7 +2311,7 @@ impl App {
         self.draw_main();
         drop(scratch);
         match exit {
-            Ok(ViewerExit::Edit(_)) => self.edit_in_archive(),
+            Ok(ViewerExit::Edit(line)) => self.edit_in_archive_at(line),
             Ok(_) => Ok(()),
             Err(e) => dialog::alert(&mut self.tui, "Viewer", &e.to_string()),
         }
@@ -2321,6 +2319,11 @@ impl App {
 
     /// F4 inside an archive: edits a temporary copy and offers to put it back.
     fn edit_in_archive(&mut self) -> io::Result<()> {
+        self.edit_in_archive_at(0)
+    }
+
+    /// Edits the current archive entry with line `start_line`, from 0, at the top.
+    fn edit_in_archive_at(&mut self, start_line: usize) -> io::Result<()> {
         if self.refuse_nested(self.active, "Edit")? {
             return Ok(());
         }
@@ -2330,7 +2333,7 @@ impl App {
         };
         let (file, format, folder) = (view.file.clone(), view.format, view.folder.clone());
         let name = entry.name.clone();
-        self.edit_archive_entry(&file, format, &folder, &name)
+        self.edit_archive_entry(&file, format, &folder, &name, start_line)
     }
 
     /// Edits the entry `name` of `folder` in an archive from a temporary copy,
@@ -2341,6 +2344,7 @@ impl App {
         format: Format,
         folder: &str,
         name: &str,
+        start_line: usize,
     ) -> io::Result<()> {
         let Some((_scratch, path)) = self.extract_to_scratch(file, format, folder, name)? else {
             return Ok(());
@@ -2353,7 +2357,7 @@ impl App {
             db: &db,
             active_name: None,
             passive_name: None,
-            start_line: 0,
+            start_line,
         };
         editor::run(&mut self.tui, &path, &mut ctx)?;
         self.draw_main();
@@ -3149,7 +3153,7 @@ impl App {
                     return Ok(());
                 }
                 let (folder, name) = inner.rsplit_once('/').unwrap_or(("", inner));
-                self.edit_archive_entry(file, *format, folder, name)
+                self.edit_archive_entry(file, *format, folder, name, 0)
             }
             (HitTarget::Inner(inner), Some((file, format, _))) => {
                 let (folder, name) = inner.rsplit_once('/').unwrap_or(("", inner));
@@ -3161,7 +3165,6 @@ impl App {
                 let exit = viewer::run(
                     &mut self.tui,
                     &path,
-                    0,
                     &mut self.keybar,
                     &mut self.clipboard,
                     &db,

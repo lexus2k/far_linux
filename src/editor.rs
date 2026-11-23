@@ -22,7 +22,7 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-const MAX_EDIT_SIZE: u64 = 512 * 1024 * 1024;
+pub const MAX_EDIT_SIZE: u64 = 512 * 1024 * 1024;
 const BOM: &[u8] = b"\xef\xbb\xbf";
 
 /// A position: line index and character index within the line.
@@ -468,8 +468,9 @@ pub struct Clipboard {
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditorExit {
     Close,
-    /// F6: view the file, with this line at the top of the screen.
-    View(usize),
+    /// F6: view the file, which Save As may have renamed, with this line at
+    /// the top of the screen.
+    View(PathBuf, usize),
     NewFile,
     GoToFile,
     History,
@@ -1613,7 +1614,7 @@ pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<Ed
             }
             (NONE, KeyCode::F(6)) => {
                 if confirm_leave(tui, &mut ed)? {
-                    return Ok(EditorExit::View(ed.top_line()));
+                    return Ok(EditorExit::View(ed.path.clone(), ed.top_line()));
                 }
             }
             (SHIFT, KeyCode::F(4)) => {
