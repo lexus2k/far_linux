@@ -1662,13 +1662,20 @@ impl App {
     }
 
     fn view_file(&mut self, path: &Path) -> io::Result<()> {
+        self.view_file_at(path, 0)
+    }
+
+    /// Views `path` with line `start_line`, from 0, at the top.
+    fn view_file_at(&mut self, path: &Path, start_line: usize) -> io::Result<()> {
         let mut current = path.to_path_buf();
+        let mut start_line = start_line;
         loop {
             self.remember_viewed(&current, false);
             let db = self.db.clone();
             let exit = viewer::run(
                 &mut self.tui,
                 &current,
+                start_line,
                 &mut self.keybar,
                 &mut self.clipboard,
                 &db,
@@ -1676,13 +1683,14 @@ impl App {
             self.draw_main();
             match exit {
                 Ok(ViewerExit::Close) => {}
-                Ok(ViewerExit::Edit) => return self.edit_file(&current),
+                Ok(ViewerExit::Edit(line)) => return self.edit_file_at(&current, line),
                 Ok(ViewerExit::GoToFile) => return self.jump_to(&current),
                 Ok(ViewerExit::History) => return self.view_history(),
                 Ok(ViewerExit::NextFile) | Ok(ViewerExit::PreviousFile) => {
                     let forward = matches!(exit, Ok(ViewerExit::NextFile));
                     if let Some(next) = self.adjacent_file(&current, forward) {
                         current = next;
+                        start_line = 0;
                         continue;
                     }
                 }
@@ -1725,6 +1733,11 @@ impl App {
     }
 
     fn edit_file(&mut self, path: &Path) -> io::Result<()> {
+        self.edit_file_at(path, 0)
+    }
+
+    /// Edits `path` with line `start_line`, from 0, at the top.
+    fn edit_file_at(&mut self, path: &Path, start_line: usize) -> io::Result<()> {
         self.remember_viewed(path, true);
         let name_on = |panel: &Panel| panel.current().filter(|e| !e.is_up).map(|e| e.name.clone());
         let db = self.db.clone();
@@ -1734,6 +1747,7 @@ impl App {
             db: &db,
             active_name: name_on(&self.panels[self.active]),
             passive_name: name_on(&self.panels[1 - self.active]),
+            start_line,
         };
         let exit = editor::run(&mut self.tui, path, &mut ctx)?;
         self.reload_all();
@@ -1746,7 +1760,7 @@ impl App {
         self.draw_main();
         match exit {
             EditorExit::Close => Ok(()),
-            EditorExit::View => self.view_file(path),
+            EditorExit::View(line) => self.view_file_at(path, line),
             EditorExit::NewFile => self.new_file(),
             EditorExit::GoToFile => self.jump_to(path),
             EditorExit::History => self.view_history(),
@@ -2291,6 +2305,7 @@ impl App {
         let exit = viewer::run(
             &mut self.tui,
             &path,
+            0,
             &mut self.keybar,
             &mut self.clipboard,
             &db,
@@ -2298,7 +2313,7 @@ impl App {
         self.draw_main();
         drop(scratch);
         match exit {
-            Ok(ViewerExit::Edit) => self.edit_in_archive(),
+            Ok(ViewerExit::Edit(_)) => self.edit_in_archive(),
             Ok(_) => Ok(()),
             Err(e) => dialog::alert(&mut self.tui, "Viewer", &e.to_string()),
         }
@@ -2338,6 +2353,7 @@ impl App {
             db: &db,
             active_name: None,
             passive_name: None,
+            start_line: 0,
         };
         editor::run(&mut self.tui, &path, &mut ctx)?;
         self.draw_main();
@@ -3145,6 +3161,7 @@ impl App {
                 let exit = viewer::run(
                     &mut self.tui,
                     &path,
+                    0,
                     &mut self.keybar,
                     &mut self.clipboard,
                     &db,

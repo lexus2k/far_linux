@@ -468,7 +468,8 @@ pub struct Clipboard {
 #[derive(Debug, PartialEq, Eq)]
 pub enum EditorExit {
     Close,
-    View,
+    /// F6: view the file, with this line at the top of the screen.
+    View(usize),
     NewFile,
     GoToFile,
     History,
@@ -580,6 +581,21 @@ impl Editor {
             locked: false,
             status_bar: true,
         })
+    }
+
+    /// Shows line `line`, from 0, at the top with the cursor at its start, or
+    /// the last line if the file has fewer.
+    pub fn start_at(&mut self, line: usize) {
+        let line = line.min(self.buf.lines.len().saturating_sub(1));
+        self.cursor = pos(line, 0);
+        self.top = line;
+        self.left = 0;
+        self.sync_vis();
+    }
+
+    /// The line at the top of the screen, from 0.
+    pub fn top_line(&self) -> usize {
+        self.top
     }
 
     fn line(&self) -> &str {
@@ -1274,6 +1290,9 @@ pub struct EditorContext<'a> {
     pub active_name: Option<String>,
     /// Name under the cursor on the passive panel, for Ctrl+Shift+Enter.
     pub passive_name: Option<String>,
+    /// The line, from 0, to show at the top with the cursor on it, as F6 in
+    /// the viewer leaves it.
+    pub start_line: usize,
 }
 
 const HELP: &[(&str, &str)] = &[
@@ -1369,6 +1388,7 @@ pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<Ed
         }
     };
     ed.search = ctx.db.load_search();
+    ed.start_at(ctx.start_line);
     let ctrl_alt = CTRL | ALT;
     loop {
         tui.sync_held();
@@ -1593,7 +1613,7 @@ pub fn run(tui: &mut Tui, path: &Path, ctx: &mut EditorContext) -> io::Result<Ed
             }
             (NONE, KeyCode::F(6)) => {
                 if confirm_leave(tui, &mut ed)? {
-                    return Ok(EditorExit::View);
+                    return Ok(EditorExit::View(ed.top_line()));
                 }
             }
             (SHIFT, KeyCode::F(4)) => {
@@ -2606,6 +2626,20 @@ mod tests {
             .file_type()
             .is_symlink());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn start_at_puts_the_line_at_the_top_with_the_cursor() {
+        let file = temp("start_at");
+        fs::write(&file, "a\nb\nc\nd\n").unwrap();
+        let mut ed = Editor::open(&file).unwrap();
+        ed.start_at(2);
+        assert_eq!((ed.cursor, ed.top_line()), (pos(2, 0), 2));
+        // A file with fewer lines stops at its last one.
+        ed.start_at(99);
+        assert_eq!(ed.cursor.line, ed.buf.lines.len() - 1);
+        assert_eq!(ed.top_line(), ed.cursor.line);
+        let _ = fs::remove_file(&file);
     }
 
     #[test]

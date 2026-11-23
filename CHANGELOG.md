@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### Changed
+
+- `F6` between the viewer and the editor keeps the line at the top of the
+  screen, as Far does, instead of starting at the top of the file. The editor
+  puts the cursor on that line.
+
 ## 0.6.0 - 2026-11-19
 
 ### Added

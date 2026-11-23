@@ -2171,3 +2171,47 @@ fn typed_commands_offer_history_and_file_names_on_panels_and_console() {
     s.keys(&["C-o"]);
     s.wait("╔");
 }
+
+/// Presses PgDn `times`, waiting for each to scroll, and returns the top line.
+fn page_down(s: &Session, times: usize) -> String {
+    let mut top = top_numbered_line(&s.screen());
+    for _ in 0..times {
+        s.keys(&["PageDown"]);
+        s.wait_gone(&top);
+        top = top_numbered_line(&s.screen());
+    }
+    top
+}
+
+/// The first `line NNN` on screen, which is the top text row.
+fn top_numbered_line(screen: &str) -> String {
+    let at = screen.find("line ").expect("no numbered line on screen");
+    screen[at..at + 8].to_string()
+}
+
+#[test]
+fn f6_keeps_the_top_line_between_viewer_and_editor() {
+    let Some(s) = Session::start(|root| {
+        let text: String = (1..=300).map(|i| format!("line {i:03}\n")).collect();
+        fs::write(root.join("left/numbers.txt"), text).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("numbers.txt");
+    s.keys(&["Down", "F3"]);
+    s.wait("line 001");
+    let viewed = page_down(&s, 2);
+    s.keys(&["F6"]);
+    s.wait("2Save");
+    s.wait_for("editor at the viewer's line", |t| {
+        !t.contains("line 001") && t.contains(&viewed)
+    });
+    assert_eq!(top_numbered_line(&s.screen()), viewed, "{}", s.screen());
+    let edited = page_down(&s, 3);
+    s.keys(&["F6"]);
+    s.wait("Wrap");
+    s.wait_for("viewer at the editor's line", |t| {
+        !t.contains("2Save") && t.contains(&edited)
+    });
+    assert_eq!(top_numbered_line(&s.screen()), edited, "{}", s.screen());
+}
