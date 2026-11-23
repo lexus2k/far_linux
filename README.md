@@ -121,10 +121,14 @@ ones. The list is saved to `~/.config/far_linux/associations.ini`, which can als
 be edited by hand.
 
 Inside an archive, the file is unpacked into a private temporary folder and the
-command runs there, with `!.!` naming the copy. The copy stays until no panel
-shows the archive, or far quits, because a program such as an editor may keep
-running after the command returns. If the copy changed by then, far asks
-whether to update it in the archive.
+command runs there, with `!.!` naming the copy. The copy stays until far quits,
+because a program such as an editor may keep running after the command returns.
+Once no panel shows the archive, a change to the copy, even a later one, makes
+far ask whether to update it in the archive, and it warns when the archive
+itself changed after the file was unpacked. Changes that could not be put back,
+because the update failed or the archive is read-only, are kept on disk when
+far quits, and far says where. Edit commands are refused inside a read-only
+archive, as `F4` is.
 
 Masks may use the `[masks]` groups of the highlighting file,
 such as `<arc>`. When a save from the dialogs would drop comments or mistakes

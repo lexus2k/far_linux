@@ -456,29 +456,48 @@ struct App {
     db: Rc<History>,
 }
 
-/// Runs the file manager until the user quits.
-/// An archive entry unpacked for an association command.
+/// An archive entry unpacked for an association command. It is kept until
+/// far quits, because the program the command started may still have it open
+/// after the archive is left.
 struct ArcCopy {
     /// Holds the copy; dropping it removes the copy.
-    _scratch: ScratchDir,
+    scratch: ScratchDir,
     /// The unpacked file.
     path: PathBuf,
-    /// Its size and modification time when unpacked.
-    stamp: Option<(u64, std::time::SystemTime)>,
+    /// Its stamp when last looked at.
+    stamp: Option<FileStamp>,
     /// The archive, its format and the folder in it the entry is in.
     file: PathBuf,
     format: Format,
     folder: String,
+    /// The archive's stamp when the entry was unpacked or last put back, to
+    /// warn before an older copy replaces newer changes.
+    archive_stamp: Option<FileStamp>,
     /// Why the archive cannot be changed, if it cannot.
     read_only: Option<&'static str>,
+    /// The copy holds changes that are not in the archive.
+    unsaved: bool,
 }
 
+type FileStamp = (u64, std::time::SystemTime);
+
 /// The size and modification time of `path`, to tell whether it changed.
-fn file_stamp(path: &Path) -> Option<(u64, std::time::SystemTime)> {
+/// Unlike the panel's stamp this keeps fractions of a second, so a quick
+/// save of the same size is still seen.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
     let meta = fs::metadata(path).ok()?;
     Some((meta.len(), meta.modified().ok()?))
 }
 
+/// What became of a changed archive entry offered back to its archive.
+#[derive(PartialEq, Eq)]
+enum OfferBack {
+    Updated,
+    Discarded,
+    Failed,
+}
+
+/// Runs the file manager until the user quits.
 pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
     // Prefer the logical path, which keeps symbolic link names in the title.
@@ -636,6 +655,22 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 impl App {
     fn main_loop(&mut self) -> io::Result<()> {
+        match self.run_keys() {
+            Ok(()) => self.settle_arc_copies(true),
+            Err(e) => {
+                // No dialogs now; keep whatever might hold changes.
+                for copy in std::mem::take(&mut self.arc_copies) {
+                    if copy.unsaved || file_stamp(&copy.path) != copy.stamp {
+                        let dir = copy.scratch.keep();
+                        eprintln!("far: changes kept in {}", dir.display());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn run_keys(&mut self) -> io::Result<()> {
         while !self.quit {
             self.tui.sync_held();
             self.draw_main();
@@ -655,7 +690,7 @@ impl App {
                 None => self.refresh_changed(),
             }
         }
-        self.settle_arc_copies(true)
+        Ok(())
     }
 
     /// True when a panel shows the archive `file`, also as the outer archive
@@ -673,57 +708,108 @@ impl App {
         })
     }
 
-    /// Settles the unpacked copies whose archive is no longer shown, or all
-    /// of them when far quits: a changed copy is offered back to its archive,
-    /// and every copy is then removed.
+    /// Offers the changed copies whose archive is no longer shown back to
+    /// it, and when far quits (`all`) does so for every copy and removes
+    /// them. A copy holding changes that could not be put back is kept on
+    /// disk, and far says where.
     fn settle_arc_copies(&mut self, all: bool) -> io::Result<()> {
-        let mut index = 0;
-        while index < self.arc_copies.len() {
-            if !all && self.archive_shown(&self.arc_copies[index].file) {
-                index += 1;
+        for index in 0..self.arc_copies.len() {
+            let copy = &self.arc_copies[index];
+            if !all && self.archive_shown(&copy.file) {
                 continue;
             }
-            let copy = self.arc_copies.remove(index);
-            if file_stamp(&copy.path) == copy.stamp {
+            let now = file_stamp(&copy.path);
+            if now == copy.stamp {
                 continue;
             }
-            self.draw_main();
-            let name = copy.path.file_name().unwrap_or_default().to_string_lossy();
-            let archive = copy.file.file_name().unwrap_or_default().to_string_lossy();
+            self.arc_copies[index].stamp = now;
+            let copy = &self.arc_copies[index];
             if let Some(reason) = copy.read_only {
-                let text = format!("{name} changed, but {archive} cannot be changed.\n{reason}");
+                let name = copy.path.file_name().unwrap_or_default().to_string_lossy();
+                let archive = copy.file.file_name().unwrap_or_default().to_string_lossy();
+                let text = format!(
+                    "{name} changed, but {archive} cannot be changed.\n{reason}\n\
+                     The changed file is kept when far quits."
+                );
+                self.arc_copies[index].unsaved = true;
+                self.draw_main();
                 dialog::alert(&mut self.tui, "Archive", &text)?;
                 continue;
             }
-            let lines = vec![
-                format!("{name} from {archive} changed."),
-                "Update it in the archive?".to_string(),
-            ];
-            let answer = dialog::message(
-                &mut self.tui,
-                "Archive",
-                &lines,
-                &["Update", "Discard"],
-                false,
-            )?;
-            if answer != Some(0) {
-                continue;
+            let (file, format, folder, path) = (
+                copy.file.clone(),
+                copy.format,
+                copy.folder.clone(),
+                copy.path.clone(),
+            );
+            let newer = file_stamp(&file) != copy.archive_stamp;
+            let result = self.offer_back(&file, format, &folder, &path, newer)?;
+            let copy = &mut self.arc_copies[index];
+            copy.unsaved = result == OfferBack::Failed;
+            if result == OfferBack::Updated {
+                copy.archive_stamp = file_stamp(&file);
             }
-            let ArcCopy {
-                _scratch,
-                path,
-                file,
-                format,
-                folder,
-                ..
-            } = copy;
-            let summary = self.run_op("Update archive", move |ui| {
-                archive::update_file(&file, format, &folder, &path, ui)
-            })?;
-            drop(_scratch);
-            self.after_op(&summary);
+        }
+        if !all {
+            return Ok(());
+        }
+        let mut kept = Vec::new();
+        for copy in std::mem::take(&mut self.arc_copies) {
+            if copy.unsaved {
+                copy.scratch.keep();
+                kept.push(copy.path.display().to_string());
+            }
+        }
+        if !kept.is_empty() {
+            let mut lines = vec!["Changes that are not in their archive are kept in:".to_string()];
+            lines.extend(kept);
+            self.draw_main();
+            dialog::message(&mut self.tui, "Archive", &lines, &["OK"], true)?;
         }
         Ok(())
+    }
+
+    /// Asks whether to put the changed file `path` back into `folder` of the
+    /// archive `file`, and does so. `newer` warns that the archive changed
+    /// since the file was unpacked, so its copy of the entry may be newer.
+    fn offer_back(
+        &mut self,
+        file: &Path,
+        format: Format,
+        folder: &str,
+        path: &Path,
+        newer: bool,
+    ) -> io::Result<OfferBack> {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let archive = file.file_name().unwrap_or_default().to_string_lossy();
+        let mut lines = vec![format!("{name} from {archive} changed.")];
+        if newer {
+            lines.push(format!("{archive} also changed after it was unpacked,"));
+            lines.push("and updating replaces its copy of the file.".to_string());
+        }
+        lines.push("Update it in the archive?".to_string());
+        self.draw_main();
+        let answer = dialog::message(
+            &mut self.tui,
+            "Archive",
+            &lines,
+            &["Update", "Discard"],
+            newer,
+        )?;
+        if answer != Some(0) {
+            return Ok(OfferBack::Discarded);
+        }
+        let (file, folder, path) = (file.to_path_buf(), folder.to_string(), path.to_path_buf());
+        let summary = self.run_op("Update archive", move |ui| {
+            archive::update_file(&file, format, &folder, &path, ui)
+        })?;
+        // Only reload: the selection belongs to whatever the user is doing.
+        self.reload_all();
+        Ok(if summary.cancelled || summary.skipped > 0 {
+            OfferBack::Failed
+        } else {
+            OfferBack::Updated
+        })
     }
 
     fn panel(&mut self) -> &mut Panel {
@@ -1998,6 +2084,14 @@ impl App {
             .map(|v| (v.file.clone(), v.format, v.folder.clone(), v.read_only()));
         let mut copy = None;
         if let Some((file, format, folder, read_only)) = view {
+            // As the internal editor, edit commands are refused where the
+            // changes could not be put back.
+            if matches!(slot, Slot::Edit | Slot::AltEdit)
+                && self.refuse_nested(self.active, "Edit")?
+            {
+                return Ok(true);
+            }
+            let archive_stamp = file_stamp(&file);
             let Some((scratch, path)) = self.extract_current_to_scratch()? else {
                 return Ok(true);
             };
@@ -2008,13 +2102,15 @@ impl App {
                 selected: vec![name],
             };
             copy = Some(ArcCopy {
-                _scratch: scratch,
+                scratch,
                 stamp: file_stamp(&path),
                 path,
                 file,
                 format,
                 folder,
+                archive_stamp,
                 read_only,
+                unsaved: false,
             });
         }
         let tui = &mut self.tui;
@@ -2025,16 +2121,21 @@ impl App {
             Err(text) => dialog::alert(&mut self.tui, "File associations", &text)?,
             Ok(None) => {}
             Ok(Some(expanded)) => {
+                let special =
+                    is_exit_command(&expanded.command) || is_about_command(&expanded.command);
                 let command = match &copy {
+                    Some(_) if special => expanded.command.clone(),
                     Some(copy) => {
                         let dir = copy.path.parent().unwrap_or(Path::new("/"));
-                        match dir.to_str() {
-                            // A subshell, so the console's folder stays where it is.
-                            Some(dir) => {
-                                format!("( cd {} && {} )", shell_quote(dir), expanded.command)
-                            }
-                            None => expanded.command.clone(),
-                        }
+                        let Some(dir) = dir.to_str() else {
+                            // Running elsewhere, `!.!` could name a real file.
+                            let text = "The temporary folder's name is not UTF-8";
+                            dialog::alert(&mut self.tui, "File associations", text)?;
+                            return Ok(true);
+                        };
+                        // A subshell, so the console's folder stays where it
+                        // is. The newline ends a trailing `#` comment.
+                        format!("( cd {} && {}\n)", shell_quote(dir), expanded.command)
                     }
                     None => expanded.command.clone(),
                 };
@@ -2839,7 +2940,8 @@ impl App {
         name: &str,
         start_line: usize,
     ) -> io::Result<()> {
-        let Some((_scratch, path)) = self.extract_to_scratch(file, format, folder, name)? else {
+        let archive_stamp = file_stamp(file);
+        let Some((scratch, path)) = self.extract_to_scratch(file, format, folder, name)? else {
             return Ok(());
         };
         let before = fs::read(&path).ok();
@@ -2857,22 +2959,13 @@ impl App {
         if fs::read(&path).ok() == before {
             return Ok(());
         }
-        let lines = vec!["The file changed. Update it in the archive?".to_string()];
-        let answer = dialog::message(
-            &mut self.tui,
-            "Archive",
-            &lines,
-            &["Update", "Discard"],
-            false,
-        )?;
-        if answer != Some(0) {
-            return Ok(());
+        let newer = file_stamp(file) != archive_stamp;
+        if self.offer_back(file, format, folder, &path, newer)? == OfferBack::Failed {
+            // Keep the edited file rather than lose it with the copy.
+            scratch.keep();
+            let text = format!("The changes are kept in {}", path.display());
+            dialog::alert(&mut self.tui, "Archive", &text)?;
         }
-        let (file, folder) = (file.to_path_buf(), folder.to_string());
-        let summary = self.run_op("Update archive", move |ui| {
-            archive::update_file(&file, format, &folder, &path, ui)
-        })?;
-        self.after_op(&summary);
         Ok(())
     }
 

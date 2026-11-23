@@ -2368,7 +2368,7 @@ fn associations_inside_archives_get_a_copy_offered_back_on_leaving() {
         fs::write(
             root.join("home/config/far_linux/associations.ini"),
             "[association]\nmask = *.txt\n\
-             view = cp !.! \"$HOME/seen.txt\" && printf ' now' >> !.!\n",
+             view = cp !.! \"$HOME/seen.txt\" && printf ' now' >> !.! # a comment\n\n",
         )
         .unwrap();
     }) else {
@@ -2433,4 +2433,62 @@ fn associations_inside_archives_get_a_copy_offered_back_on_leaving() {
     s.wait_gone("Update it in the archive?");
     std::thread::sleep(Duration::from_millis(300));
     assert_eq!(read(), "buy milk now");
+}
+
+#[test]
+fn an_archive_copy_changed_after_leaving_is_still_offered_back() {
+    use std::io::{Read, Write};
+    let Some(s) = Session::start(|root| {
+        let file = fs::File::create(root.join("left/logs.zip")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("a.log", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"start ").unwrap();
+        zip.finish().unwrap();
+        fs::create_dir_all(root.join("home/config/far_linux")).unwrap();
+        fs::write(
+            root.join("home/config/far_linux/associations.ini"),
+            "[association]\nmask = *.log\n\
+             view = (sleep 1; printf late >> !.!) >/dev/null 2>&1 &\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("logs.zip");
+    s.keys(&["End", "Enter"]);
+    s.wait("logs.zip:/");
+    s.keys(&["End", "F3"]);
+    // Keys sent while the command's console is up are lost; wait for the
+    // panels to come back.
+    std::thread::sleep(Duration::from_millis(300));
+    s.wait("a.log");
+    // Leave at once: the program has not written yet, so nothing is asked,
+    // and the copy must survive for it.
+    s.keys(&["C-PageUp"]);
+    s.wait_gone("logs.zip:/");
+    assert!(!s.screen().contains("Update it in the archive?"));
+    std::thread::sleep(Duration::from_millis(1500));
+    s.keys(&["Home"]);
+    s.wait("Update it in the archive?");
+    s.keys(&["Enter"]);
+    let read = || -> String {
+        let mut zip = zip::ZipArchive::new(fs::File::open(s.p("left/logs.zip")).unwrap()).unwrap();
+        let mut text = String::new();
+        zip.by_name("a.log")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    };
+    let start = Instant::now();
+    while read() != "start late" {
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "{:?}\n{}",
+            read(),
+            s.screen()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
 }

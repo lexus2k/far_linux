@@ -1933,6 +1933,13 @@ impl ScratchDir {
     pub fn path(&self) -> &Path {
         &self.0
     }
+
+    /// Keeps the folder on disk and returns its path, for files that hold
+    /// changes which could not be put where they belong.
+    pub fn keep(self) -> PathBuf {
+        let this = std::mem::ManuallyDrop::new(self);
+        this.0.clone()
+    }
 }
 
 impl Drop for ScratchDir {
@@ -2885,5 +2892,14 @@ mod tests {
         assert!(is_under("a/b", "a"));
         assert!(is_under("a", "a"));
         assert!(!is_under("ab", "a"));
+    }
+
+    #[test]
+    fn a_kept_scratch_folder_stays_on_disk() {
+        let scratch = ScratchDir::new().unwrap();
+        fs::write(scratch.path().join("a"), "x").unwrap();
+        let dir = scratch.keep();
+        assert_eq!(fs::read_to_string(dir.join("a")).unwrap(), "x");
+        fs::remove_dir_all(dir).unwrap();
     }
 }
