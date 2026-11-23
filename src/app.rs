@@ -1,6 +1,7 @@
 //! The application: panels, command line, hot keys and file operation dialogs.
 
 use crate::archive::{self, ExtractRequest, Format, ScratchDir, FORMATS};
+use crate::assoc::{self, Associations, Slot};
 use crate::autocomplete;
 use crate::dialog::{self, Field, Form};
 use crate::editor::{self, Clipboard, EditorContext, EditorExit};
@@ -73,6 +74,15 @@ pub enum Action {
     InvertSelection,
     SelectAll,
     Highlighting,
+    FileAssociations,
+    /// Alt+F3: the associated or external viewer.
+    ViewAlt,
+    /// Alt+F4: the associated or external editor.
+    EditAlt,
+    /// Ctrl+Shift+F3: the internal viewer, whatever the associations.
+    ViewInternal,
+    /// Ctrl+Shift+F4: the internal editor, whatever the associations.
+    EditInternal,
     ClearSelection,
     FindFiles,
     CommandHistory,
@@ -161,6 +171,7 @@ fn commands_menu() -> Vec<MenuItem> {
         ("Right panel on/off", "Ctrl+F2", Action::ToggleRight),
         ("Key bar on/off", "Ctrl+B", Action::ToggleKeybar),
         ("Files highlighting", "F9", Action::Highlighting),
+        ("File associations", "F9", Action::FileAssociations),
         ("Help", "F1", Action::Help),
         ("Version information", "far:about", Action::About),
         ("Quit", "F10", Action::Quit),
@@ -169,6 +180,13 @@ fn commands_menu() -> Vec<MenuItem> {
 
 const HELP: &[(&str, &str)] = &[
     ("F9, Commands", "Files highlighting: edit the colour groups"),
+    ("F9, Commands", "File associations: commands for file masks"),
+    ("Alt+F3, Alt+F4", "Associated, else $PAGER or $EDITOR"),
+    (
+        "Ctrl+Shift+F3, F4",
+        "Internal viewer, editor, ignoring associations",
+    ),
+    ("Ctrl+Shift+PgDn", "Open the archive, ignoring associations"),
     ("far:about", "Version information, typed as a command"),
     ("Ctrl+C", "Clear the command line, or cancel an operation"),
     ("Archives", ""),
@@ -257,7 +275,7 @@ const PANEL_KEYS: KeyBars = KeyBars {
         "Add", "Extrct", "ArcCmd", "Edit…", "Copy", "Rename", "", "Delete", "", "", "", "",
     ],
     alt: [
-        "Left", "Right", "", "", "", "MkLink", "Find", "Histry", "", "", "ViewHs", "FoldHs",
+        "Left", "Right", "View", "Edit", "", "MkLink", "Find", "Histry", "", "", "ViewHs", "FoldHs",
     ],
     ctrl: [
         "Left", "Right", "Name", "Extens", "Write", "Size", "Unsort", "Creatn", "Access", "",
@@ -412,6 +430,8 @@ struct App {
     shell: Shell,
     quit: bool,
     masks: String,
+    /// Far's file associations, from their settings file.
+    assoc: Associations,
     find_mask: String,
     find_text: String,
     db: Rc<History>,
@@ -484,11 +504,13 @@ pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
         shell,
         quit: false,
         masks: db.last(Kind::Mask).unwrap_or_else(|| "*".into()),
+        assoc: Associations::default(),
         find_mask: db.last(Kind::FindMask).unwrap_or_else(|| "*".into()),
         find_text: db.last(Kind::FindText).unwrap_or_default(),
         db,
     };
     app.apply_highlighting()?;
+    app.load_associations()?;
     app.main_loop()
 }
 
@@ -759,7 +781,8 @@ impl App {
                 self.panel().move_by(page);
             }
             (CTRL, KeyCode::PageUp) => self.go_up(),
-            (CTRL, KeyCode::PageDown) => self.enter_folder(),
+            (CTRL, KeyCode::PageDown) => self.enter_folder(true)?,
+            (m, KeyCode::PageDown) if m == CTRL | SHIFT => self.enter_folder(false)?,
             (CTRL, KeyCode::Char('\\')) => {
                 self.navigate(Path::new("/"), None)?;
             }
@@ -883,9 +906,12 @@ impl App {
         }
     }
 
-    fn enter_folder(&mut self) {
+    /// Ctrl+PgDn: enters a folder or an archive. With `use_assoc`, a file with
+    /// an association for Ctrl+PgDn runs its command instead, as in Far, and
+    /// Ctrl+Shift+PgDn passes false to always open the archive.
+    fn enter_folder(&mut self, use_assoc: bool) -> io::Result<()> {
         let Some(entry) = self.panels[self.active].current().cloned() else {
-            return;
+            return Ok(());
         };
         if entry.is_up {
             self.go_up();
@@ -898,6 +924,7 @@ impl App {
         } else if entry.is_dir {
             let path = self.panels[self.active].entry_path(&entry);
             let _ = self.navigate(&path, None);
+        } else if use_assoc && self.run_association(Slot::CtrlPgDn)? {
         } else {
             let path = self.panels[self.active].entry_path(&entry);
             if let Some(format) = archive::detect(&path) {
@@ -906,6 +933,7 @@ impl App {
                 let _ = self.enter_split_archive(&path, format);
             }
         }
+        Ok(())
     }
 
     /// Opens an archive in the active panel.
@@ -1072,6 +1100,7 @@ impl App {
         } else if entry.is_dir {
             let path = self.panels[self.active].entry_path(&entry);
             self.navigate(&path, None)?;
+        } else if self.run_association(Slot::Enter)? {
         } else if let Some(format) = archive::detect(Path::new(&entry.raw)) {
             let path = self.panels[self.active].entry_path(&entry);
             self.enter_archive(&path, format)?;
@@ -1159,6 +1188,11 @@ impl App {
 
     /// Runs a command on the console, then returns to the panels.
     fn execute(&mut self, command: &str) -> io::Result<()> {
+        self.execute_with(command, true)
+    }
+
+    /// Runs a command on the console, adding it to the history if `remember`.
+    fn execute_with(&mut self, command: &str, remember: bool) -> io::Result<()> {
         if is_exit_command(command) {
             self.quit = true;
             return Ok(());
@@ -1174,14 +1208,16 @@ impl App {
             return Ok(());
         }
         self.tui.show_console()?;
-        let result = self.run_on_console(command);
+        let result = self.run_on_console(command, remember);
         self.tui.enter()?;
         result
     }
 
     /// Prints and runs a command. The console must already be showing.
-    fn run_on_console(&mut self, command: &str) -> io::Result<()> {
-        self.remember_command(command);
+    fn run_on_console(&mut self, command: &str, remember: bool) -> io::Result<()> {
+        if remember {
+            self.remember_command(command);
+        }
         let cwd = self.panels[self.active].path.clone();
         let mut out = io::stdout();
         terminal::disable_raw_mode()?;
@@ -1308,7 +1344,7 @@ impl App {
                         let lines = about_lines().join("\r\n");
                         execute!(out, Print(format!("{prompt}{text}\r\n{lines}\r\n")))?;
                     } else {
-                        self.run_on_console(&text)?;
+                        self.run_on_console(&text, true)?;
                     }
                 }
                 (NONE, KeyCode::Tab) => self.complete_command()?,
@@ -1561,6 +1597,11 @@ impl App {
             Action::ArchiveCommands => self.archive_commands()?,
             Action::View => self.view_current()?,
             Action::Edit => self.edit_current()?,
+            Action::ViewAlt => self.view_or_edit_alt(Slot::AltView)?,
+            Action::EditAlt => self.view_or_edit_alt(Slot::AltEdit)?,
+            Action::ViewInternal => self.view_current_with(false)?,
+            Action::EditInternal => self.edit_current_with(false)?,
+            Action::FileAssociations => self.edit_associations()?,
             Action::NewFile => self.new_file()?,
             Action::Copy => self.copy_dialog(false)?,
             Action::CopyHere => self.copy_dialog(true)?,
@@ -1644,6 +1685,11 @@ impl App {
     }
 
     fn view_current(&mut self) -> io::Result<()> {
+        self.view_current_with(true)
+    }
+
+    /// F3, or with `use_assoc` false Ctrl+Shift+F3, which skips associations.
+    fn view_current_with(&mut self, use_assoc: bool) -> io::Result<()> {
         let Some(entry) = self.panels[self.active].current().cloned() else {
             return Ok(());
         };
@@ -1656,6 +1702,9 @@ impl App {
         }
         if entry.is_dir {
             return self.count_folders();
+        }
+        if use_assoc && self.run_association(Slot::View)? {
+            return Ok(());
         }
         let path = self.panels[self.active].entry_path(&entry);
         self.view_file(&path)
@@ -1718,6 +1767,11 @@ impl App {
     }
 
     fn edit_current(&mut self) -> io::Result<()> {
+        self.edit_current_with(true)
+    }
+
+    /// F4, or with `use_assoc` false Ctrl+Shift+F4, which skips associations.
+    fn edit_current_with(&mut self, use_assoc: bool) -> io::Result<()> {
         let Some(entry) = self.panels[self.active].current().cloned() else {
             return Ok(());
         };
@@ -1727,8 +1781,288 @@ impl App {
         if self.panels[self.active].archive.is_some() {
             return self.edit_in_archive();
         }
+        if use_assoc && self.run_association(Slot::Edit)? {
+            return Ok(());
+        }
         let path = self.panels[self.active].entry_path(&entry);
         self.edit_file(&path)
+    }
+
+    /// Alt+F3 and Alt+F4: the associated command, else the external viewer or
+    /// editor, which on Linux is `$PAGER`, or `$VISUAL` then `$EDITOR`. Without
+    /// one, or inside an archive, the internal viewer or editor.
+    fn view_or_edit_alt(&mut self, slot: Slot) -> io::Result<()> {
+        let view = slot == Slot::AltView;
+        let panel = &self.panels[self.active];
+        let file = panel
+            .current()
+            .filter(|e| !e.is_up && !e.is_dir && panel.archive.is_none())
+            .map(|e| panel.entry_path(e));
+        let Some(path) = file else {
+            return if view {
+                self.view_current_with(false)
+            } else {
+                self.edit_current_with(false)
+            };
+        };
+        if self.run_association(slot)? {
+            return Ok(());
+        }
+        let names: &[&str] = if view {
+            &["PAGER"]
+        } else {
+            &["VISUAL", "EDITOR"]
+        };
+        let external = names
+            .iter()
+            .filter_map(|n| std::env::var(n).ok())
+            .find(|v| !v.trim().is_empty());
+        match external {
+            Some(program) => {
+                let command = format!("{program} {}", shell_quote(&path.display().to_string()));
+                self.execute_with(&command, false)
+            }
+            None if view => self.view_file(&path),
+            None => self.edit_file(&path),
+        }
+    }
+
+    /// What Far's special symbols refer to now.
+    fn meta_context(&self) -> assoc::MetaContext {
+        let info = |panel: &Panel| assoc::PanelInfo {
+            path: panel.path.clone(),
+            current: panel.current().filter(|e| !e.is_up).map(|e| e.raw.clone()),
+            selected: panel
+                .targets()
+                .iter()
+                .filter_map(|p| p.file_name().map(|n| n.to_os_string()))
+                .collect(),
+        };
+        assoc::MetaContext {
+            active: info(&self.panels[self.active]),
+            passive: info(&self.panels[1 - self.active]),
+            active_is_left: self.active == 0,
+        }
+    }
+
+    /// Runs the command that an association gives `slot` for the file under
+    /// the cursor, asking which when several match, as Far does. True when an
+    /// association took the key, even if the user then cancelled.
+    fn run_association(&mut self, slot: Slot) -> io::Result<bool> {
+        let panel = &self.panels[self.active];
+        if panel.archive.is_some() {
+            return Ok(false);
+        }
+        let Some(entry) = panel.current().filter(|e| !e.is_up && !e.is_dir) else {
+            return Ok(false);
+        };
+        let name = entry.raw.to_string_lossy().into_owned();
+        let found: Vec<assoc::Association> = self
+            .assoc
+            .matching(&name, slot)
+            .into_iter()
+            .cloned()
+            .collect();
+        let chosen = match found.len() {
+            0 => return Ok(false),
+            1 => found[0].clone(),
+            _ => {
+                let labels: Vec<String> = found.iter().map(|a| a.label()).collect();
+                match dialog::menu(&mut self.tui, "Select association", &labels, 0)? {
+                    Some(i) => found[i].clone(),
+                    None => return Ok(true),
+                }
+            }
+        };
+        let ctx = self.meta_context();
+        let tui = &mut self.tui;
+        let mut ask = |title: &str, init: &str| -> Option<String> {
+            dialog::prompt(tui, "Execute", title, init).ok().flatten()
+        };
+        match assoc::expand(chosen.command(slot), &ctx, &mut ask) {
+            Err(text) => dialog::alert(&mut self.tui, "File associations", &text)?,
+            Ok(None) => {}
+            Ok(Some(expanded)) => {
+                self.execute_with(&expanded.command, false)?;
+                // The list file, if any, is removed only now.
+                drop(expanded);
+            }
+        }
+        Ok(true)
+    }
+
+    /// F9, Commands, File associations: Far's list, where `Ins` adds, `F4` or
+    /// `Enter` edits, `Del` deletes and `Ctrl+Up`, `Ctrl+Down` move.
+    fn edit_associations(&mut self) -> io::Result<()> {
+        let Some(path) = assoc::settings_path() else {
+            return dialog::alert(&mut self.tui, "File associations", "HOME is not set");
+        };
+        let keys = [
+            Key {
+                code: KeyCode::Insert,
+                mods: NONE,
+            },
+            Key {
+                code: KeyCode::F(4),
+                mods: NONE,
+            },
+            Key {
+                code: KeyCode::Delete,
+                mods: NONE,
+            },
+            Key {
+                code: KeyCode::Up,
+                mods: CTRL,
+            },
+            Key {
+                code: KeyCode::Down,
+                mods: CTRL,
+            },
+        ];
+        let mut focus = 0;
+        loop {
+            if self.assoc.list.is_empty() {
+                // An empty list has nothing to show; start with a new entry.
+                if !self.edit_association(&path, None, 0)? {
+                    return Ok(());
+                }
+                continue;
+            }
+            // Dialogs leave their drawing behind; the list goes over the panels.
+            self.draw_main();
+            let items: Vec<String> = self.assoc.list.iter().map(|a| a.label()).collect();
+            let at = match dialog::menu_keys(
+                &mut self.tui,
+                "File associations",
+                &items,
+                focus,
+                &keys,
+            )? {
+                dialog::MenuResult::Closed => return Ok(()),
+                dialog::MenuResult::Chosen(i) => {
+                    focus = i;
+                    self.edit_association(&path, Some(i), i)?;
+                    continue;
+                }
+                dialog::MenuResult::Key(key, i) => {
+                    focus = i;
+                    key
+                }
+            };
+            let last = self.assoc.list.len() - 1;
+            match (at.mods, at.code) {
+                (NONE, KeyCode::Insert) => {
+                    self.edit_association(&path, None, focus)?;
+                }
+                (NONE, KeyCode::F(4)) => {
+                    self.edit_association(&path, Some(focus), focus)?;
+                }
+                (NONE, KeyCode::Delete) => {
+                    let lines = vec![
+                        "Do you wish to delete association for".to_string(),
+                        self.assoc.list[focus].label(),
+                    ];
+                    let answer = dialog::message(
+                        &mut self.tui,
+                        "File associations",
+                        &lines,
+                        &["Delete", "Cancel"],
+                        true,
+                    )?;
+                    if answer == Some(0) {
+                        self.assoc.list.remove(focus);
+                        focus = focus.min(self.assoc.list.len().saturating_sub(1));
+                        self.save_associations(&path)?;
+                    }
+                }
+                (CTRL, KeyCode::Up) if focus > 0 => {
+                    self.assoc.list.swap(focus, focus - 1);
+                    focus -= 1;
+                    self.save_associations(&path)?;
+                }
+                (CTRL, KeyCode::Down) if focus < last => {
+                    self.assoc.list.swap(focus, focus + 1);
+                    focus += 1;
+                    self.save_associations(&path)?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Far's "Edit file associations" dialog, for entry `index` or a new one
+    /// inserted at `insert_at`. True when it was saved.
+    fn edit_association(
+        &mut self,
+        path: &Path,
+        index: Option<usize>,
+        insert_at: usize,
+    ) -> io::Result<bool> {
+        let old = index
+            .map(|i| self.assoc.list[i].clone())
+            .unwrap_or_default();
+        let mut fields = vec![
+            Field::text("A file &mask or several file masks:", &old.mask),
+            Field::text("&Description of the association:", &old.description),
+        ];
+        for slot in assoc::SLOTS {
+            fields.push(Field::text(slot.label(), old.command(slot)));
+        }
+        let mut form = Form::new(fields);
+        if !form.run(&mut self.tui, "Edit file associations")? {
+            return Ok(false);
+        }
+        let mut new = assoc::Association {
+            mask: form.text(0).trim().to_string(),
+            description: form.text(1).trim().to_string(),
+            ..Default::default()
+        };
+        for (i, slot) in assoc::SLOTS.iter().enumerate() {
+            new.set_command(*slot, &form.text(2 + i));
+        }
+        let mut problems = Vec::new();
+        crate::highlight::MaskList::new(&new.mask, &mut problems);
+        if new.mask.is_empty() {
+            problems.push("A file mask is needed".to_string());
+        }
+        if !problems.is_empty() {
+            dialog::alert(&mut self.tui, "File associations", &problems.join("\n"))?;
+            return Ok(false);
+        }
+        match index {
+            Some(i) => self.assoc.list[i] = new,
+            None => {
+                let at = insert_at.min(self.assoc.list.len());
+                self.assoc.list.insert(at, new);
+            }
+        }
+        self.save_associations(path)?;
+        Ok(true)
+    }
+
+    fn save_associations(&mut self, path: &Path) -> io::Result<()> {
+        if let Err(e) = self.assoc.save(path) {
+            let text = format!("{}: {e}", path.display());
+            dialog::alert(&mut self.tui, "File associations", &text)?;
+        }
+        Ok(())
+    }
+
+    /// Reads the associations file and reports its mistakes.
+    fn load_associations(&mut self) -> io::Result<()> {
+        self.assoc = assoc::settings_path()
+            .map_or_else(Associations::default, |path| Associations::load(&path));
+        let problems = self.assoc.problems.clone();
+        if !problems.is_empty() {
+            self.draw_main();
+            let mut lines = vec!["File associations:".to_string()];
+            lines.extend(problems.iter().take(10).cloned());
+            if problems.len() > 10 {
+                lines.push(format!("…and {} more", problems.len() - 10));
+            }
+            dialog::message(&mut self.tui, "File associations", &lines, &["OK"], true)?;
+        }
+        Ok(())
     }
 
     fn edit_file(&mut self, path: &Path) -> io::Result<()> {
@@ -3715,6 +4049,10 @@ fn key_action(key: Key, enhanced: bool) -> Option<Action> {
         (SHIFT, KeyCode::F(3)) => Action::ArchiveCommands,
         (NONE, KeyCode::F(3)) => Action::View,
         (NONE, KeyCode::F(4)) => Action::Edit,
+        (ALT, KeyCode::F(3)) => Action::ViewAlt,
+        (ALT, KeyCode::F(4)) => Action::EditAlt,
+        (m, KeyCode::F(3)) if m == shift_ctrl => Action::ViewInternal,
+        (m, KeyCode::F(4)) if m == shift_ctrl => Action::EditInternal,
         (SHIFT, KeyCode::F(4)) => Action::NewFile,
         (NONE, KeyCode::F(5)) => Action::Copy,
         (SHIFT, KeyCode::F(5)) => Action::CopyHere,

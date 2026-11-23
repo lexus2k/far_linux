@@ -32,6 +32,7 @@ pass trivially if tmux is missing, because they skip themselves.
 | `src/editor.rs` | F4 editor: buffer, undo, blocks, search, saving |
 | `src/syntax.rs` | Syntax colours for the editor, from `syntect` grammars with Colorer's default colours |
 | `src/shell.rs` | Runs commands in bash and carries cwd and exports between them |
+| `src/assoc.rs` | File associations: settings file, masks and Far's special symbols. No UI code |
 | `src/autocomplete.rs` | Command line AutoComplete: what the list offers, its keys and drawing |
 | `src/screen.rs` | Cell buffer, terminal setup, key normalization, theme |
 | `src/input.rs` | Windows Terminal's input mode, which reports modifier keys alone |
@@ -62,6 +63,9 @@ pass trivially if tmux is missing, because they skip themselves.
 - Move into an archive removes the sources only after nothing was skipped and
   the archive tests clean.
 - A symbolic link must never replace the file it points to.
+- File names are untrusted in commands too. Association commands get every
+  substituted name escaped for the quoting it lands in; the tests in
+  `assoc.rs` run the result through bash.
 
 Add a test for any change to these paths. In `fsops.rs`, use the scripted
 `OpUi` implementation.
