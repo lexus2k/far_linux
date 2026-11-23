@@ -2353,3 +2353,84 @@ fn file_associations_run_commands_and_are_edited_from_f9() {
     let text = fs::read_to_string(&file).unwrap();
     assert!(text.find("*.txt") < text.find("Second"), "{text}");
 }
+
+#[test]
+fn associations_inside_archives_get_a_copy_offered_back_on_leaving() {
+    use std::io::{Read, Write};
+    let Some(s) = Session::start(|root| {
+        let file = fs::File::create(root.join("left/notes.zip")).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("docs/todo.txt", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"buy milk").unwrap();
+        zip.finish().unwrap();
+        fs::create_dir_all(root.join("home/config/far_linux")).unwrap();
+        fs::write(
+            root.join("home/config/far_linux/associations.ini"),
+            "[association]\nmask = *.txt\n\
+             view = cp !.! \"$HOME/seen.txt\" && printf ' now' >> !.!\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("notes.zip");
+    s.keys(&["End", "Enter"]);
+    s.wait("notes.zip:/");
+    s.keys(&["Down", "Enter"]);
+    s.wait("todo.txt");
+    s.keys(&["End", "F3"]);
+    s.wait_file(&s.p("home/seen.txt"), true);
+    assert_eq!(
+        fs::read_to_string(s.p("home/seen.txt")).unwrap(),
+        "buy milk"
+    );
+    // Still inside the archive: nothing is asked yet.
+    s.wait("todo.txt");
+    assert!(!s.screen().contains("Update it in the archive?"));
+    s.keys(&["C-PageUp"]);
+    s.wait("docs");
+    assert!(!s.screen().contains("Update it in the archive?"));
+    s.keys(&["C-PageUp"]);
+    s.wait("Update it in the archive?");
+    assert!(s.screen().contains("todo.txt from notes.zip changed."));
+    s.keys(&["Enter"]);
+    let read = || -> String {
+        let mut zip = zip::ZipArchive::new(fs::File::open(s.p("left/notes.zip")).unwrap()).unwrap();
+        let mut text = String::new();
+        zip.by_name("docs/todo.txt")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        text
+    };
+    let start = Instant::now();
+    while read() != "buy milk now" {
+        assert!(
+            start.elapsed() < Duration::from_secs(8),
+            "{:?}\n{}",
+            read(),
+            s.screen()
+        );
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    // Changed again, then quitting from inside the archive: asked once more,
+    // and Discard leaves the archive as it is.
+    s.wait("notes.zip");
+    s.keys(&["Enter"]);
+    s.wait("notes.zip:/");
+    s.keys(&["Down", "Enter"]);
+    s.wait("todo.txt");
+    fs::remove_file(s.p("home/seen.txt")).unwrap();
+    s.keys(&["End", "F3"]);
+    s.wait_file(&s.p("home/seen.txt"), true);
+    s.wait("todo.txt");
+    s.keys(&["F10"]);
+    s.wait("Do you want to quit?");
+    s.keys(&["Enter"]);
+    s.wait("Update it in the archive?");
+    s.keys(&["Right", "Enter"]);
+    s.wait_gone("Update it in the archive?");
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(read(), "buy milk now");
+}

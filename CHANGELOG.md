@@ -12,6 +12,9 @@
 - `Alt+F3` and `Alt+F4` run `$PAGER`, or `$VISUAL` then `$EDITOR`, when no
   association applies, and `Ctrl+Shift+F3`, `Ctrl+Shift+F4` and
   `Ctrl+Shift+PgDn` ignore associations, as in Far.
+- File associations work inside archives too. The command gets an unpacked
+  copy, which is kept until the archive is left or far quits, and then
+  offered back to the archive if it changed.
 
 ## 0.7.0 - 2026-11-23
 

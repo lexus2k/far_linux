@@ -27,6 +27,15 @@ inside it and its listing. `Panel::path` stays the folder holding the archive,
 because shell commands need a real working directory. Commands that make no sense
 inside an archive are refused in `App::perform`.
 
+**Association commands inside an archive keep their copy.** The entry is
+unpacked into a `ScratchDir` held in `App::arc_copies`, and the command runs in
+a subshell there. Programs started through `xdg-open` or `code` return at once
+and keep the file open, so the copy cannot be removed, nor its changes judged,
+when the command returns. After every key, `settle_arc_copies` settles each
+copy whose archive no panel shows any more, also as the outer archive of a
+nested one, and all of them on quit: a copy whose size or modification time
+changed is offered back with `archive::update_file`.
+
 **Zip, tar and gzip run in-process; other formats use tools.** The Rust crates
 need no installed programs for the common formats. Bzip2 and xz are piped through
 the system tools, and 7z is driven through its command line, because no pure Rust
