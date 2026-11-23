@@ -56,6 +56,7 @@ Press F1 in the program for the full list.
 | Selection | `Ins`, `Shift+arrows`, `+` / `-` by mask, `*` invert |
 | Finding | `Alt+letter` quick search, `Alt+F7` find files, inside the archive when one is open. The results window fills while searching: `Enter` goes to a file, `F3` / `F4` view or edit it, `Alt+N` new search |
 | Display | `Ctrl+F3`..`Ctrl+F11` sort, `Ctrl+F12` sort menu, `Ctrl+1`..`Ctrl+4` columns, `Ctrl+H` hidden files, `Ctrl+L` info, `Ctrl+Q` quick view, `F9` menu |
+| File associations | `Enter`, `Ctrl+PgDn`, `F3`, `Alt+F3`, `F4`, `Alt+F4` run the command associated with the file's mask, from `F9`, Commands, File associations. `Ctrl+Shift+PgDn`, `Ctrl+Shift+F3` and `Ctrl+Shift+F4` ignore them |
 | Viewer (`F3`) | `F2` wrap, `Shift+F2` word wrap, `F4` hex, `Shift+F4` mode, `F6` edit at the same line, `F7` search, `Shift+F7` or `Space` next, `Alt+F7` previous, `F8` encoding, `Shift+F8` choose encoding, also UTF-16, `Alt+F8` go to, `+` / `-` next or previous file. `F1` lists all keys |
 | Editor (`F4`) | `F2` save, `Shift+arrows` block, `Alt+arrows` vertical block, `Ctrl+C/X/V`, `Ctrl+Z`, `F7` search, `Ctrl+F7` replace, `Shift+F7` next, `Alt+F7` previous, `Alt+F8` go to, `F8` encoding, `Shift+F8` choose encoding, also UTF-16, `Ctrl+Shift+0..9` / `Ctrl+0..9` bookmarks, `F6` view at the same line. `F1` lists all keys. Source code is coloured by file type |
 
@@ -97,6 +98,31 @@ Limits: password protected archives, rar and renaming inside an archive are not
 supported. Listing and testing run in the foreground and cannot be cancelled, so
 a large compressed tar can pause the program. Esc does not stop a 7z command once
 it has started.
+
+## File associations
+
+As in Far, `F9`, Commands, File associations lists commands for file masks.
+`Ins` adds one, `F4` or `Enter` edits, `Del` deletes, and `Ctrl+Up` and
+`Ctrl+Down` change the order. Each has a mask, such as `*.md,*.markdown` with
+`|README.md` to exclude, a description, and commands for `Enter`, `Ctrl+PgDn`,
+`F3`, `Alt+F3`, `F4` and `Alt+F4`. When several match, a menu asks which one.
+
+Commands run in bash with Far's special symbols replaced: `!.!` the file name,
+`!` without extension, `` !` `` the extension, `!\` the folder ending in `/`,
+`!&` the selected files, `!@!` a file listing them (`!@F!` with full paths),
+`!?Title?initial!` text asked for first, `!!` a `!`, and `!#`, `!^`, `![`, `!]`
+to refer to the passive, active, left or right panel. For example, `glow -p !.!`
+as the `F3` command shows Markdown with `glow`.
+
+Without an association, `Enter` opens the file as before, `Ctrl+PgDn` opens
+archives, `F3` and `F4` use the internal viewer and editor, and `Alt+F3` and
+`Alt+F4` run `$PAGER`, or `$VISUAL` then `$EDITOR`, falling back to the internal
+ones. The list is saved to `~/.config/far_linux/associations.ini`, which can also
+be edited by hand. Masks may use the `[masks]` groups of the highlighting file,
+such as `<arc>`. When a save from the dialogs would drop comments or mistakes
+from a hand-edited file, the old file is kept as `associations.ini.bak`, and a
+file that could not be read is never overwritten. The commands are also on the
+`F9` Files menu, for terminals that do not deliver `Alt+F3` or `Ctrl+Shift` keys.
 
 ## History
 
@@ -178,6 +204,14 @@ box makes room by scrolling the output up rather than covering it.
   dialog, and `F9`, Commands, Files highlighting opens it. It has Far's masks,
   including `<name>` and `|` to exclude, and its four colours, but no regular
   expression masks, marking character or "continue processing". Deleting the file restores the defaults.
+- File associations replace each special symbol with the name escaped for bash,
+  where Far adds nothing, so a name such as `$(rm -rf ~)` stays a name whether
+  the command quotes it or not, and a name starting with `-` gets `./` in front
+  so that it is not read as an option. `!&` quotes each name, as Far's default
+  `Q` does. Text typed for `!?Title?initial!` goes in as typed, as in Far.
+  Short name symbols such as `!-!` and `!~` give the long name. Regular
+  expression masks, `IF EXIST` conditions and named input histories are not
+  supported, and associations do not apply inside archives.
 - The default groups are Far's: hidden (names starting with a dot), folders, `<arc>`,
   `<temp>` and executables, plus links, images, media, documents and source. Linux
   uses the execute permission rather than Far's `<exec>` masks, and it comes after

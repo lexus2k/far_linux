@@ -2266,3 +2266,90 @@ fn f6_keeps_the_line_for_an_archive_entry_and_after_save_as() {
     });
     assert_eq!(top_numbered_line(&s.screen()), edited, "{}", s.screen());
 }
+
+#[test]
+fn file_associations_run_commands_and_are_edited_from_f9() {
+    let Some(s) = Session::start_with("COLORTERM=truecolor", |root| {
+        fs::write(root.join("left/notes.md"), "# hello\n").unwrap();
+        fs::write(root.join("left/plain.txt"), "plain\n").unwrap();
+        fs::create_dir_all(root.join("home/config/far_linux")).unwrap();
+        fs::write(
+            root.join("home/config/far_linux/associations.ini"),
+            "[association]\nmask = *.md\ndescription = First\n\
+             enter = printf %s !.! > first.out\n\
+             view = printf %s- !?Word:?init! > asked.out\n\
+             [association]\nmask = *.md\ndescription = Second\n\
+             enter = printf second > second.out\n",
+        )
+        .unwrap();
+    }) else {
+        return;
+    };
+    s.wait("notes.md");
+    // Two associations for Enter: Far asks which one.
+    s.keys(&["Down", "Enter"]);
+    s.wait("Select association");
+    s.keys(&["Down", "Enter"]);
+    s.wait_file(&s.p("left/second.out"), true);
+    s.wait("second.out");
+    // One for F3, with a question first.
+    s.keys(&["Home", "Down", "F3"]);
+    s.wait("Word:");
+    s.keys(&["C-y"]);
+    s.text("a b");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/asked.out"), true);
+    s.wait("asked.out");
+    assert_eq!(fs::read_to_string(s.p("left/asked.out")).unwrap(), "a-b-");
+    // A file without associations views as before.
+    s.wait("plain.txt");
+    assert!(!s.p("left/first.out").exists());
+    // F9, Commands, File associations: Del removes the first one.
+    s.keys(&["F9"]);
+    s.wait("Left");
+    s.keys(&["Right", "Right"]);
+    s.wait("File associations");
+    for _ in 0..30 {
+        if s.tmux(&["capture-pane", "-p", "-e", "-t", "t"])
+            .contains("48;5;30m File associations")
+        {
+            break;
+        }
+        s.keys(&["Down"]);
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    s.keys(&["Enter"]);
+    s.wait("Second");
+    s.keys(&["Delete"]);
+    s.wait("Do you wish to delete");
+    s.keys(&["Enter"]);
+    s.wait_gone("Do you wish to delete");
+    let file = s.p("home/config/far_linux/associations.ini");
+    let start = Instant::now();
+    while fs::read_to_string(&file).unwrap().contains("First") {
+        assert!(start.elapsed() < Duration::from_secs(5), "not saved");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    assert!(fs::read_to_string(&file)
+        .unwrap()
+        .contains("description = Second"));
+    // F4 opens Far's dialog with the entry's fields.
+    s.keys(&["F4"]);
+    s.wait("Edit file associations");
+    s.wait("printf second > second.out");
+    s.keys(&["Escape"]);
+    s.wait_gone("Edit file associations");
+    // Ins adds one where the cursor is.
+    s.keys(&["Insert"]);
+    s.wait("Edit file associations");
+    s.text("*.txt");
+    s.keys(&["Enter"]);
+    s.wait_gone("Edit file associations");
+    let start = Instant::now();
+    while !fs::read_to_string(&file).unwrap().contains("mask = *.txt") {
+        assert!(start.elapsed() < Duration::from_secs(5), "not saved");
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    let text = fs::read_to_string(&file).unwrap();
+    assert!(text.find("*.txt") < text.find("Second"), "{text}");
+}

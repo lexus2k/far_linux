@@ -248,6 +248,33 @@ impl Masks {
     }
 }
 
+/// A mask list in the syntax of the highlighting file, for other settings
+/// that take file masks: `*.txt,*.[ch]`, with `|*.old` to exclude.
+#[derive(Clone, Debug, Default)]
+pub struct MaskList(Masks);
+
+impl MaskList {
+    /// Compiles `text`, adding any mistakes to `problems`.
+    pub fn new(text: &str, problems: &mut Vec<String>) -> MaskList {
+        MaskList(compile(text, &HashMap::new(), problems))
+    }
+
+    /// Compiles `text`, where `<name>` stands for a group from `groups`.
+    pub fn with_groups(
+        text: &str,
+        groups: &HashMap<String, String>,
+        problems: &mut Vec<String>,
+    ) -> MaskList {
+        MaskList(compile(text, groups, problems))
+    }
+
+    /// Whether `name` matches, ignoring case.
+    pub fn matches(&self, name: &str) -> bool {
+        let name: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
+        self.0.matches(&name)
+    }
+}
+
 /// Splits text at a delimiter, keeping quoted masks and `[...]` sets whole.
 fn split_masks(text: &str, is_delimiter: impl Fn(char) -> bool) -> Vec<&str> {
     let mut parts = Vec::new();
@@ -433,6 +460,8 @@ pub struct Highlight {
     groups: Vec<Group>,
     /// Problems found while reading, each naming its line. The rest still works.
     pub problems: Vec<String>,
+    /// The `[masks]` groups, such as `arc`, for other settings that take masks.
+    pub mask_groups: HashMap<String, String>,
 }
 
 impl Default for Highlight {
@@ -553,7 +582,11 @@ impl Highlight {
                 selected_cursor: group.selected_cursor,
             });
         }
-        Highlight { groups, problems }
+        Highlight {
+            groups,
+            problems,
+            mask_groups: named,
+        }
     }
 
     /// The colours for a file, from the first group it belongs to.

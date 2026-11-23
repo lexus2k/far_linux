@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+### Added
+
+- File associations, as Far's `F9`, Commands, File associations: commands for
+  `Enter`, `Ctrl+PgDn`, `F3`, `Alt+F3`, `F4` and `Alt+F4` on files that match
+  a mask, with Far's special symbols such as `!.!`, a menu when several match,
+  and Far's list and edit dialogs. They are saved to
+  `~/.config/far_linux/associations.ini`.
+- `Alt+F3` and `Alt+F4` run `$PAGER`, or `$VISUAL` then `$EDITOR`, when no
+  association applies, and `Ctrl+Shift+F3`, `Ctrl+Shift+F4` and
+  `Ctrl+Shift+PgDn` ignore associations, as in Far.
+
 ## 0.7.0 - 2026-11-23
 
 ### Changed
