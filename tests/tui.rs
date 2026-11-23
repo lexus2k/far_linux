@@ -2171,3 +2171,98 @@ fn typed_commands_offer_history_and_file_names_on_panels_and_console() {
     s.keys(&["C-o"]);
     s.wait("╔");
 }
+
+/// Presses PgDn `times`, waiting for each to scroll, and returns the top line.
+fn page_down(s: &Session, times: usize) -> String {
+    let mut top = top_numbered_line(&s.screen());
+    for _ in 0..times {
+        s.keys(&["PageDown"]);
+        s.wait_gone(&top);
+        top = top_numbered_line(&s.screen());
+    }
+    top
+}
+
+/// The first `line NNN` on screen, which is the top text row.
+fn top_numbered_line(screen: &str) -> String {
+    let at = screen.find("line ").expect("no numbered line on screen");
+    screen[at..at + 8].to_string()
+}
+
+#[test]
+fn f6_keeps_the_top_line_between_viewer_and_editor() {
+    let Some(s) = Session::start(|root| {
+        let text: String = (1..=300).map(|i| format!("line {i:03}\n")).collect();
+        fs::write(root.join("left/numbers.txt"), text).unwrap();
+    }) else {
+        return;
+    };
+    s.wait("numbers.txt");
+    s.keys(&["Down", "F3"]);
+    s.wait("line 001");
+    let viewed = page_down(&s, 2);
+    s.keys(&["F6"]);
+    s.wait("2Save");
+    s.wait_for("editor at the viewer's line", |t| {
+        !t.contains("line 001") && t.contains(&viewed)
+    });
+    assert_eq!(top_numbered_line(&s.screen()), viewed, "{}", s.screen());
+    let edited = page_down(&s, 3);
+    s.keys(&["F6"]);
+    s.wait("Wrap");
+    s.wait_for("viewer at the editor's line", |t| {
+        !t.contains("2Save") && t.contains(&edited)
+    });
+    assert_eq!(top_numbered_line(&s.screen()), edited, "{}", s.screen());
+}
+
+#[test]
+fn f6_keeps_the_line_for_an_archive_entry_and_after_save_as() {
+    let text: String = (1..=300).map(|i| format!("line {i:03}\n")).collect();
+    let Some(s) = Session::start(|root| {
+        let file = fs::File::create(root.join("left/n.tar")).unwrap();
+        let mut tar = tar::Builder::new(file);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(text.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "numbers.txt", text.as_bytes())
+            .unwrap();
+        tar.finish().unwrap();
+        fs::write(root.join("left/plain.txt"), &text).unwrap();
+    }) else {
+        return;
+    };
+    // An archive entry: viewer, then F6 to the editor at the same line.
+    s.wait("n.tar");
+    s.keys(&["Down", "Enter"]);
+    s.wait("n.tar:/");
+    s.wait("numbers.txt");
+    s.keys(&["Down", "F3"]);
+    s.wait("line 001");
+    let viewed = page_down(&s, 2);
+    s.keys(&["F6"]);
+    s.wait("2Save");
+    s.wait_for("editor at the viewer's line", |t| t.contains(&viewed));
+    assert_eq!(top_numbered_line(&s.screen()), viewed, "{}", s.screen());
+    s.keys(&["Escape"]);
+    s.wait_gone("2Save");
+    s.keys(&["C-PageUp"]);
+    s.wait_gone("n.tar:/");
+    // Save As, then F6 views the new file, not the old one.
+    s.wait("plain.txt");
+    s.keys(&["End", "F4"]);
+    s.wait("line 001");
+    let edited = page_down(&s, 2);
+    s.keys(&["S-F2"]);
+    s.wait("File name:");
+    s.keys(&["C-y"]);
+    s.text("renamed.txt");
+    s.keys(&["Enter"]);
+    s.wait_file(&s.p("left/renamed.txt"), true);
+    s.keys(&["F6"]);
+    s.wait_for("viewer of the renamed file", |t| {
+        t.contains("renamed.txt") && !t.contains("2Save")
+    });
+    assert_eq!(top_numbered_line(&s.screen()), edited, "{}", s.screen());
+}

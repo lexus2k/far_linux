@@ -25,12 +25,15 @@ const SEARCH_CHUNK: u64 = 1024 * 1024;
 const TAB: usize = 8;
 const HEX_WIDTH: u64 = 16;
 const WINDOW: usize = 1024 * 1024;
+/// Bytes read at a time when counting lines for F6.
+const LINE_SCAN: usize = 1024 * 1024;
 
 /// What to do after the viewer closes.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ViewerExit {
     Close,
-    Edit,
+    /// F6: edit the file, with this line at the top of the screen.
+    Edit(usize),
     NextFile,
     PreviousFile,
     GoToFile,
@@ -158,6 +161,60 @@ impl Viewer {
         }
         let nl = self.unit_of(b'\n');
         bytes.chunks_exact(2).rposition(|u| u == nl).map(|i| i * 2)
+    }
+
+    /// Line breaks in `bytes`, which start on a unit.
+    fn count_newlines(&self, bytes: &[u8]) -> usize {
+        if !self.utf16() {
+            return bytes.iter().filter(|b| **b == b'\n').count();
+        }
+        let nl = self.unit_of(b'\n');
+        bytes.chunks_exact(2).filter(|u| *u == nl).count()
+    }
+
+    /// The number of the line, from 0, that holds the byte at `offset`.
+    pub fn line_of(&self, offset: u64) -> usize {
+        let end = self.align(offset.min(self.size));
+        let mut lines = 0;
+        let mut at = 0;
+        while at < end {
+            let len = (end - at).min(LINE_SCAN as u64) as usize;
+            let chunk = self.read_at(at, len);
+            if chunk.is_empty() {
+                break;
+            }
+            lines += self.count_newlines(&chunk);
+            at += chunk.len() as u64;
+        }
+        lines
+    }
+
+    /// Where line `line`, counted from 0, starts. The end of the file when it
+    /// has fewer lines.
+    pub fn offset_of_line(&self, line: usize) -> u64 {
+        let mut left = line;
+        let mut at = 0;
+        while left > 0 && at < self.size {
+            let chunk = self.read_at(at, LINE_SCAN);
+            if chunk.is_empty() {
+                break;
+            }
+            let mut used = 0;
+            while left > 0 {
+                match self.find_newline(&chunk[used..]) {
+                    Some(i) => {
+                        used += i + self.unit();
+                        left -= 1;
+                    }
+                    None => {
+                        used = chunk.len();
+                        break;
+                    }
+                }
+            }
+            at += used as u64;
+        }
+        at.min(self.size)
     }
 
     fn ends_with_newline(&self, bytes: &[u8]) -> bool {
@@ -947,7 +1004,24 @@ pub fn run(
     clipboard: &mut Clipboard,
     db: &Rc<History>,
 ) -> io::Result<ViewerExit> {
+    run_at(tui, path, 0, keybar, clipboard, db)
+}
+
+/// Runs the viewer until it is closed, starting with line `start_line`,
+/// counted from 0, at the top, as F6 in the editor leaves it.
+pub fn run_at(
+    tui: &mut Tui,
+    path: &Path,
+    start_line: usize,
+    keybar: &mut bool,
+    clipboard: &mut Clipboard,
+    db: &Rc<History>,
+) -> io::Result<ViewerExit> {
     let mut v = Viewer::open(path)?;
+    if start_line > 0 {
+        let offset = v.offset_of_line(start_line);
+        v.go_to(offset, tui.screen.w as usize);
+    }
     let mut search = SearchState {
         opts: db.load_search(),
         hex: db.flag("search.hex", false),
@@ -980,7 +1054,16 @@ pub fn run(
             (_, KeyCode::Esc) | (NONE, KeyCode::F(3)) | (NONE, KeyCode::F(10)) => {
                 return Ok(ViewerExit::Close);
             }
-            (NONE, KeyCode::F(6)) => return Ok(ViewerExit::Edit),
+            (NONE, KeyCode::F(6)) => {
+                // The editor refuses a file this large, so do not read it
+                // all to count lines first.
+                let line = if v.size > crate::editor::MAX_EDIT_SIZE {
+                    0
+                } else {
+                    v.line_of(v.top)
+                };
+                return Ok(ViewerExit::Edit(line));
+            }
             (NONE, KeyCode::Char('+')) => return Ok(ViewerExit::NextFile),
             (NONE, KeyCode::Char('-')) => return Ok(ViewerExit::PreviousFile),
             (CTRL, KeyCode::F(10)) => return Ok(ViewerExit::GoToFile),
@@ -1227,6 +1310,41 @@ mod tests {
         let path = std::env::temp_dir().join(format!("far_view_{}_{tag}", std::process::id()));
         fs::write(&path, data).unwrap();
         (Viewer::open(&path).unwrap(), path)
+    }
+
+    #[test]
+    fn lines_and_offsets_convert_both_ways_for_f6() {
+        let (mut v, p) = make("f6_lines", b"one\ntwo\r\nthree\n");
+        assert_eq!(v.offset_of_line(0), 0);
+        assert_eq!(v.offset_of_line(1), 4);
+        assert_eq!(v.offset_of_line(2), 9);
+        // Past the last line is the end of the file.
+        assert_eq!(v.offset_of_line(9), v.size);
+        assert_eq!(v.line_of(0), 0);
+        assert_eq!(v.line_of(4), 1);
+        // Inside a line, such as a wrapped row, counts as that line.
+        assert_eq!(v.line_of(6), 1);
+        assert_eq!(v.line_of(9), 2);
+        v.go_to(v.offset_of_line(2), 80);
+        assert_eq!(v.line_of(v.top), 2);
+        fs::remove_file(p).unwrap();
+
+        // UTF-16 counts whole code units, not a 0x0A byte inside a character.
+        let mut data = vec![0xFF, 0xFE];
+        for c in "a\nb\u{0A0A}\nc".encode_utf16() {
+            data.extend_from_slice(&c.to_le_bytes());
+        }
+        let (v, p) = make("f6_utf16", &data);
+        assert_eq!(v.line_of(v.size), 2);
+        assert_eq!(v.offset_of_line(2), 12);
+        fs::remove_file(p).unwrap();
+
+        // Lines beyond the first chunk that is read.
+        let line = "x".repeat(99) + "\n";
+        let (v, p) = make("f6_big", line.repeat(30_000).as_bytes());
+        assert_eq!(v.offset_of_line(25_000), 2_500_000);
+        assert_eq!(v.line_of(2_500_050), 25_000);
+        fs::remove_file(p).unwrap();
     }
 
     #[test]
