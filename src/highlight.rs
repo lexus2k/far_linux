@@ -259,6 +259,15 @@ impl MaskList {
         MaskList(compile(text, &HashMap::new(), problems))
     }
 
+    /// Compiles `text`, where `<name>` stands for a group from `groups`.
+    pub fn with_groups(
+        text: &str,
+        groups: &HashMap<String, String>,
+        problems: &mut Vec<String>,
+    ) -> MaskList {
+        MaskList(compile(text, groups, problems))
+    }
+
     /// Whether `name` matches, ignoring case.
     pub fn matches(&self, name: &str) -> bool {
         let name: Vec<char> = name.chars().flat_map(char::to_lowercase).collect();
@@ -451,6 +460,8 @@ pub struct Highlight {
     groups: Vec<Group>,
     /// Problems found while reading, each naming its line. The rest still works.
     pub problems: Vec<String>,
+    /// The `[masks]` groups, such as `arc`, for other settings that take masks.
+    pub mask_groups: HashMap<String, String>,
 }
 
 impl Default for Highlight {
@@ -571,7 +582,11 @@ impl Highlight {
                 selected_cursor: group.selected_cursor,
             });
         }
-        Highlight { groups, problems }
+        Highlight {
+            groups,
+            problems,
+            mask_groups: named,
+        }
     }
 
     /// The colours for a file, from the first group it belongs to.

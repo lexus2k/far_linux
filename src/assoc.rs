@@ -5,6 +5,7 @@
 
 use crate::archive::ScratchDir;
 use crate::highlight::MaskList;
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::io::{self, Write};
@@ -78,11 +79,6 @@ impl Association {
             self.description.clone()
         }
     }
-
-    /// Whether the file name `name` matches the masks.
-    pub fn matches(&self, name: &str) -> bool {
-        MaskList::new(&self.mask, &mut Vec::new()).matches(name)
-    }
 }
 
 /// The associations in their order, which is the order of the menu Far shows
@@ -92,6 +88,15 @@ pub struct Associations {
     pub list: Vec<Association>,
     /// Mistakes found in the settings file, to report.
     pub problems: Vec<String>,
+    /// The file exists but could not be read, so saving would lose it.
+    pub unreadable: bool,
+    /// Mask groups from the highlighting file, such as `<arc>`.
+    groups: HashMap<String, String>,
+    /// The masks of `list`, compiled once.
+    compiled: Vec<MaskList>,
+    /// The file as read would come back unchanged from `to_text`. When it
+    /// would not, because of comments or mistakes, a save keeps a copy first.
+    lossless: bool,
 }
 
 /// The most a settings file may hold. Anything larger is a mistake.
@@ -128,9 +133,13 @@ pub fn settings_path() -> Option<PathBuf> {
 }
 
 impl Associations {
-    /// Reads the settings text.
-    pub fn parse(text: &str) -> Associations {
-        let mut found = Associations::default();
+    /// Reads the settings text. `groups` are the mask groups that `<name>`
+    /// in a mask stands for.
+    pub fn parse(text: &str, groups: &HashMap<String, String>) -> Associations {
+        let mut found = Associations {
+            groups: groups.clone(),
+            ..Associations::default()
+        };
         let mut inside = false;
         for (index, line) in text.lines().enumerate() {
             let number = index + 1;
@@ -180,14 +189,39 @@ impl Associations {
                 .problems
                 .push("an association without a mask is ignored".to_string());
         }
-        for assoc in &found.list {
-            let mut problems = Vec::new();
-            MaskList::new(&assoc.mask, &mut problems);
-            found
-                .problems
-                .extend(problems.into_iter().map(|p| format!("{}: {p}", assoc.mask)));
-        }
+        let mut problems = Vec::new();
+        found.recompile_into(&mut problems);
+        found.problems.extend(problems);
+        found.lossless = found.to_text() == text;
         found
+    }
+
+    /// Compiles the masks again after the list changed.
+    pub fn recompile(&mut self) {
+        self.recompile_into(&mut Vec::new());
+    }
+
+    fn recompile_into(&mut self, problems: &mut Vec<String>) {
+        self.compiled = self
+            .list
+            .iter()
+            .map(|a| {
+                let mut found = Vec::new();
+                let masks = MaskList::with_groups(&a.mask, &self.groups, &mut found);
+                problems.extend(found.into_iter().map(|p| format!("{}: {p}", a.mask)));
+                masks
+            })
+            .collect();
+    }
+
+    /// Mistakes in `mask`, as the edit dialog checks it before saving.
+    pub fn mask_problems(&self, mask: &str) -> Vec<String> {
+        let mut problems = Vec::new();
+        MaskList::with_groups(mask, &self.groups, &mut problems);
+        if mask.trim().is_empty() {
+            problems.push("A file mask is needed".to_string());
+        }
+        problems
     }
 
     /// The settings text, as the dialogs save it.
@@ -211,37 +245,66 @@ impl Associations {
 
     /// Reads the settings file. A missing file means no associations, and a
     /// broken one must never stop the file manager.
-    pub fn load(path: &Path) -> Associations {
+    pub fn load(path: &Path, groups: &HashMap<String, String>) -> Associations {
+        let unusable = |why: String| Associations {
+            problems: vec![why],
+            unreadable: true,
+            groups: groups.clone(),
+            ..Associations::default()
+        };
         match fs::metadata(path) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Associations::default(),
-            Ok(m) if !m.is_file() || m.len() > MOST_FILE_BYTES => {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 return Associations {
-                    list: Vec::new(),
-                    problems: vec![format!("{} is not a usable file", path.display())],
+                    groups: groups.clone(),
+                    lossless: true,
+                    ..Associations::default()
                 }
+            }
+            Ok(m) if !m.is_file() || m.len() > MOST_FILE_BYTES => {
+                return unusable(format!("{} is not a usable file", path.display()))
             }
             _ => {}
         }
         match fs::read(path) {
-            Ok(bytes) => Associations::parse(&String::from_utf8_lossy(&bytes)),
-            Err(e) => Associations {
-                list: Vec::new(),
-                problems: vec![format!("{}: {e}", path.display())],
+            Ok(bytes) => match String::from_utf8(bytes) {
+                Ok(text) => Associations::parse(&text, groups),
+                Err(_) => unusable(format!("{} is not UTF-8 text", path.display())),
             },
+            Err(e) => unusable(format!("{}: {e}", path.display())),
         }
     }
 
     /// Writes the settings file through a temporary file and a rename, so a
-    /// failed write leaves the old file as it was.
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
+    /// failed write leaves the old file as it was. A symbolic link is written
+    /// through, not replaced. When the file held what saving drops, such as
+    /// comments, a copy is kept as `associations.ini.bak` first. A file that
+    /// could not be read is never overwritten.
+    pub fn save(&mut self, path: &Path) -> io::Result<()> {
+        if self.unreadable {
+            return Err(io::Error::other(
+                "the file could not be read, so it is not overwritten; fix or remove it first",
+            ));
         }
-        let temp = path.with_extension("ini.tmp");
+        let target = match fs::symlink_metadata(path) {
+            Ok(m) if m.file_type().is_symlink() => fs::canonicalize(path)?,
+            _ => path.to_path_buf(),
+        };
+        let dir = target.parent().unwrap_or(Path::new("/")).to_path_buf();
+        fs::create_dir_all(&dir)?;
+        if !self.lossless && target.exists() {
+            let mut backup = target.clone().into_os_string();
+            backup.push(".bak");
+            fs::copy(&target, &backup)?;
+        }
+        let name = target.file_name().unwrap_or_default().to_string_lossy();
+        let temp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
         let written = fs::File::create(&temp)
             .and_then(|mut f| f.write_all(self.to_text().as_bytes()).and(f.sync_all()));
-        match written.and_then(|()| fs::rename(&temp, path)) {
-            Ok(()) => Ok(()),
+        match written.and_then(|()| fs::rename(&temp, &target)) {
+            Ok(()) => {
+                self.lossless = true;
+                Ok(())
+            }
             Err(e) => {
                 let _ = fs::remove_file(&temp);
                 Err(e)
@@ -253,7 +316,9 @@ impl Associations {
     pub fn matching(&self, name: &str, slot: Slot) -> Vec<&Association> {
         self.list
             .iter()
-            .filter(|a| !a.command(slot).is_empty() && a.matches(name))
+            .zip(&self.compiled)
+            .filter(|(a, masks)| !a.command(slot).is_empty() && masks.matches(name))
+            .map(|(a, _)| a)
             .collect()
     }
 }
@@ -316,12 +381,22 @@ fn escape(text: &str, quote: Quote) -> String {
         }
         Quote::None => {
             let plain = |c: char| c.is_ascii_alphanumeric() || "_./+=:,@%-".contains(c);
-            if text.chars().all(plain) {
+            if !text.is_empty() && text.chars().all(plain) {
                 text.to_string()
             } else {
                 format!("'{}'", text.replace('\'', "'\\''"))
             }
         }
+    }
+}
+
+/// A name as an argument: one starting with `-` gets `./` in front, so that
+/// a program cannot take a name such as `--output=x` for an option.
+fn as_argument(name: &str) -> String {
+    if name.starts_with('-') {
+        format!("./{name}")
+    } else {
+        name.to_string()
     }
 }
 
@@ -415,8 +490,8 @@ pub fn expand(
             i += token.chars().count();
             match kind {
                 b'!' => out.push('!'),
-                b'n' => out.push_str(&escape(current()?, quote)),
-                b's' => out.push_str(&escape(split_ext(current()?).0, quote)),
+                b'n' => out.push_str(&escape(&as_argument(current()?), quote)),
+                b's' => out.push_str(&escape(&as_argument(split_ext(current()?).0), quote)),
                 b'e' => out.push_str(&escape(split_ext(current()?).1, quote)),
                 b'd' => {}
                 b'p' => out.push_str(&escape(&folder_text(&panel.path)?, quote)),
@@ -471,7 +546,7 @@ pub fn expand(
             }
             let mut names = Vec::new();
             for name in &panel.selected {
-                names.push(escape(text_of(name)?, Quote::None));
+                names.push(escape(&as_argument(text_of(name)?), Quote::None));
             }
             let joined = names.join(" ");
             // Inside quotes the list is one word; bash cannot split it there.
@@ -496,14 +571,16 @@ pub fn expand(
                     let Some(answer) = ask(title, init) else {
                         return Ok(None);
                     };
-                    out.push_str(&escape(&answer, quote));
+                    // Typed by the user, so it goes in as typed: Far's `*.c *.h`
+                    // must stay two globs.
+                    out.push_str(&answer);
                     i += 2 + body[..mid + 1 + end].chars().count() + 1;
                     continue;
                 }
             }
         }
         // A lone ! is the name without its extension.
-        out.push_str(&escape(split_ext(current()?).0, quote));
+        out.push_str(&escape(&as_argument(split_ext(current()?).0), quote));
         i += 1;
     }
     Ok(Some(Expanded {
@@ -654,7 +731,7 @@ mod tests {
         })
         .unwrap()
         .unwrap();
-        assert_eq!(done.command, "grep 'a b' report.final.md");
+        assert_eq!(done.command, "grep a b report.final.md");
         assert_eq!(asked, vec![("Find:".to_string(), "TODO".to_string())]);
         // Cancelling a question cancels the command.
         assert!(expand("x !?Q?!", &c, &mut |_, _| None).unwrap().is_none());
@@ -679,16 +756,18 @@ mod tests {
         a.set_command(Slot::AltEdit, "code !.!");
         let all = Associations {
             list: vec![a.clone()],
-            problems: Vec::new(),
+            ..Associations::default()
         };
-        let back = Associations::parse(&all.to_text());
+        let back = Associations::parse(&all.to_text(), &HashMap::new());
         assert_eq!(back.list, vec![a]);
         assert!(back.problems.is_empty(), "{:?}", back.problems);
         assert_eq!(back.matching("notes.MD", Slot::View).len(), 1);
         assert!(back.matching("README.md", Slot::View).is_empty());
         assert!(back.matching("notes.md", Slot::Enter).is_empty());
-        let broken =
-            Associations::parse("mask = *.x\n[other]\n[association]\nwhat = 1\nview = v\n");
+        let broken = Associations::parse(
+            "mask = *.x\n[other]\n[association]\nwhat = 1\nview = v\n",
+            &HashMap::new(),
+        );
         assert_eq!(broken.problems.len(), 4, "{:?}", broken.problems);
         assert!(broken.list.is_empty());
     }
@@ -698,15 +777,90 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("far_assoc_{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         let path = dir.join("associations.ini");
-        let mut all = Associations::default();
+        let groups = HashMap::new();
+        let mut all = Associations::load(&path, &groups);
+        assert!(all.list.is_empty() && all.problems.is_empty());
         all.list.push(Association {
             mask: "*.pdf".into(),
             ..Association::default()
         });
         all.save(&path).unwrap();
-        assert_eq!(Associations::load(&path).list, all.list);
-        assert!(!path.with_extension("ini.tmp").exists());
-        assert!(Associations::load(&dir.join("missing.ini")).list.is_empty());
+        assert_eq!(Associations::load(&path, &groups).list, all.list);
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, vec![OsString::from("associations.ini")]);
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn hand_edits_are_kept_and_unreadable_files_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!("far_assoc_keep_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let groups = HashMap::new();
+        // Comments are lost on save, so a copy is kept first.
+        let path = dir.join("associations.ini");
+        let hand = "# mine\n[association]\nmask = *.md\nview = glow !.!\n";
+        fs::write(&path, hand).unwrap();
+        let mut all = Associations::load(&path, &groups);
+        all.list.clear();
+        all.save(&path).unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("associations.ini.bak")).unwrap(),
+            hand
+        );
+        // A file that could not be read stays as it is.
+        let bad = dir.join("bad.ini");
+        fs::write(&bad, b"[association]\nmask = \xFF\n").unwrap();
+        let mut broken = Associations::load(&bad, &groups);
+        assert!(broken.unreadable && !broken.problems.is_empty());
+        assert!(broken.save(&bad).is_err());
+        assert_eq!(fs::read(&bad).unwrap(), b"[association]\nmask = \xFF\n");
+        // A symbolic link is written through, not replaced.
+        let real = dir.join("dotfiles.ini");
+        fs::write(&real, "").unwrap();
+        let link = dir.join("link.ini");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut linked = Associations::load(&link, &groups);
+        linked.list.push(Association {
+            mask: "*.x".into(),
+            ..Association::default()
+        });
+        linked.recompile();
+        linked.save(&link).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(fs::read_to_string(&real).unwrap().contains("mask = *.x"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn masks_may_use_highlighting_groups() {
+        let groups = HashMap::from([("arc".to_string(), "*.zip,*.7z".to_string())]);
+        let all = Associations::parse("[association]\nmask = <arc>\nenter = x\n", &groups);
+        assert!(all.problems.is_empty(), "{:?}", all.problems);
+        assert_eq!(all.matching("a.ZIP", Slot::Enter).len(), 1);
+        assert!(all.matching("a.txt", Slot::Enter).is_empty());
+        assert!(!all.mask_problems("<nope>").is_empty());
+        assert!(!all.mask_problems(" ").is_empty());
+    }
+
+    #[test]
+    fn options_empty_values_and_typed_text() {
+        let mut c = ctx();
+        c.active.current = Some("--output=x.md".into());
+        c.active.selected = vec!["-rf".into()];
+        assert_eq!(run("pandoc !.!", &c), "pandoc ./--output=x.md");
+        assert_eq!(run("rm !&", &c), "rm ./-rf");
+        c.active.current = Some("Makefile".into());
+        assert_eq!(run("tool !` !.!", &c), "tool '' Makefile");
+        let done = expand("grep !?In:?*.*!", &c, &mut |_, _| Some("*.c *.h".into()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(done.command, "grep *.c *.h");
     }
 }

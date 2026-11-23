@@ -2277,7 +2277,7 @@ fn file_associations_run_commands_and_are_edited_from_f9() {
             root.join("home/config/far_linux/associations.ini"),
             "[association]\nmask = *.md\ndescription = First\n\
              enter = printf %s !.! > first.out\n\
-             view = printf %s !?Word:?init! > asked.out\n\
+             view = printf %s- !?Word:?init! > asked.out\n\
              [association]\nmask = *.md\ndescription = Second\n\
              enter = printf second > second.out\n",
         )
@@ -2296,14 +2296,11 @@ fn file_associations_run_commands_and_are_edited_from_f9() {
     s.keys(&["Home", "Down", "F3"]);
     s.wait("Word:");
     s.keys(&["C-y"]);
-    s.text("it's $HOME");
+    s.text("a b");
     s.keys(&["Enter"]);
     s.wait_file(&s.p("left/asked.out"), true);
     s.wait("asked.out");
-    assert_eq!(
-        fs::read_to_string(s.p("left/asked.out")).unwrap(),
-        "it's $HOME"
-    );
+    assert_eq!(fs::read_to_string(s.p("left/asked.out")).unwrap(), "a-b-");
     // A file without associations views as before.
     s.wait("plain.txt");
     assert!(!s.p("left/first.out").exists());

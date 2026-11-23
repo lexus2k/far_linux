@@ -118,7 +118,11 @@ Without an association, `Enter` opens the file as before, `Ctrl+PgDn` opens
 archives, `F3` and `F4` use the internal viewer and editor, and `Alt+F3` and
 `Alt+F4` run `$PAGER`, or `$VISUAL` then `$EDITOR`, falling back to the internal
 ones. The list is saved to `~/.config/far_linux/associations.ini`, which can also
-be edited by hand.
+be edited by hand. Masks may use the `[masks]` groups of the highlighting file,
+such as `<arc>`. When a save from the dialogs would drop comments or mistakes
+from a hand-edited file, the old file is kept as `associations.ini.bak`, and a
+file that could not be read is never overwritten. The commands are also on the
+`F9` Files menu, for terminals that do not deliver `Alt+F3` or `Ctrl+Shift` keys.
 
 ## History
 
@@ -202,7 +206,9 @@ box makes room by scrolling the output up rather than covering it.
   expression masks, marking character or "continue processing". Deleting the file restores the defaults.
 - File associations replace each special symbol with the name escaped for bash,
   where Far adds nothing, so a name such as `$(rm -rf ~)` stays a name whether
-  the command quotes it or not. `!&` quotes each name, as Far's default `Q` does.
+  the command quotes it or not, and a name starting with `-` gets `./` in front
+  so that it is not read as an option. `!&` quotes each name, as Far's default
+  `Q` does. Text typed for `!?Title?initial!` goes in as typed, as in Far.
   Short name symbols such as `!-!` and `!~` give the long name. Regular
   expression masks, `IF EXIST` conditions and named input histories are not
   supported, and associations do not apply inside archives.

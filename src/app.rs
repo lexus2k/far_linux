@@ -83,6 +83,8 @@ pub enum Action {
     ViewInternal,
     /// Ctrl+Shift+F4: the internal editor, whatever the associations.
     EditInternal,
+    /// Ctrl+Shift+PgDn: open the archive, whatever the associations.
+    OpenArchive,
     ClearSelection,
     FindFiles,
     CommandHistory,
@@ -132,6 +134,19 @@ fn files_menu() -> Vec<MenuItem> {
     vec![
         ("View", "F3", Action::View),
         ("Edit", "F4", Action::Edit),
+        ("View with alternative", "Alt+F3", Action::ViewAlt),
+        ("Edit with alternative", "Alt+F4", Action::EditAlt),
+        (
+            "View in internal viewer",
+            "Ctrl+Shift+F3",
+            Action::ViewInternal,
+        ),
+        (
+            "Edit in internal editor",
+            "Ctrl+Shift+F4",
+            Action::EditInternal,
+        ),
+        ("Open as archive", "Ctrl+Shift+PgDn", Action::OpenArchive),
         ("New file", "Shift+F4", Action::NewFile),
         ("Copy", "F5", Action::Copy),
         ("Copy here", "Shift+F5", Action::CopyHere),
@@ -782,7 +797,6 @@ impl App {
             }
             (CTRL, KeyCode::PageUp) => self.go_up(),
             (CTRL, KeyCode::PageDown) => self.enter_folder(true)?,
-            (m, KeyCode::PageDown) if m == CTRL | SHIFT => self.enter_folder(false)?,
             (CTRL, KeyCode::Char('\\')) => {
                 self.navigate(Path::new("/"), None)?;
             }
@@ -1602,6 +1616,7 @@ impl App {
             Action::ViewInternal => self.view_current_with(false)?,
             Action::EditInternal => self.edit_current_with(false)?,
             Action::FileAssociations => self.edit_associations()?,
+            Action::OpenArchive => self.enter_folder(false)?,
             Action::NewFile => self.new_file()?,
             Action::Copy => self.copy_dialog(false)?,
             Action::CopyHere => self.copy_dialog(true)?,
@@ -1817,9 +1832,11 @@ impl App {
             .iter()
             .filter_map(|n| std::env::var(n).ok())
             .find(|v| !v.trim().is_empty());
-        match external {
-            Some(program) => {
-                let command = format!("{program} {}", shell_quote(&path.display().to_string()));
+        // A name that is not UTF-8 cannot be put in a command unchanged.
+        let text = path.to_str().map(str::to_string);
+        match external.zip(text) {
+            Some((program, text)) => {
+                let command = format!("{program} {}", shell_quote(&text));
                 self.execute_with(&command, false)
             }
             None if view => self.view_file(&path),
@@ -1998,36 +2015,36 @@ impl App {
         index: Option<usize>,
         insert_at: usize,
     ) -> io::Result<bool> {
-        let old = index
+        let mut new = index
             .map(|i| self.assoc.list[i].clone())
             .unwrap_or_default();
-        let mut fields = vec![
-            Field::text("A file &mask or several file masks:", &old.mask),
-            Field::text("&Description of the association:", &old.description),
-        ];
-        for slot in assoc::SLOTS {
-            fields.push(Field::text(slot.label(), old.command(slot)));
-        }
-        let mut form = Form::new(fields);
-        if !form.run(&mut self.tui, "Edit file associations")? {
-            return Ok(false);
-        }
-        let mut new = assoc::Association {
-            mask: form.text(0).trim().to_string(),
-            description: form.text(1).trim().to_string(),
-            ..Default::default()
-        };
-        for (i, slot) in assoc::SLOTS.iter().enumerate() {
-            new.set_command(*slot, &form.text(2 + i));
-        }
-        let mut problems = Vec::new();
-        crate::highlight::MaskList::new(&new.mask, &mut problems);
-        if new.mask.is_empty() {
-            problems.push("A file mask is needed".to_string());
-        }
-        if !problems.is_empty() {
-            dialog::alert(&mut self.tui, "File associations", &problems.join("\n"))?;
-            return Ok(false);
+        // A mistake in the mask reopens the form with what was typed.
+        loop {
+            let mut fields = vec![
+                Field::text("A file &mask or several file masks:", &new.mask),
+                Field::text("&Description of the association:", &new.description),
+            ];
+            for slot in assoc::SLOTS {
+                fields.push(Field::text(slot.label(), new.command(slot)));
+            }
+            let mut form = Form::new(fields);
+            if !form.run(&mut self.tui, "Edit file associations")? {
+                return Ok(false);
+            }
+            new.mask = form.text(0).trim().to_string();
+            new.description = form.text(1).trim().to_string();
+            for (i, slot) in assoc::SLOTS.iter().enumerate() {
+                new.set_command(*slot, &form.text(2 + i));
+            }
+            let problems = self.assoc.mask_problems(&new.mask);
+            if problems.is_empty() {
+                break;
+            }
+            self.draw_main();
+            let mut lines = vec!["File mask:".to_string()];
+            lines.extend(problems);
+            dialog::message(&mut self.tui, "File associations", &lines, &["OK"], true)?;
+            self.draw_main();
         }
         match index {
             Some(i) => self.assoc.list[i] = new,
@@ -2041,6 +2058,7 @@ impl App {
     }
 
     fn save_associations(&mut self, path: &Path) -> io::Result<()> {
+        self.assoc.recompile();
         if let Err(e) = self.assoc.save(path) {
             let text = format!("{}: {e}", path.display());
             dialog::alert(&mut self.tui, "File associations", &text)?;
@@ -2050,8 +2068,10 @@ impl App {
 
     /// Reads the associations file and reports its mistakes.
     fn load_associations(&mut self) -> io::Result<()> {
-        self.assoc = assoc::settings_path()
-            .map_or_else(Associations::default, |path| Associations::load(&path));
+        let groups = self.panels[0].highlight.mask_groups.clone();
+        self.assoc = assoc::settings_path().map_or_else(Associations::default, |path| {
+            Associations::load(&path, &groups)
+        });
         let problems = self.assoc.problems.clone();
         if !problems.is_empty() {
             self.draw_main();
@@ -4053,6 +4073,7 @@ fn key_action(key: Key, enhanced: bool) -> Option<Action> {
         (ALT, KeyCode::F(4)) => Action::EditAlt,
         (m, KeyCode::F(3)) if m == shift_ctrl => Action::ViewInternal,
         (m, KeyCode::F(4)) if m == shift_ctrl => Action::EditInternal,
+        (m, KeyCode::PageDown) if m == shift_ctrl => Action::OpenArchive,
         (SHIFT, KeyCode::F(4)) => Action::NewFile,
         (NONE, KeyCode::F(5)) => Action::Copy,
         (SHIFT, KeyCode::F(5)) => Action::CopyHere,
