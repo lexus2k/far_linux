@@ -444,12 +444,57 @@ struct App {
     clipboard: Clipboard,
     shell: Shell,
     quit: bool,
+    /// Archive entries unpacked for association commands. They are kept until
+    /// no panel shows their archive, because the program may still be using
+    /// them, and then offered back to the archive if they changed.
+    arc_copies: Vec<ArcCopy>,
     masks: String,
     /// Far's file associations, from their settings file.
     assoc: Associations,
     find_mask: String,
     find_text: String,
     db: Rc<History>,
+}
+
+/// An archive entry unpacked for an association command. It is kept until
+/// far quits, because the program the command started may still have it open
+/// after the archive is left.
+struct ArcCopy {
+    /// Holds the copy; dropping it removes the copy.
+    scratch: ScratchDir,
+    /// The unpacked file.
+    path: PathBuf,
+    /// Its stamp when last looked at.
+    stamp: Option<FileStamp>,
+    /// The archive, its format and the folder in it the entry is in.
+    file: PathBuf,
+    format: Format,
+    folder: String,
+    /// The archive's stamp when the entry was unpacked or last put back, to
+    /// warn before an older copy replaces newer changes.
+    archive_stamp: Option<FileStamp>,
+    /// Why the archive cannot be changed, if it cannot.
+    read_only: Option<&'static str>,
+    /// The copy holds changes that are not in the archive.
+    unsaved: bool,
+}
+
+type FileStamp = (u64, std::time::SystemTime);
+
+/// The size and modification time of `path`, to tell whether it changed.
+/// Unlike the panel's stamp this keeps fractions of a second, so a quick
+/// save of the same size is still seen.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = fs::metadata(path).ok()?;
+    Some((meta.len(), meta.modified().ok()?))
+}
+
+/// What became of a changed archive entry offered back to its archive.
+#[derive(PartialEq, Eq)]
+enum OfferBack {
+    Updated,
+    Discarded,
+    Failed,
 }
 
 /// Runs the file manager until the user quits.
@@ -518,6 +563,7 @@ pub fn run(left: Option<OsString>, right: Option<OsString>) -> io::Result<()> {
         clipboard: Clipboard::default(),
         shell,
         quit: false,
+        arc_copies: Vec::new(),
         masks: db.last(Kind::Mask).unwrap_or_else(|| "*".into()),
         assoc: Associations::default(),
         find_mask: db.last(Kind::FindMask).unwrap_or_else(|| "*".into()),
@@ -609,6 +655,22 @@ fn same_dir(a: &Path, b: &Path) -> bool {
 
 impl App {
     fn main_loop(&mut self) -> io::Result<()> {
+        match self.run_keys() {
+            Ok(()) => self.settle_arc_copies(true),
+            Err(e) => {
+                // No dialogs now; keep whatever might hold changes.
+                for copy in std::mem::take(&mut self.arc_copies) {
+                    if copy.unsaved || file_stamp(&copy.path) != copy.stamp {
+                        let dir = copy.scratch.keep();
+                        eprintln!("far: changes kept in {}", dir.display());
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
+    fn run_keys(&mut self) -> io::Result<()> {
         while !self.quit {
             self.tui.sync_held();
             self.draw_main();
@@ -618,6 +680,7 @@ impl App {
                     let before = self.cmd.text();
                     self.on_key(key)?;
                     self.after_cmd_key(&before);
+                    self.settle_arc_copies(false)?;
                 }
                 Some(Input::Paste(text)) => {
                     self.cmd.insert_str(&text);
@@ -628,6 +691,125 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    /// True when a panel shows the archive `file`, also as the outer archive
+    /// of a nested one.
+    fn archive_shown(&self, file: &Path) -> bool {
+        self.panels.iter().any(|panel| {
+            let mut view = panel.archive.as_ref();
+            while let Some(v) = view {
+                if v.file == file {
+                    return true;
+                }
+                view = v.outer.as_ref().map(|o| &o.view);
+            }
+            false
+        })
+    }
+
+    /// Offers the changed copies whose archive is no longer shown back to
+    /// it, and when far quits (`all`) does so for every copy and removes
+    /// them. A copy holding changes that could not be put back is kept on
+    /// disk, and far says where.
+    fn settle_arc_copies(&mut self, all: bool) -> io::Result<()> {
+        for index in 0..self.arc_copies.len() {
+            let copy = &self.arc_copies[index];
+            if !all && self.archive_shown(&copy.file) {
+                continue;
+            }
+            let now = file_stamp(&copy.path);
+            if now == copy.stamp {
+                continue;
+            }
+            self.arc_copies[index].stamp = now;
+            let copy = &self.arc_copies[index];
+            if let Some(reason) = copy.read_only {
+                let name = copy.path.file_name().unwrap_or_default().to_string_lossy();
+                let archive = copy.file.file_name().unwrap_or_default().to_string_lossy();
+                let text = format!(
+                    "{name} changed, but {archive} cannot be changed.\n{reason}\n\
+                     The changed file is kept when far quits."
+                );
+                self.arc_copies[index].unsaved = true;
+                self.draw_main();
+                dialog::alert(&mut self.tui, "Archive", &text)?;
+                continue;
+            }
+            let (file, format, folder, path) = (
+                copy.file.clone(),
+                copy.format,
+                copy.folder.clone(),
+                copy.path.clone(),
+            );
+            let newer = file_stamp(&file) != copy.archive_stamp;
+            let result = self.offer_back(&file, format, &folder, &path, newer)?;
+            let copy = &mut self.arc_copies[index];
+            copy.unsaved = result == OfferBack::Failed;
+            if result == OfferBack::Updated {
+                copy.archive_stamp = file_stamp(&file);
+            }
+        }
+        if !all {
+            return Ok(());
+        }
+        let mut kept = Vec::new();
+        for copy in std::mem::take(&mut self.arc_copies) {
+            if copy.unsaved {
+                copy.scratch.keep();
+                kept.push(copy.path.display().to_string());
+            }
+        }
+        if !kept.is_empty() {
+            let mut lines = vec!["Changes that are not in their archive are kept in:".to_string()];
+            lines.extend(kept);
+            self.draw_main();
+            dialog::message(&mut self.tui, "Archive", &lines, &["OK"], true)?;
+        }
+        Ok(())
+    }
+
+    /// Asks whether to put the changed file `path` back into `folder` of the
+    /// archive `file`, and does so. `newer` warns that the archive changed
+    /// since the file was unpacked, so its copy of the entry may be newer.
+    fn offer_back(
+        &mut self,
+        file: &Path,
+        format: Format,
+        folder: &str,
+        path: &Path,
+        newer: bool,
+    ) -> io::Result<OfferBack> {
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let archive = file.file_name().unwrap_or_default().to_string_lossy();
+        let mut lines = vec![format!("{name} from {archive} changed.")];
+        if newer {
+            lines.push(format!("{archive} also changed after it was unpacked,"));
+            lines.push("and updating replaces its copy of the file.".to_string());
+        }
+        lines.push("Update it in the archive?".to_string());
+        self.draw_main();
+        let answer = dialog::message(
+            &mut self.tui,
+            "Archive",
+            &lines,
+            &["Update", "Discard"],
+            newer,
+        )?;
+        if answer != Some(0) {
+            return Ok(OfferBack::Discarded);
+        }
+        let (file, folder, path) = (file.to_path_buf(), folder.to_string(), path.to_path_buf());
+        let summary = self.run_op("Update archive", move |ui| {
+            archive::update_file(&file, format, &folder, &path, ui)
+        })?;
+        // Only reload: the selection belongs to whatever the user is doing.
+        self.reload_all();
+        Ok(if summary.cancelled || summary.skipped > 0 {
+            OfferBack::Failed
+        } else {
+            OfferBack::Updated
+        })
     }
 
     fn panel(&mut self) -> &mut Panel {
@@ -932,6 +1114,7 @@ impl App {
         } else if self.panels[self.active].archive.is_some() {
             if entry.is_dir {
                 self.panel().enter_archive_folder(&entry.name);
+            } else if use_assoc && self.run_association(Slot::CtrlPgDn)? {
             } else if let Some(format) = archive::detect(Path::new(&entry.raw)) {
                 let _ = self.enter_nested_archive(format);
             }
@@ -1106,6 +1289,7 @@ impl App {
         } else if self.panels[self.active].archive.is_some() {
             if entry.is_dir {
                 self.panel().enter_archive_folder(&entry.name);
+            } else if self.run_association(Slot::Enter)? {
             } else if let Some(format) = archive::detect(Path::new(&entry.raw)) {
                 self.enter_nested_archive(format)?;
             } else {
@@ -1709,7 +1893,7 @@ impl App {
             return Ok(());
         };
         if self.panels[self.active].archive.is_some() {
-            return if entry.is_dir {
+            return if entry.is_dir || (use_assoc && self.run_association(Slot::View)?) {
                 Ok(())
             } else {
                 self.view_in_archive()
@@ -1793,11 +1977,11 @@ impl App {
         if entry.is_up || entry.is_dir {
             return Ok(());
         }
-        if self.panels[self.active].archive.is_some() {
-            return self.edit_in_archive();
-        }
         if use_assoc && self.run_association(Slot::Edit)? {
             return Ok(());
+        }
+        if self.panels[self.active].archive.is_some() {
+            return self.edit_in_archive();
         }
         let path = self.panels[self.active].entry_path(&entry);
         self.edit_file(&path)
@@ -1814,6 +1998,9 @@ impl App {
             .filter(|e| !e.is_up && !e.is_dir && panel.archive.is_none())
             .map(|e| panel.entry_path(e));
         let Some(path) = file else {
+            if self.run_association(slot)? {
+                return Ok(());
+            }
             return if view {
                 self.view_current_with(false)
             } else {
@@ -1867,9 +2054,6 @@ impl App {
     /// association took the key, even if the user then cancelled.
     fn run_association(&mut self, slot: Slot) -> io::Result<bool> {
         let panel = &self.panels[self.active];
-        if panel.archive.is_some() {
-            return Ok(false);
-        }
         let Some(entry) = panel.current().filter(|e| !e.is_up && !e.is_dir) else {
             return Ok(false);
         };
@@ -1891,7 +2075,44 @@ impl App {
                 }
             }
         };
-        let ctx = self.meta_context();
+        let mut ctx = self.meta_context();
+        // Inside an archive the command gets an unpacked copy, which is kept
+        // until the archive is left, and runs in the copy's folder.
+        let view = self.panels[self.active]
+            .archive
+            .as_ref()
+            .map(|v| (v.file.clone(), v.format, v.folder.clone(), v.read_only()));
+        let mut copy = None;
+        if let Some((file, format, folder, read_only)) = view {
+            // As the internal editor, edit commands are refused where the
+            // changes could not be put back.
+            if matches!(slot, Slot::Edit | Slot::AltEdit)
+                && self.refuse_nested(self.active, "Edit")?
+            {
+                return Ok(true);
+            }
+            let archive_stamp = file_stamp(&file);
+            let Some((scratch, path)) = self.extract_current_to_scratch()? else {
+                return Ok(true);
+            };
+            let name = path.file_name().unwrap_or_default().to_os_string();
+            ctx.active = assoc::PanelInfo {
+                path: scratch.path().to_path_buf(),
+                current: Some(name.clone()),
+                selected: vec![name],
+            };
+            copy = Some(ArcCopy {
+                scratch,
+                stamp: file_stamp(&path),
+                path,
+                file,
+                format,
+                folder,
+                archive_stamp,
+                read_only,
+                unsaved: false,
+            });
+        }
         let tui = &mut self.tui;
         let mut ask = |title: &str, init: &str| -> Option<String> {
             dialog::prompt(tui, "Execute", title, init).ok().flatten()
@@ -1900,9 +2121,28 @@ impl App {
             Err(text) => dialog::alert(&mut self.tui, "File associations", &text)?,
             Ok(None) => {}
             Ok(Some(expanded)) => {
-                self.execute_with(&expanded.command, false)?;
+                let special =
+                    is_exit_command(&expanded.command) || is_about_command(&expanded.command);
+                let command = match &copy {
+                    Some(_) if special => expanded.command.clone(),
+                    Some(copy) => {
+                        let dir = copy.path.parent().unwrap_or(Path::new("/"));
+                        let Some(dir) = dir.to_str() else {
+                            // Running elsewhere, `!.!` could name a real file.
+                            let text = "The temporary folder's name is not UTF-8";
+                            dialog::alert(&mut self.tui, "File associations", text)?;
+                            return Ok(true);
+                        };
+                        // A subshell, so the console's folder stays where it
+                        // is. The newline ends a trailing `#` comment.
+                        format!("( cd {} && {}\n)", shell_quote(dir), expanded.command)
+                    }
+                    None => expanded.command.clone(),
+                };
+                self.execute_with(&command, false)?;
                 // The list file, if any, is removed only now.
                 drop(expanded);
+                self.arc_copies.extend(copy);
             }
         }
         Ok(true)
@@ -2700,7 +2940,8 @@ impl App {
         name: &str,
         start_line: usize,
     ) -> io::Result<()> {
-        let Some((_scratch, path)) = self.extract_to_scratch(file, format, folder, name)? else {
+        let archive_stamp = file_stamp(file);
+        let Some((scratch, path)) = self.extract_to_scratch(file, format, folder, name)? else {
             return Ok(());
         };
         let before = fs::read(&path).ok();
@@ -2718,22 +2959,13 @@ impl App {
         if fs::read(&path).ok() == before {
             return Ok(());
         }
-        let lines = vec!["The file changed. Update it in the archive?".to_string()];
-        let answer = dialog::message(
-            &mut self.tui,
-            "Archive",
-            &lines,
-            &["Update", "Discard"],
-            false,
-        )?;
-        if answer != Some(0) {
-            return Ok(());
+        let newer = file_stamp(file) != archive_stamp;
+        if self.offer_back(file, format, folder, &path, newer)? == OfferBack::Failed {
+            // Keep the edited file rather than lose it with the copy.
+            scratch.keep();
+            let text = format!("The changes are kept in {}", path.display());
+            dialog::alert(&mut self.tui, "Archive", &text)?;
         }
-        let (file, folder) = (file.to_path_buf(), folder.to_string());
-        let summary = self.run_op("Update archive", move |ui| {
-            archive::update_file(&file, format, &folder, &path, ui)
-        })?;
-        self.after_op(&summary);
         Ok(())
     }
 

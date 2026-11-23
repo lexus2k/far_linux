@@ -12,6 +12,15 @@
 - `Alt+F3` and `Alt+F4` run `$PAGER`, or `$VISUAL` then `$EDITOR`, when no
   association applies, and `Ctrl+Shift+F3`, `Ctrl+Shift+F4` and
   `Ctrl+Shift+PgDn` ignore associations, as in Far.
+- File associations work inside archives too. The command gets an unpacked
+  copy, kept until far quits, which is offered back to the archive when it
+  changes while the archive is not shown. Changes that cannot be put back
+  are kept on disk.
+
+### Fixed
+
+- `F4` inside an archive keeps the edited file, and says where, when putting
+  it back into the archive fails or is cancelled, instead of deleting it.
 
 ## 0.7.0 - 2026-11-23
 

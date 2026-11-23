@@ -118,7 +118,19 @@ Without an association, `Enter` opens the file as before, `Ctrl+PgDn` opens
 archives, `F3` and `F4` use the internal viewer and editor, and `Alt+F3` and
 `Alt+F4` run `$PAGER`, or `$VISUAL` then `$EDITOR`, falling back to the internal
 ones. The list is saved to `~/.config/far_linux/associations.ini`, which can also
-be edited by hand. Masks may use the `[masks]` groups of the highlighting file,
+be edited by hand.
+
+Inside an archive, the file is unpacked into a private temporary folder and the
+command runs there, with `!.!` naming the copy. The copy stays until far quits,
+because a program such as an editor may keep running after the command returns.
+Once no panel shows the archive, a change to the copy, even a later one, makes
+far ask whether to update it in the archive, and it warns when the archive
+itself changed after the file was unpacked. Changes that could not be put back,
+because the update failed or the archive is read-only, are kept on disk when
+far quits, and far says where. Edit commands are refused inside a read-only
+archive, as `F4` is.
+
+Masks may use the `[masks]` groups of the highlighting file,
 such as `<arc>`. When a save from the dialogs would drop comments or mistakes
 from a hand-edited file, the old file is kept as `associations.ini.bak`, and a
 file that could not be read is never overwritten. The commands are also on the
@@ -211,7 +223,8 @@ box makes room by scrolling the output up rather than covering it.
   `Q` does. Text typed for `!?Title?initial!` goes in as typed, as in Far.
   Short name symbols such as `!-!` and `!~` give the long name. Regular
   expression masks, `IF EXIST` conditions and named input histories are not
-  supported, and associations do not apply inside archives.
+  supported. Inside an archive, `!&` and `!@!` give only the file under the
+  cursor, not the selection.
 - The default groups are Far's: hidden (names starting with a dot), folders, `<arc>`,
   `<temp>` and executables, plus links, images, media, documents and source. Linux
   uses the execute permission rather than Far's `<exec>` masks, and it comes after
